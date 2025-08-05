@@ -53,8 +53,8 @@ except ImportError as e:
 
 # Import formatters - used for message formatting
 try:
-    from .formatters import MessageFormatter
-    __all__.extend(["MessageFormatter"])
+    from .formatters import MessageFormatter, truncate_text
+    __all__.extend(["MessageFormatter", "truncate_text"])
 except ImportError as e:
     warnings.warn(f"Formatters import failed: {e}", ImportWarning)
 

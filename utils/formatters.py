@@ -15,6 +15,23 @@ from models import Project,IssuePriority, IssueType, IssueStatus, UserRole,JiraI
 
 from .constants import EMOJI, MAX_MESSAGE_LENGTH, MAX_SUMMARY_LENGTH
 
+def truncate_text(self, text: str, max_length: int) -> str:
+        """Truncate text to specified length.
+        
+        Args:
+            text: Text to truncate
+            max_length: Maximum length
+            
+        Returns:
+            Truncated text
+        """
+        if not isinstance(text, str):
+            return str(text)
+        
+        if len(text) <= max_length:
+            return text
+        
+        return text[:max_length - 3] + "..."
 
 class MessageFormatter:
     """Utility class for formatting Telegram messages."""
@@ -61,7 +78,7 @@ class MessageFormatter:
         lines = []
         
         # Title line
-        title_line = f"**{issue.key}: {self._truncate_text(issue.summary, MAX_SUMMARY_LENGTH)}**"
+        title_line = f"**{issue.key}: {self.truncate_text(issue.summary, MAX_SUMMARY_LENGTH)}**"
         lines.append(title_line)
         
         # Header line with priority, type, status
@@ -84,7 +101,7 @@ class MessageFormatter:
 
         # Description
         if include_description and issue.description and not self.compact_mode:
-            description = self._truncate_text(issue.description, 300)
+            description = self.truncate_text(issue.description, 300)
             lines.append(f"📄 Description: {description}")
 
         # Additional details for non-compact mode
@@ -159,7 +176,7 @@ class MessageFormatter:
             type_emoji = issue.issue_type.get_emoji() if self.use_emoji else ""
             
             # Create compact issue line
-            issue_line = f"{i}. {priority_emoji}{type_emoji} **{issue.key}**: {self._truncate_text(issue.summary, 60)}"
+            issue_line = f"{i}. {priority_emoji}{type_emoji} **{issue.key}**: {self.truncate_text(issue.summary, 60)}"
             
             if issue.assignee and not self.compact_mode:
                 issue_line += f" (👤 {issue.assignee})"
@@ -193,7 +210,7 @@ class MessageFormatter:
 
         # Description
         if project.description:
-            description = self._truncate_text(project.description, 200)
+            description = self.truncate_text(project.description, 200)
             lines.append(f"📄 {description}")
 
         if include_details:
@@ -414,23 +431,6 @@ class MessageFormatter:
         
         return "\n".join(lines)
 
-    def _truncate_text(self, text: str, max_length: int) -> str:
-        """Truncate text to specified length.
-        
-        Args:
-            text: Text to truncate
-            max_length: Maximum length
-            
-        Returns:
-            Truncated text
-        """
-        if not isinstance(text, str):
-            return str(text)
-        
-        if len(text) <= max_length:
-            return text
-        
-        return text[:max_length - 3] + "..."
 
     def _format_datetime(self, dt: datetime) -> str:
         """Format datetime for display.
