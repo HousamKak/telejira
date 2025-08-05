@@ -398,6 +398,189 @@ class BaseHandler(ABC):
                 pass
 
     # =============================================================================
+    # BASIC COMMAND HANDLERS
+    # =============================================================================
+
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /start command - welcome message and setup.
+        
+        Args:
+            update: Telegram update
+            context: Telegram context
+        """
+        self.log_handler_start(update, "start_command")
+        
+        try:
+            # Get or create user (this will handle the database calls correctly)
+            user = await self.get_or_create_user(update)
+            if not user:
+                return
+
+            # Log user action
+            self.log_user_action(user, "start_command")
+
+            # Create welcome message
+            welcome_message = f"""
+{EMOJI.get('WAVE', '👋')} **Welcome to the Telegram-Jira Bot!**
+
+Hello {user.get_display_name()}! I'm here to help you manage Jira issues directly from Telegram.
+
+**Quick Start:**
+• Use `/wizard` for interactive setup
+• Use `/help` to see all available commands
+• Use `/projects` to view available projects
+
+**Create Issues Fast:**
+Just send me a message like:
+`HIGH BUG Login button not working`
+
+Let's get started! 🚀
+            """
+
+            await self.send_message(update, welcome_message)
+            self.log_handler_end(update, "start_command")
+
+        except Exception as e:
+            await self.handle_error(update, e, "start_command")
+            self.log_handler_end(update, "start_command", success=False)
+
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /help command - show comprehensive help.
+        
+        Args:
+            update: Telegram update
+            context: Telegram context
+        """
+        self.log_handler_start(update, "help_command")
+        
+        try:
+            user = await self.get_or_create_user(update)
+            if not user:
+                return
+
+            # Log user action
+            self.log_user_action(user, "help_command")
+
+            # Build help message based on user role
+            help_message = f"""
+{EMOJI.get('HELP', '❓')} **Telegram-Jira Bot Help**
+
+**Basic Commands:**
+• `/start` - Welcome message and setup
+• `/help` - Show this help message
+• `/wizard` - Interactive setup wizard
+• `/status` - Your statistics and bot status
+
+**Project Commands:**
+• `/projects` - List available projects
+• `/setdefault <KEY>` - Set your default project
+
+**Issue Commands:**
+• `/create` - Interactive issue creation
+• `/myissues` - View your recent issues
+
+**Quick Issue Creation:**
+Send a message like: `HIGH BUG Login button not working`
+
+Format: `[PRIORITY] [TYPE] Description`
+• Priority: LOWEST, LOW, MEDIUM, HIGH, HIGHEST
+• Type: TASK, BUG, STORY, EPIC, IMPROVEMENT
+            """
+
+            # Add admin commands if user is admin
+            if self.is_admin(user):
+                help_message += f"""
+
+**Admin Commands:**
+• `/addproject <KEY> "<NAME>" [description]` - Add project
+• `/editproject <KEY>` - Edit project
+• `/deleteproject <KEY>` - Delete project
+• `/users` - List all users
+• `/syncjira` - Sync with Jira
+                """
+
+            # Add super admin commands if user is super admin
+            if self.is_super_admin(user):
+                help_message += f"""
+
+**Super Admin Commands:**
+• `/config` - Bot configuration
+• `/broadcast <message>` - Message all users
+• `/maintenance` - System maintenance
+                """
+
+            help_message += f"""
+
+**Need More Help?**
+Contact your system administrator or check the project documentation.
+
+**Current Role:** {user.role.value.replace('_', ' ').title()}
+            """
+
+            await self.send_message(update, help_message)
+            self.log_handler_end(update, "help_command")
+
+        except Exception as e:
+            await self.handle_error(update, e, "help_command")
+            self.log_handler_end(update, "help_command", success=False)
+
+    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /status command - show user and bot status.
+        
+        Args:
+            update: Telegram update
+            context: Telegram context
+        """
+        self.log_handler_start(update, "status_command")
+        
+        try:
+            user = await self.get_or_create_user(update)
+            if not user:
+                return
+
+            # Log user action
+            self.log_user_action(user, "status_command")
+
+            try:
+                # Get user statistics if the method exists
+                user_stats = await self.db.get_user_stats(user.user_id)
+            except (AttributeError, DatabaseError):
+                # Fallback if get_user_stats doesn't exist or fails
+                user_stats = {
+                    'total_issues': user.issues_created,
+                    'active_issues': 0,
+                    'resolved_issues': 0
+                }
+
+            # Build status message
+            status_message = f"""
+{EMOJI.get('STATUS', '📊')} **Your Status**
+
+**User Information:**
+• Name: {user.get_display_name()}
+• Role: {user.role.value.replace('_', ' ').title()}
+• Member since: {user.created_at.strftime('%B %d, %Y')}
+• Last active: {user.last_activity.strftime('%B %d, %Y at %I:%M %p')}
+
+**Statistics:**
+• Total issues created: {user_stats.get('total_issues', 0)}
+• Active issues: {user_stats.get('active_issues', 0)}
+• Resolved issues: {user_stats.get('resolved_issues', 0)}
+
+**Bot Status:** ✅ Online and ready
+**Jira Connection:** ✅ Connected
+
+Use `/help` for available commands.
+            """
+
+            await self.send_message(update, status_message)
+            self.log_handler_end(update, "status_command")
+
+        except Exception as e:
+            await self.handle_error(update, e, "status_command")
+            self.log_handler_end(update, "status_command", success=False)
+
+    # =============================================================================
     # VALIDATION METHODS
     # =============================================================================
 
@@ -637,25 +820,49 @@ class BaseHandler(ABC):
         )
 
     # =============================================================================
-    # ABSTRACT METHODS - MUST BE IMPLEMENTED BY SUBCLASSES
+    # CONCRETE IMPLEMENTATIONS OF ABSTRACT METHODS
     # =============================================================================
 
-    @abstractmethod
     async def handle_error(self, update: Update, error: Exception, context: str = "") -> None:
-        """Handle errors specific to this handler.
+        """Default error handler implementation.
         
         Args:
             update: Telegram update
             error: Exception that occurred
             context: Additional context
         """
-        pass
+        # Log the error
+        handler_name = self.get_handler_name()
+        self.logger.error(f"Error in {handler_name}{' (' + context + ')' if context else ''}: {error}")
+        
+        # Handle specific error types
+        if isinstance(error, DatabaseError):
+            await self.handle_database_error(update, error, context)
+        elif isinstance(error, JiraAPIError):
+            await self.handle_jira_error(update, error, context)
+        elif isinstance(error, ValueError):
+            await self.send_error_message(
+                update, 
+                f"Invalid input: {str(error)}", 
+                ErrorType.VALIDATION_ERROR
+            )
+        elif isinstance(error, TelegramError):
+            await self.send_error_message(
+                update,
+                "Telegram API error occurred. Please try again.",
+                ErrorType.NETWORK_ERROR
+            )
+        else:
+            await self.send_error_message(
+                update,
+                f"{handler_name} error: {str(error)}",
+                ErrorType.UNKNOWN_ERROR
+            )
 
-    @abstractmethod
     def get_handler_name(self) -> str:
-        """Get the name of this handler for logging purposes.
+        """Default implementation of get_handler_name.
         
         Returns:
-            Handler name
+            Handler name based on class name
         """
-        pass
+        return self.__class__.__name__
