@@ -13,7 +13,6 @@ import sys
 import os
 from pathlib import Path
 from typing import Optional, NoReturn
-from contextlib import asynccontextmanager
 
 # Add the current directory to the Python path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -73,9 +72,6 @@ class TelegramJiraBot:
         # Initialize logger
         self._setup_logging()
         self.logger = logging.getLogger(__name__)
-
-        # Shutdown flag
-        self._shutdown_event = asyncio.Event()
 
     def _setup_logging(self) -> None:
         """Setup logging configuration with rotation and formatting."""
@@ -142,10 +138,6 @@ class TelegramJiraBot:
                 retry_delay=self.config.jira_retry_delay,
                 page_size=self.config.jira_page_size,
             )
-
-            # Test Jira connection
-            await self._test_jira_connection()
-            self.logger.info("✅ Jira service initialized successfully")
 
             # Initialize Telegram service
             self.telegram_service = TelegramService(
@@ -377,27 +369,11 @@ class TelegramJiraBot:
             except Exception as send_error:
                 self.logger.error(f"Failed to send error message to user: {send_error}")
 
-    def _setup_signal_handlers(self) -> None:
-        """Setup signal handlers for graceful shutdown."""
-
-        def signal_handler(signum, frame):
-            self.logger.info(f"Received signal {signum}, initiating shutdown...")
-            self._shutdown_event.set()
-
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-
     async def _graceful_shutdown(self) -> None:
         """Perform graceful shutdown of all services."""
         self.logger.info("Starting graceful shutdown...")
 
         try:
-            # Stop the application
-            if self.application:
-                await self.application.stop()
-                await self.application.shutdown()
-                self.logger.info("✅ Telegram application stopped")
-
             # Close database connections
             if self.database:
                 await self.database.close()
@@ -408,106 +384,154 @@ class TelegramJiraBot:
                 await self.jira_service.close()
                 self.logger.info("✅ Jira service closed")
 
+            # Close Telegram service
+            if self.telegram_service:
+                # Add any cleanup for telegram service if needed
+                pass
+
             self.logger.info("✅ Graceful shutdown completed")
 
         except Exception as e:
             self.logger.error(f"❌ Error during graceful shutdown: {e}")
 
-    @asynccontextmanager
-    async def _application_context(self):
-        """Async context manager for proper resource management."""
-        try:
-            await self._initialize_services()
-            self._initialize_handlers()
-
-            # Build Telegram application
-            self.application = (
-                Application.builder()
-                .token(self.config.telegram_token)
-                .pool_timeout(self.config.telegram_pool_timeout)
-                .connection_pool_size(self.config.telegram_connection_pool_size)
-                .build()
-            )
-
-            # Ensure application is not None before proceeding
-            if not self.application:
-                raise RuntimeError("Failed to initialize the Telegram application")
-
-            self._register_handlers()
-
-            # Initialize application
-            await self.application.initialize()
-            await self.application.start()
-
-            yield self.application
-
-        finally:
-            await self._graceful_shutdown()
-
-    async def run(self) -> None:
-        """Run the bot application.
-
-        This is the main entry point that starts the bot and handles
-        all initialization, signal handling, and cleanup.
+    def create_application(self) -> Application:
+        """Create and configure the Telegram application.
+        
+        Returns:
+            Configured Application instance
         """
-        self.logger.info(f"🚀 Starting {BOT_INFO['NAME']} v{BOT_INFO['VERSION']}")
-        self.logger.info(f"📍 Jira Domain: {self.config.jira_domain}")
-        self.logger.info(f"👤 Jira User: {self.config.jira_email}")
+        # Build Telegram application
+        application = (
+            Application.builder()
+            .token(self.config.telegram_token)
+            .pool_timeout(self.config.telegram_pool_timeout)
+            .connection_pool_size(self.config.telegram_connection_pool_size)
+            .build()
+        )
 
-        try:
-            self._setup_signal_handlers()
+        # Store the application instance
+        self.application = application
+        return application
 
-            async with self._application_context() as app:
-              self.logger.info("✅ Bot started successfully!")
-              self.logger.info("🔄 Bot is now running... Press Ctrl+C to stop.")
 
-              # let Application handle everything
-              await app.run_polling(
-                  allowed_updates=Update.ALL_TYPES,
-                  drop_pending_updates=True,
-                  stop_signals=None,      
-                  close_loop=False        
-              )
-              
-        except KeyboardInterrupt:
-            self.logger.info("🛑 Received keyboard interrupt")
-        except JiraAPIError as e:
-            self.logger.error(f"❌ Jira API error: {e}")
-            sys.exit(1)
-        except Exception as e:
-            self.logger.error(f"❌ Unexpected error: {e}")
-            sys.exit(1)
-        finally:
-            self.logger.info("👋 Bot stopped")
+async def runner(bot: TelegramJiraBot) -> None:
+    """
+    Async runner that handles the complete PTB lifecycle.
+    
+    Args:
+        bot: The TelegramJiraBot instance
+    """
+    logger = logging.getLogger(__name__)
+    
+    try:
+        # Create Application & register handlers
+        application = bot.create_application()
+        bot._register_handlers()
+
+        # Initialize services that belong to PTB
+        await application.initialize()
+        await application.start()
+        
+        logger.info("✅ Bot initialized successfully!")
+        logger.info("🔄 Bot is now running... Press Ctrl+C to stop.")
+
+        # Start polling (async path)
+        await application.updater.start_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+        )
+
+        # Wait until a stop signal (Ctrl+C) or .stop() is called
+        await application.updater.wait()
+
+    except Exception as e:
+        logger.error(f"❌ Error in runner: {e}")
+        raise
+    finally:
+        # Stop PTB cleanly
+        if application:
+            try:
+                await application.stop()
+                await application.shutdown()
+                logger.info("✅ Telegram application stopped")
+            except Exception as e:
+                logger.error(f"❌ Error stopping application: {e}")
+
+        # Close your own services
+        await bot._graceful_shutdown()
 
 
 def main() -> None:
-    """Main entry point for the Telegram-Jira bot.
-
-    Raises:
-        SystemExit: If the bot fails to start or encounters a fatal error
     """
+    Main entry point that uses a single event loop for the entire bot lifecycle.
+    """
+    # Basic logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[logging.StreamHandler()]
+    )
+    logger = logging.getLogger(__name__)
+
+    # Windows event loop policy
+    if sys.platform.startswith("win"):
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    # Load config
     try:
-        # Load configuration
         config = load_config_from_env(env_file=str(Path(__file__).parent / ".env"))
-
-        # Create and run bot
-        bot = TelegramJiraBot(config)
-        asyncio.run(bot.run())
-
-    except ValueError as e:
-        print(f"❌ Configuration error: {e}", file=sys.stderr)
-        print("Please check your .env file and environment variables.", file=sys.stderr)
-        sys.exit(1)
-    except FileNotFoundError as e:
-        print(f"❌ File not found: {e}", file=sys.stderr)
-        sys.exit(1)
-    except KeyboardInterrupt:
-        print("\n👋 Bot stopped by user")
-        sys.exit(0)
+        logging.getLogger().setLevel(getattr(logging, config.log_level.upper(), logging.INFO))
     except Exception as e:
-        print(f"❌ Fatal error: {e}", file=sys.stderr)
+        logger.error(f"❌ Failed to load configuration: {e}")
         sys.exit(1)
+
+    # Build bot
+    try:
+        bot = TelegramJiraBot(config)
+        logger.info(f"🚀 Starting {BOT_INFO['NAME']} v{BOT_INFO['VERSION']}")
+        logger.info(f"📍 Jira Domain: {config.jira_domain}")
+        logger.info(f"👤 Jira User: {config.jira_email}")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize bot: {e}")
+        sys.exit(1)
+
+    # Run everything inside ONE event loop
+    async def bootstrap_and_run():
+        """Bootstrap the bot and run it."""
+        try:
+            # Initialize your services (DB, Jira, TelegramService)
+            await bot._initialize_services()
+            # Optional: quick Jira health check
+            await bot._test_jira_connection()
+            # Init handlers (your own synchronous step)
+            bot._initialize_handlers()
+            
+            logger.info("✅ Services initialized successfully")
+            
+            # Hand off to PTB runner
+            await runner(bot)
+            
+        except JiraAPIError as e:
+            logger.error(f"❌ Jira API error: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"❌ Error in bootstrap: {e}")
+            raise
+
+    try:
+        asyncio.run(bootstrap_and_run())
+    except KeyboardInterrupt:
+        logger.info("🛑 Received keyboard interrupt")
+    except Exception as e:
+        logger.error(f"❌ Bot crashed: {e}")
+        # Best-effort shutdown
+        try:
+            asyncio.run(bot._graceful_shutdown())
+        except Exception as se:
+            logger.error(f"❌ Error during shutdown: {se}")
+        sys.exit(1)
+    finally:
+        logger.info("👋 Bot stopped")
 
 
 if __name__ == "__main__":
