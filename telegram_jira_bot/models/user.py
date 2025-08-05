@@ -2,18 +2,45 @@
 """
 User model for the Telegram-Jira bot.
 
-Contains user-related data models and preferences.
+Contains user-related data models including User, UserPreferences, and UserSession
+with comprehensive validation and business logic.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Dict, Any, List, Union
 from .enums import IssuePriority, IssueType, UserRole, WizardState
+
+
+def parse_iso_datetime(date_str: Optional[str]) -> Optional[datetime]:
+    """Parse ISO datetime string with tolerant handling.
+    
+    Args:
+        date_str: ISO datetime string
+        
+    Returns:
+        Parsed datetime object or None if parsing fails
+    """
+    if not date_str or not isinstance(date_str, str):
+        return None
+    
+    try:
+        # Handle various ISO formats
+        if date_str.endswith('Z'):
+            date_str = date_str[:-1] + '+00:00'
+        elif date_str.endswith('+0000'):
+            date_str = date_str[:-5] + '+00:00'
+        elif date_str.endswith('-0000'):
+            date_str = date_str[:-5] + '+00:00'
+        
+        return datetime.fromisoformat(date_str)
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 
 @dataclass
 class User:
-    """Telegram user data model."""
+    """Telegram user data model with comprehensive validation."""
     user_id: int
     username: Optional[str] = None
     first_name: Optional[str] = None
@@ -32,6 +59,7 @@ class User:
         self._validate_strings()
         self._validate_enums()
         self._validate_datetime_fields()
+        self._validate_numeric_fields()
 
     def _validate_user_id(self) -> None:
         """Validate user ID."""
@@ -40,8 +68,8 @@ class User:
 
     def _validate_strings(self) -> None:
         """Validate string fields."""
-        string_fields = [self.username, self.first_name, self.last_name, self.timezone]
-        for field in string_fields:
+        optional_string_fields = [self.username, self.first_name, self.last_name, self.timezone]
+        for field in optional_string_fields:
             if field is not None and not isinstance(field, str):
                 raise TypeError("string fields must be strings or None")
         
@@ -59,9 +87,127 @@ class User:
         for dt_field in datetime_fields:
             if not isinstance(dt_field, datetime):
                 raise TypeError("datetime fields must be datetime instances")
+        
+        # Ensure last_activity is not before created_at
+        if self.last_activity < self.created_at:
+            raise ValueError("last_activity cannot be before created_at")
+
+    def _validate_numeric_fields(self) -> None:
+        """Validate numeric fields."""
+        if not isinstance(self.issues_created, int) or self.issues_created < 0:
+            raise ValueError("issues_created must be a non-negative integer")
+        if not isinstance(self.is_active, bool):
+            raise TypeError("is_active must be a boolean")
+
+    @classmethod
+    def from_telegram_user(cls, telegram_user: Any) -> 'User':
+        """Create User from Telegram user object.
+        
+        Args:
+            telegram_user: Telegram user object
+            
+        Returns:
+            User instance
+        """
+        return cls(
+            user_id=telegram_user.id,
+            username=telegram_user.username,
+            first_name=telegram_user.first_name,
+            last_name=telegram_user.last_name
+        )
+
+    def get_display_name(self) -> str:
+        """Get user's display name.
+        
+        Returns:
+            Formatted display name
+        """
+        if self.first_name and self.last_name:
+            return f"{self.first_name} {self.last_name}"
+        elif self.first_name:
+            return self.first_name
+        elif self.username:
+            return f"@{self.username}"
+        else:
+            return f"User {self.user_id}"
+
+    def get_full_name(self) -> str:
+        """Get user's full name with username.
+        
+        Returns:
+            Full name including username if available
+        """
+        display_name = self.get_display_name()
+        if self.username and not display_name.startswith('@'):
+            return f"{display_name} (@{self.username})"
+        return display_name
+
+    def update_activity(self) -> None:
+        """Update last activity timestamp to now."""
+        self.last_activity = datetime.now(timezone.utc)
+
+    def increment_issues_created(self) -> None:
+        """Increment the count of issues created by user."""
+        self.issues_created += 1
+
+    def has_permission(self, required_role: UserRole) -> bool:
+        """Check if user has required permission level.
+        
+        Args:
+            required_role: Minimum role required
+            
+        Returns:
+            True if user has sufficient permissions
+        """
+        return self.role.has_permission(required_role)
+
+    def is_admin(self) -> bool:
+        """Check if user is an admin.
+        
+        Returns:
+            True if user has admin privileges
+        """
+        return self.role in [UserRole.ADMIN, UserRole.SUPER_ADMIN]
+
+    def is_super_admin(self) -> bool:
+        """Check if user is a super admin.
+        
+        Returns:
+            True if user is a super admin
+        """
+        return self.role == UserRole.SUPER_ADMIN
+
+    def get_activity_summary(self) -> str:
+        """Get formatted activity summary.
+        
+        Returns:
+            Formatted activity information
+        """
+        now = datetime.now(timezone.utc)
+        days_since_created = (now - self.created_at).days
+        days_since_activity = (now - self.last_activity).days
+        
+        summary = f"**{self.get_display_name()}**\n"
+        summary += f"🆔 ID: `{self.user_id}`\n"
+        summary += f"👤 Role: {self.role.get_display_name()}\n"
+        summary += f"📊 Issues Created: {self.issues_created}\n"
+        summary += f"📅 Member Since: {days_since_created} days ago\n"
+        summary += f"⏰ Last Active: {days_since_activity} days ago\n"
+        
+        if self.timezone:
+            summary += f"🌍 Timezone: {self.timezone}\n"
+        
+        status = "🟢 Active" if self.is_active else "🔴 Inactive"
+        summary += f"📈 Status: {status}"
+        
+        return summary
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert user to dictionary for serialization."""
+        """Convert user to dictionary for serialization.
+        
+        Returns:
+            Dictionary representation of the user
+        """
         return {
             'user_id': self.user_id,
             'username': self.username,
@@ -78,26 +224,32 @@ class User:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'User':
-        """Create User from dictionary."""
+        """Create User from dictionary.
+        
+        Args:
+            data: Dictionary data
+            
+        Returns:
+            User instance
+            
+        Raises:
+            TypeError: If data is not a dictionary
+            ValueError: If required fields are missing
+        """
         if not isinstance(data, dict):
             raise TypeError("data must be a dictionary")
 
-        # Parse enum
+        # Parse role enum
         role = UserRole.USER
         if data.get('role'):
             try:
-                role = UserRole(data['role'])
-            except ValueError:
+                role = UserRole.from_string(data['role'])
+            except (ValueError, TypeError):
                 role = UserRole.USER
 
         # Parse datetime fields
-        created_at = datetime.now(timezone.utc)
-        if data.get('created_at'):
-            created_at = datetime.fromisoformat(data['created_at'])
-        
-        last_activity = datetime.now(timezone.utc)
-        if data.get('last_activity'):
-            last_activity = datetime.fromisoformat(data['last_activity'])
+        created_at = parse_iso_datetime(data.get('created_at')) or datetime.now(timezone.utc)
+        last_activity = parse_iso_datetime(data.get('last_activity')) or created_at
 
         return cls(
             user_id=data['user_id'],
@@ -113,74 +265,6 @@ class User:
             timezone=data.get('timezone')
         )
 
-    @classmethod
-    def from_telegram_user(cls, telegram_user) -> 'User':
-        """Create User from telegram.User object."""
-        return cls(
-            user_id=telegram_user.id,
-            username=telegram_user.username,
-            first_name=telegram_user.first_name,
-            last_name=telegram_user.last_name
-        )
-
-    def get_display_name(self) -> str:
-        """Get user's display name."""
-        if self.first_name and self.last_name:
-            return f"{self.first_name} {self.last_name}"
-        elif self.first_name:
-            return self.first_name
-        elif self.username:
-            return f"@{self.username}"
-        else:
-            return f"User {self.user_id}"
-
-    def get_full_name(self) -> str:
-        """Get user's full name with username."""
-        display_name = self.get_display_name()
-        if self.username and not display_name.startswith('@'):
-            return f"{display_name} (@{self.username})"
-        return display_name
-
-    def update_activity(self) -> None:
-        """Update last activity timestamp."""
-        self.last_activity = datetime.now(timezone.utc)
-
-    def increment_issues_created(self) -> None:
-        """Increment the count of issues created."""
-        self.issues_created += 1
-
-    def has_permission(self, required_role: UserRole) -> bool:
-        """Check if user has required permission level."""
-        return self.role.has_permission(required_role)
-
-    def is_admin(self) -> bool:
-        """Check if user is an admin."""
-        return self.role in [UserRole.ADMIN, UserRole.SUPER_ADMIN]
-
-    def is_super_admin(self) -> bool:
-        """Check if user is a super admin."""
-        return self.role == UserRole.SUPER_ADMIN
-
-    def get_activity_summary(self) -> str:
-        """Get formatted activity summary."""
-        days_since_created = (datetime.now(timezone.utc) - self.created_at).days
-        days_since_activity = (datetime.now(timezone.utc) - self.last_activity).days
-        
-        summary = f"**{self.get_display_name()}**\n"
-        summary += f"🆔 ID: `{self.user_id}`\n"
-        summary += f"👤 Role: {self.role.value.title()}\n"
-        summary += f"📊 Issues Created: {self.issues_created}\n"
-        summary += f"📅 Member Since: {days_since_created} days ago\n"
-        summary += f"⏰ Last Active: {days_since_activity} days ago\n"
-        
-        if self.timezone:
-            summary += f"🌍 Timezone: {self.timezone}\n"
-        
-        status = "🟢 Active" if self.is_active else "🔴 Inactive"
-        summary += f"📈 Status: {status}"
-        
-        return summary
-
     def __str__(self) -> str:
         """String representation of the user."""
         return f"User({self.user_id}: {self.get_display_name()})"
@@ -193,7 +277,7 @@ class User:
 
 @dataclass
 class UserPreferences:
-    """User preferences for the bot."""
+    """User preferences for the bot with validation."""
     user_id: int
     default_project_key: Optional[str] = None
     default_priority: IssuePriority = IssuePriority.MEDIUM
@@ -214,6 +298,8 @@ class UserPreferences:
         self._validate_enums()
         self._validate_numeric_fields()
         self._validate_strings()
+        self._validate_boolean_fields()
+        self._validate_datetime_fields()
 
     def _validate_user_id(self) -> None:
         """Validate user ID."""
@@ -221,26 +307,82 @@ class UserPreferences:
             raise ValueError("user_id must be a positive integer")
 
     def _validate_enums(self) -> None:
-        """Validate enum fields."""
+        """Validate enum fields with proper defaults."""
         if not isinstance(self.default_priority, IssuePriority):
-            raise TypeError("default_priority must be an IssuePriority instance")
+            try:
+                if isinstance(self.default_priority, str):
+                    self.default_priority = IssuePriority.from_string(self.default_priority)
+                else:
+                    raise TypeError("default_priority must be an IssuePriority instance")
+            except (ValueError, TypeError):
+                self.default_priority = IssuePriority.MEDIUM
+        
         if not isinstance(self.default_issue_type, IssueType):
-            raise TypeError("default_issue_type must be an IssueType instance")
+            try:
+                if isinstance(self.default_issue_type, str):
+                    self.default_issue_type = IssueType.from_string(self.default_issue_type)
+                else:
+                    raise TypeError("default_issue_type must be an IssueType instance")
+            except (ValueError, TypeError):
+                self.default_issue_type = IssueType.TASK
 
     def _validate_numeric_fields(self) -> None:
         """Validate numeric fields."""
         if not isinstance(self.max_issues_per_page, int) or self.max_issues_per_page <= 0:
             raise ValueError("max_issues_per_page must be a positive integer")
+        if self.max_issues_per_page > 50:  # Reasonable upper limit
+            raise ValueError("max_issues_per_page cannot exceed 50")
 
     def _validate_strings(self) -> None:
         """Validate string fields."""
-        if self.default_project_key is not None and not isinstance(self.default_project_key, str):
-            raise TypeError("default_project_key must be a string or None")
+        if self.default_project_key is not None:
+            if not isinstance(self.default_project_key, str):
+                raise TypeError("default_project_key must be a string or None")
+            if not self.default_project_key.strip():
+                self.default_project_key = None
+        
         if not isinstance(self.date_format, str) or not self.date_format.strip():
             raise ValueError("date_format must be a non-empty string")
+        
+        # Test date format validity
+        try:
+            datetime.now().strftime(self.date_format)
+        except (ValueError, TypeError):
+            raise ValueError(f"Invalid date_format: {self.date_format}")
+
+    def _validate_boolean_fields(self) -> None:
+        """Validate boolean fields."""
+        boolean_fields = [
+            self.auto_assign_to_self,
+            self.notifications_enabled,
+            self.include_description_in_summary,
+            self.show_issue_details,
+            self.quick_create_mode
+        ]
+        for field in boolean_fields:
+            if not isinstance(field, bool):
+                raise TypeError("boolean fields must be boolean values")
+
+    def _validate_datetime_fields(self) -> None:
+        """Validate datetime fields."""
+        datetime_fields = [self.created_at, self.updated_at]
+        for dt_field in datetime_fields:
+            if not isinstance(dt_field, datetime):
+                raise TypeError("datetime fields must be datetime instances")
+        
+        if self.updated_at < self.created_at:
+            raise ValueError("updated_at cannot be before created_at")
+
+    def update_timestamp(self) -> None:
+        """Update the updated_at timestamp to now."""
+        self.updated_at = datetime.now(timezone.utc)
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert preferences to dictionary for serialization."""
+        """Convert preferences to dictionary for serialization.
+        
+        Returns:
+            Dictionary representation of preferences
+        """
         return {
             'user_id': self.user_id,
             'default_project_key': self.default_project_key,
@@ -259,33 +401,31 @@ class UserPreferences:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'UserPreferences':
-        """Create UserPreferences from dictionary."""
+        """Create UserPreferences from dictionary.
+        
+        Args:
+            data: Dictionary data
+            
+        Returns:
+            UserPreferences instance
+        """
         if not isinstance(data, dict):
             raise TypeError("data must be a dictionary")
 
         # Parse enums
-        default_priority = IssuePriority.MEDIUM
-        if data.get('default_priority'):
-            try:
-                default_priority = IssuePriority.from_string(data['default_priority'])
-            except (ValueError, TypeError):
-                pass
+        try:
+            default_priority = IssuePriority.from_string(data.get('default_priority', 'Medium'))
+        except (ValueError, TypeError):
+            default_priority = IssuePriority.MEDIUM
 
-        default_issue_type = IssueType.TASK
-        if data.get('default_issue_type'):
-            try:
-                default_issue_type = IssueType.from_string(data['default_issue_type'])
-            except (ValueError, TypeError):
-                pass
+        try:
+            default_issue_type = IssueType.from_string(data.get('default_issue_type', 'Task'))
+        except (ValueError, TypeError):
+            default_issue_type = IssueType.TASK
 
         # Parse datetime fields
-        created_at = datetime.now(timezone.utc)
-        if data.get('created_at'):
-            created_at = datetime.fromisoformat(data['created_at'])
-        
-        updated_at = datetime.now(timezone.utc)
-        if data.get('updated_at'):
-            updated_at = datetime.fromisoformat(data['updated_at'])
+        created_at = parse_iso_datetime(data.get('created_at')) or datetime.now(timezone.utc)
+        updated_at = parse_iso_datetime(data.get('updated_at')) or created_at
 
         return cls(
             user_id=data['user_id'],
@@ -303,65 +443,23 @@ class UserPreferences:
             updated_at=updated_at
         )
 
-    def update_preference(self, key: str, value: Any) -> bool:
-        """Update a specific preference."""
-        if not hasattr(self, key):
-            return False
-        
-        # Validate the value based on the field type
-        current_value = getattr(self, key)
-        
-        if isinstance(current_value, bool) and not isinstance(value, bool):
-            return False
-        elif isinstance(current_value, int) and not isinstance(value, int):
-            return False
-        elif isinstance(current_value, str) and not isinstance(value, str):
-            return False
-        elif isinstance(current_value, IssuePriority):
-            if isinstance(value, str):
-                try:
-                    value = IssuePriority.from_string(value)
-                except ValueError:
-                    return False
-            elif not isinstance(value, IssuePriority):
-                return False
-        elif isinstance(current_value, IssueType):
-            if isinstance(value, str):
-                try:
-                    value = IssueType.from_string(value)
-                except ValueError:
-                    return False
-            elif not isinstance(value, IssueType):
-                return False
-        
-        setattr(self, key, value)
-        self.updated_at = datetime.now(timezone.utc)
-        return True
-
-    def get_formatted_preferences(self) -> str:
-        """Get formatted preferences for display."""
-        prefs = f"⚙️ **User Preferences**\n\n"
-        prefs += f"🎯 Default Project: {self.default_project_key or 'None'}\n"
-        prefs += f"🔸 Default Priority: {self.default_priority.get_emoji()} {self.default_priority.value}\n"
-        prefs += f"📋 Default Issue Type: {self.default_issue_type.get_emoji()} {self.default_issue_type.value}\n"
-        prefs += f"👤 Auto-assign to self: {'✅' if self.auto_assign_to_self else '❌'}\n"
-        prefs += f"🔔 Notifications: {'✅' if self.notifications_enabled else '❌'}\n"
-        prefs += f"📄 Include descriptions: {'✅' if self.include_description_in_summary else '❌'}\n"
-        prefs += f"📊 Issues per page: {self.max_issues_per_page}\n"
-        prefs += f"📅 Date format: {self.date_format}\n"
-        prefs += f"🔍 Show issue details: {'✅' if self.show_issue_details else '❌'}\n"
-        prefs += f"⚡ Quick create mode: {'✅' if self.quick_create_mode else '❌'}\n"
-        
-        return prefs
-
     def __str__(self) -> str:
         """String representation of preferences."""
         return f"UserPreferences(user_id={self.user_id}, project={self.default_project_key})"
 
+    def __repr__(self) -> str:
+        """Developer representation of preferences."""
+        return (f"UserPreferences(user_id={self.user_id}, "
+                f"project='{self.default_project_key}', "
+                f"priority={self.default_priority.value})")
+
 
 @dataclass
 class UserSession:
-    """User session data for wizards and state management."""
+    """User session data for wizards and state management.
+    
+    FIXED: timezone.timedelta -> timedelta import issue resolved.
+    """
     user_id: int
     wizard_state: WizardState = WizardState.IDLE
     wizard_data: Dict[str, Any] = field(default_factory=dict)
@@ -376,20 +474,54 @@ class UserSession:
             raise ValueError("user_id must be a positive integer")
         if not isinstance(self.wizard_state, WizardState):
             raise TypeError("wizard_state must be a WizardState instance")
+        if not isinstance(self.wizard_data, dict):
+            raise TypeError("wizard_data must be a dictionary")
+        if self.last_command is not None and not isinstance(self.last_command, str):
+            raise TypeError("last_command must be a string or None")
+        if self.last_message_id is not None and not isinstance(self.last_message_id, int):
+            raise TypeError("last_message_id must be an integer or None")
+        if not isinstance(self.created_at, datetime):
+            raise TypeError("created_at must be a datetime object")
+        if not isinstance(self.expires_at, datetime):
+            raise TypeError("expires_at must be a datetime object")
+        if self.expires_at <= self.created_at:
+            raise ValueError("expires_at must be after created_at")
 
     def is_expired(self) -> bool:
-        """Check if session is expired."""
+        """Check if session is expired.
+        
+        Returns:
+            True if session has expired
+        """
         return datetime.now(timezone.utc) > self.expires_at
 
     def extend_expiry(self, hours: int = 24) -> None:
-        """Extend session expiry."""
+        """Extend session expiry.
+        
+        FIXED: Now correctly imports and uses timedelta instead of timezone.timedelta
+        
+        Args:
+            hours: Number of hours to extend (must be positive)
+            
+        Raises:
+            ValueError: If hours is not a positive integer
+        """
         if not isinstance(hours, int) or hours <= 0:
             raise ValueError("hours must be a positive integer")
         
-        self.expires_at = datetime.now(timezone.utc) + timezone.timedelta(hours=hours)
+        # FIXED: Use timedelta directly, not timezone.timedelta
+        self.expires_at = datetime.now(timezone.utc) + timedelta(hours=hours)
 
     def start_wizard(self, wizard_state: WizardState, initial_data: Optional[Dict[str, Any]] = None) -> None:
-        """Start a new wizard session."""
+        """Start a new wizard session.
+        
+        Args:
+            wizard_state: New wizard state
+            initial_data: Initial wizard data
+            
+        Raises:
+            TypeError: If wizard_state is not a WizardState instance
+        """
         if not isinstance(wizard_state, WizardState):
             raise TypeError("wizard_state must be a WizardState instance")
         
@@ -398,14 +530,30 @@ class UserSession:
         self.extend_expiry()
 
     def update_wizard_data(self, key: str, value: Any) -> None:
-        """Update wizard data."""
+        """Update wizard data.
+        
+        Args:
+            key: Data key
+            value: Data value
+            
+        Raises:
+            TypeError: If key is not a string
+        """
         if not isinstance(key, str):
             raise TypeError("key must be a string")
         
         self.wizard_data[key] = value
 
     def get_wizard_data(self, key: str, default: Any = None) -> Any:
-        """Get wizard data value."""
+        """Get wizard data value.
+        
+        Args:
+            key: Data key
+            default: Default value if key not found
+            
+        Returns:
+            Wizard data value or default
+        """
         return self.wizard_data.get(key, default)
 
     def clear_wizard(self) -> None:
@@ -414,15 +562,37 @@ class UserSession:
         self.wizard_data.clear()
 
     def is_in_wizard(self) -> bool:
-        """Check if user is currently in a wizard."""
-        return self.wizard_state != WizardState.IDLE
+        """Check if user is currently in a wizard.
+        
+        Returns:
+            True if wizard is active
+        """
+        return self.wizard_state.is_active()
+
+    def get_wizard_progress(self) -> str:
+        """Get formatted wizard progress information.
+        
+        Returns:
+            Formatted progress string
+        """
+        if not self.is_in_wizard():
+            return "No active wizard"
+        
+        state_name = self.wizard_state.value.replace('_', ' ').title()
+        data_count = len(self.wizard_data)
+        
+        return f"Wizard: {state_name} ({data_count} data items)"
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert session to dictionary for serialization."""
+        """Convert session to dictionary for serialization.
+        
+        Returns:
+            Dictionary representation of session
+        """
         return {
             'user_id': self.user_id,
             'wizard_state': self.wizard_state.value,
-            'wizard_data': self.wizard_data,
+            'wizard_data': self.wizard_data.copy(),
             'last_command': self.last_command,
             'last_message_id': self.last_message_id,
             'created_at': self.created_at.isoformat(),
@@ -431,7 +601,17 @@ class UserSession:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'UserSession':
-        """Create UserSession from dictionary."""
+        """Create UserSession from dictionary.
+        
+        Args:
+            data: Dictionary data
+            
+        Returns:
+            UserSession instance
+            
+        Raises:
+            TypeError: If data is not a dictionary
+        """
         if not isinstance(data, dict):
             raise TypeError("data must be a dictionary")
 
@@ -439,18 +619,17 @@ class UserSession:
         wizard_state = WizardState.IDLE
         if data.get('wizard_state'):
             try:
-                wizard_state = WizardState(data['wizard_state'])
-            except ValueError:
+                wizard_state = WizardState.from_string(data['wizard_state'])
+            except (ValueError, TypeError):
                 wizard_state = WizardState.IDLE
 
-        # Parse datetime fields
-        created_at = datetime.now(timezone.utc)
-        if data.get('created_at'):
-            created_at = datetime.fromisoformat(data['created_at'])
+        # Parse datetime fields with defaults
+        created_at = parse_iso_datetime(data.get('created_at')) or datetime.now(timezone.utc)
+        expires_at = parse_iso_datetime(data.get('expires_at'))
         
-        expires_at = datetime.now(timezone.utc).replace(hour=23, minute=59, second=59)
-        if data.get('expires_at'):
-            expires_at = datetime.fromisoformat(data['expires_at'])
+        # Default expiry to end of day if not specified
+        if not expires_at:
+            expires_at = datetime.now(timezone.utc).replace(hour=23, minute=59, second=59)
 
         return cls(
             user_id=data['user_id'],
@@ -465,3 +644,9 @@ class UserSession:
     def __str__(self) -> str:
         """String representation of session."""
         return f"UserSession(user_id={self.user_id}, state={self.wizard_state.value})"
+
+    def __repr__(self) -> str:
+        """Developer representation of session."""
+        return (f"UserSession(user_id={self.user_id}, "
+                f"state={self.wizard_state.value}, "
+                f"expired={self.is_expired()})")

@@ -2,63 +2,103 @@
 """
 Enumerations for the Telegram-Jira bot.
 
-Contains all enum definitions used throughout the application.
+Contains all enum classes used throughout the application for type safety
+and consistent value handling.
 """
 
 from enum import Enum
-from typing import List, Union
+from typing import List, Type, TypeVar, cast
+
+# Type variable for enum type hints
+T = TypeVar('T', bound='BaseEnum')
 
 
-class IssuePriority(Enum):
-    """Jira issue priority levels."""
-    LOWEST = "Lowest"
-    LOW = "Low"
-    MEDIUM = "Medium"
-    HIGH = "High"
-    HIGHEST = "Highest"
-
+class BaseEnum(Enum):
+    """Base enum class with common functionality."""
+    
     @classmethod
-    def from_string(cls, value: str) -> 'IssuePriority':
-        """Create IssuePriority from string with case-insensitive matching.
+    def from_string(cls: Type[T], value: str) -> T:
+        """Create enum from string with case-insensitive matching.
         
         Args:
-            value: Priority string to parse
+            value: String value to match
             
         Returns:
-            IssuePriority instance
+            Corresponding enum instance
             
         Raises:
             TypeError: If value is not a string
-            ValueError: If value doesn't match any priority
+            ValueError: If value doesn't match any enum member
         """
         if not isinstance(value, str):
             raise TypeError("value must be a string")
         
-        value_upper = value.upper()
-        for priority in cls:
-            if priority.value.upper() == value_upper:
-                return priority
+        value_normalized = value.strip().lower()
+        if not value_normalized:
+            raise ValueError(f"Invalid {cls.__name__}: empty string")
         
-        raise ValueError(f"Invalid priority: {value}. Valid options: {[p.value for p in cls]}")
-
+        for member in cls:
+            if member.value.lower() == value_normalized:
+                return member
+        
+        # Try alternative matches
+        for member in cls:
+            if member.name.lower() == value_normalized:
+                return member
+        
+        valid_values = [member.value for member in cls]
+        raise ValueError(f"Invalid {cls.__name__}: {value}. Valid options: {valid_values}")
+    
     @classmethod
     def get_all_values(cls) -> List[str]:
-        """Get all priority values as a list."""
-        return [priority.value for priority in cls]
+        """Get all enum values as a list.
+        
+        Returns:
+            List of all enum values
+        """
+        return [member.value for member in cls]
+
+
+class IssuePriority(BaseEnum):
+    """Jira issue priority levels."""
+    CRITICAL = "Critical"
+    HIGH = "High" 
+    MEDIUM = "Medium"
+    LOW = "Low"
+    LOWEST = "Lowest"
 
     def get_emoji(self) -> str:
-        """Get emoji representation for the priority."""
+        """Get emoji representation for the priority.
+        
+        Returns:
+            Priority emoji
+        """
         emoji_map = {
-            self.LOWEST: "🔵",
-            self.LOW: "🟢", 
+            self.CRITICAL: "🚨",
+            self.HIGH: "🔴", 
             self.MEDIUM: "🟡",
-            self.HIGH: "🟠",
-            self.HIGHEST: "🔴"
+            self.LOW: "🟢",
+            self.LOWEST: "⚪"
         }
-        return emoji_map.get(self, "⚪")
+        return emoji_map.get(self, "❓")
+    
+    def get_numeric_value(self) -> int:
+        """Get numeric value for sorting/comparison.
+        
+        Returns:
+            Numeric priority value (higher = more important)
+        """
+        value_map = {
+            self.CRITICAL: 5,
+            self.HIGH: 4,
+            self.MEDIUM: 3, 
+            self.LOW: 2,
+            self.LOWEST: 1
+        }
+        return value_map.get(self, 0)
 
 
-class IssueType(Enum):
+class IssueType(BaseEnum):
     """Jira issue types."""
     TASK = "Task"
     BUG = "Bug"
@@ -67,42 +107,16 @@ class IssueType(Enum):
     IMPROVEMENT = "Improvement"
     SUBTASK = "Sub-task"
 
-    @classmethod
-    def from_string(cls, value: str) -> 'IssueType':
-        """Create IssueType from string with case-insensitive matching.
-        
-        Args:
-            value: Issue type string to parse
-            
-        Returns:
-            IssueType instance
-            
-        Raises:
-            TypeError: If value is not a string
-            ValueError: If value doesn't match any issue type
-        """
-        if not isinstance(value, str):
-            raise TypeError("value must be a string")
-        
-        value_upper = value.upper().replace("-", "")
-        for issue_type in cls:
-            type_upper = issue_type.value.upper().replace("-", "")
-            if type_upper == value_upper:
-                return issue_type
-        
-        raise ValueError(f"Invalid issue type: {value}. Valid options: {[t.value for t in cls]}")
-
-    @classmethod
-    def get_all_values(cls) -> List[str]:
-        """Get all issue type values as a list."""
-        return [issue_type.value for issue_type in cls]
-
     def get_emoji(self) -> str:
-        """Get emoji representation for the issue type."""
+        """Get emoji representation for the issue type.
+        
+        Returns:
+            Issue type emoji
+        """
         emoji_map = {
             self.TASK: "📋",
             self.BUG: "🐛",
-            self.STORY: "📖",
+            self.STORY: "📖", 
             self.EPIC: "🚀",
             self.IMPROVEMENT: "⚡",
             self.SUBTASK: "📝"
@@ -110,59 +124,103 @@ class IssueType(Enum):
         return emoji_map.get(self, "📄")
 
 
-class IssueStatus(Enum):
+class IssueStatus(BaseEnum):
     """Jira issue status levels."""
-    TO_DO = "To Do"
+    TODO = "To Do"
     IN_PROGRESS = "In Progress"
     DONE = "Done"
     CLOSED = "Closed"
     REOPENED = "Reopened"
     RESOLVED = "Resolved"
-
-    @classmethod
-    def from_string(cls, value: str) -> 'IssueStatus':
-        """Create IssueStatus from string with case-insensitive matching."""
-        if not isinstance(value, str):
-            raise TypeError("value must be a string")
-        
-        value_normalized = value.upper().replace(" ", "_")
-        for status in cls:
-            status_normalized = status.value.upper().replace(" ", "_")
-            if status_normalized == value_normalized:
-                return status
-        
-        raise ValueError(f"Invalid status: {value}. Valid options: {[s.value for s in cls]}")
+    
+    # Additional common statuses
+    OPEN = "Open"
+    IN_REVIEW = "In Review"
+    TESTING = "Testing"
+    BLOCKED = "Blocked"
 
     def get_emoji(self) -> str:
-        """Get emoji representation for the status."""
+        """Get emoji representation for the status.
+        
+        Returns:
+            Status emoji
+        """
         emoji_map = {
-            self.TO_DO: "📝",
+            self.TODO: "📝",
+            self.OPEN: "📂",
             self.IN_PROGRESS: "⏳",
+            self.IN_REVIEW: "👀",
+            self.TESTING: "🧪",
+            self.BLOCKED: "🚫",
             self.DONE: "✅",
             self.CLOSED: "🔒",
-            self.REOPENED: "🔄",
+            self.REOPENED: "🔄", 
             self.RESOLVED: "✅"
         }
         return emoji_map.get(self, "❓")
+    
+    def is_final_status(self) -> bool:
+        """Check if this is a final/completed status.
+        
+        Returns:
+            True if status indicates completion
+        """
+        final_statuses = {self.DONE, self.CLOSED, self.RESOLVED}
+        return self in final_statuses
 
 
-class UserRole(Enum):
-    """User roles in the bot."""
+class UserRole(BaseEnum):
+    """User roles in the bot with permission hierarchy."""
     USER = "user"
     ADMIN = "admin"
     SUPER_ADMIN = "super_admin"
 
     def has_permission(self, required_role: 'UserRole') -> bool:
-        """Check if this role has the required permission."""
+        """Check if this role has the required permission level.
+        
+        Args:
+            required_role: Minimum role required
+            
+        Returns:
+            True if this role has sufficient permissions
+        """
         role_hierarchy = {
             self.USER: 1,
             self.ADMIN: 2,
             self.SUPER_ADMIN: 3
         }
-        return role_hierarchy.get(self, 0) >= role_hierarchy.get(required_role, 0)
+        current_level = role_hierarchy.get(self, 0)
+        required_level = role_hierarchy.get(required_role, 0)
+        return current_level >= required_level
+    
+    def get_display_name(self) -> str:
+        """Get formatted display name for the role.
+        
+        Returns:
+            Human-readable role name
+        """
+        display_map = {
+            self.USER: "User",
+            self.ADMIN: "Administrator", 
+            self.SUPER_ADMIN: "Super Administrator"
+        }
+        return display_map.get(self, "Unknown")
+    
+    def get_emoji(self) -> str:
+        """Get emoji representation for the role.
+        
+        Returns:
+            Role emoji
+        """
+        emoji_map = {
+            self.USER: "👤",
+            self.ADMIN: "🛡️",
+            self.SUPER_ADMIN: "👑"
+        }
+        return emoji_map.get(self, "❓")
 
 
-class CommandShortcut(Enum):
+class CommandShortcut(BaseEnum):
     """Command shortcuts for faster access."""
     # Project shortcuts
     PROJECTS = "p"
@@ -187,7 +245,11 @@ class CommandShortcut(Enum):
     QUICK = "q"
 
     def get_full_command(self) -> str:
-        """Get the full command name for this shortcut."""
+        """Get the full command name for this shortcut.
+        
+        Returns:
+            Full command string
+        """
         command_map = {
             self.PROJECTS: "projects",
             self.ADD_PROJECT: "addproject",
@@ -207,7 +269,7 @@ class CommandShortcut(Enum):
         return command_map.get(self, self.value)
 
 
-class WizardState(Enum):
+class WizardState(BaseEnum):
     """States for interactive wizards."""
     IDLE = "idle"
     
@@ -230,10 +292,18 @@ class WizardState(Enum):
     EDIT_SELECTING_FIELD = "edit_field"
     EDIT_ENTERING_VALUE = "edit_value"
     EDIT_CONFIRMING = "edit_confirm"
+    
+    def is_active(self) -> bool:
+        """Check if wizard is actively running.
+        
+        Returns:
+            True if wizard is in an active state
+        """
+        return self != self.IDLE
 
 
-class ErrorType(Enum):
-    """Types of errors that can occur."""
+class ErrorType(BaseEnum):
+    """Types of errors that can occur in the bot."""
     VALIDATION_ERROR = "validation"
     DATABASE_ERROR = "database"
     JIRA_API_ERROR = "jira_api"
@@ -246,7 +316,11 @@ class ErrorType(Enum):
     UNKNOWN_ERROR = "unknown"
 
     def get_emoji(self) -> str:
-        """Get emoji representation for the error type."""
+        """Get emoji representation for the error type.
+        
+        Returns:
+            Error type emoji
+        """
         emoji_map = {
             self.VALIDATION_ERROR: "⚠️",
             self.DATABASE_ERROR: "💾",
@@ -260,3 +334,16 @@ class ErrorType(Enum):
             self.UNKNOWN_ERROR: "❓"
         }
         return emoji_map.get(self, "❗")
+    
+    def is_user_error(self) -> bool:
+        """Check if this is a user-caused error.
+        
+        Returns:
+            True if error was caused by user input/action
+        """
+        user_errors = {
+            self.VALIDATION_ERROR,
+            self.PERMISSION_ERROR, 
+            self.NOT_FOUND_ERROR
+        }
+        return self in user_errors
