@@ -2,7 +2,7 @@
 """
 Telegram service for the Telegram-Jira bot.
 
-Handles Telegram-specific operations and message formatting.
+Handles Telegram-specific operations, message formatting, and bot interactions.
 """
 
 import logging
@@ -15,876 +15,887 @@ from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 from ..models.project import Project
-from ..models.issue import JiraIssue
+from ..models.issue import JiraIssue, IssueComment
 from ..models.user import User, UserPreferences
-from ..models.enums import IssuePriority, IssueType, IssueStatus, CommandShortcut
+from ..models.enums import IssuePriority, IssueType, IssueStatus, CommandShortcut, UserRole
 from ..utils.formatters import MessageFormatter
 from ..utils.constants import EMOJI, MAX_MESSAGE_LENGTH, MAX_CALLBACK_DATA_LENGTH
+
+
+class TelegramServiceError(Exception):
+    """Custom exception for Telegram service operations."""
+    pass
 
 
 class TelegramService:
     """Service for Telegram bot operations and message handling."""
 
-    def __init__(self, use_inline_keyboards: bool = True, compact_mode: bool = False):
+    def __init__(
+        self,
+        token: Optional[str] = None,
+        timeout: int = 30,
+        use_inline_keyboards: bool = True,
+        compact_mode: bool = False
+    ):
         """Initialize Telegram service.
         
         Args:
+            token: Telegram bot token (optional for some operations)
+            timeout: Request timeout in seconds
             use_inline_keyboards: Whether to use inline keyboards
             compact_mode: Whether to use compact message formatting
+            
+        Raises:
+            ValueError: If token is empty when provided
         """
+        if token is not None and (not isinstance(token, str) or not token.strip()):
+            raise ValueError("Token cannot be empty")
+        if not isinstance(timeout, int) or timeout <= 0:
+            raise ValueError("Timeout must be positive")
+        
+        self.token = token
+        self.timeout = timeout
         self.use_inline_keyboards = use_inline_keyboards
         self.compact_mode = compact_mode
         self.formatter = MessageFormatter(compact_mode)
         self.logger = logging.getLogger(__name__)
 
-    # Message sending utilities
+    # =============================================================================
+    # MESSAGE SENDING UTILITIES - FIXED SIGNATURES
+    # =============================================================================
+
     async def send_message(
         self,
-        update: Update,
-        text: str,
+        update: Optional[Update] = None,
+        context: Optional[ContextTypes.DEFAULT_TYPE] = None,
+        chat_id: Optional[int] = None,
+        text: str = "",
         reply_markup: Optional[Union[InlineKeyboardMarkup, ReplyKeyboardMarkup]] = None,
-        parse_mode: ParseMode = ParseMode.MARKDOWN,
+        parse_mode: ParseMode = ParseMode.MARKDOWN_V2,
         disable_web_page_preview: bool = True,
-        reply_to_message: bool = False
+        reply_to_message: bool = False,
+        message_id: Optional[int] = None
     ) -> Optional[int]:
         """Send a message with proper error handling.
         
         Args:
-            update: Telegram update object
+            update: Telegram update (for extracting chat_id)
+            context: Bot context
+            chat_id: Direct chat ID (overrides update)
             text: Message text
             reply_markup: Keyboard markup
             parse_mode: Message parse mode
             disable_web_page_preview: Whether to disable web page preview
             reply_to_message: Whether to reply to the original message
+            message_id: Specific message ID to reply to
             
         Returns:
-            Message ID if sent successfully, None otherwise
+            Message ID of sent message or None if failed
+            
+        Raises:
+            TelegramServiceError: If sending fails
         """
-        if not update.effective_chat:
-            self.logger.error("No effective chat in update")
-            return None
+        if not text.strip():
+            raise ValueError("Message text cannot be empty")
 
-        # Truncate message if too long
+        # Determine chat_id
+        effective_chat_id = chat_id
+        if not effective_chat_id and update:
+            effective_chat_id = update.effective_chat.id if update.effective_chat else None
+        
+        if not effective_chat_id:
+            raise ValueError("No chat_id provided and cannot extract from update")
+
+        # Escape text for MarkdownV2 if needed
+        if parse_mode == ParseMode.MARKDOWN_V2:
+            text = self._escape_markdown_v2(text)
+
+        # Split long messages
         if len(text) > MAX_MESSAGE_LENGTH:
-            text = text[:MAX_MESSAGE_LENGTH - 3] + "..."
-            self.logger.warning(f"Message truncated to {MAX_MESSAGE_LENGTH} characters")
+            return await self._send_long_message(
+                effective_chat_id, text, reply_markup, parse_mode, 
+                disable_web_page_preview, reply_to_message, message_id, context
+            )
 
         try:
-            message = await update.effective_chat.send_message(
-                text=text,
-                reply_markup=reply_markup,
-                parse_mode=parse_mode,
-                disable_web_page_preview=disable_web_page_preview,
-                reply_to_message_id=update.effective_message.message_id if reply_to_message and update.effective_message else None
-            )
-            return message.message_id
+            # Determine reply parameters
+            reply_to_message_id = None
+            if reply_to_message and update and update.message:
+                reply_to_message_id = update.message.message_id
+            elif message_id:
+                reply_to_message_id = message_id
+
+            # Send message via context if available
+            if context:
+                message = await context.bot.send_message(
+                    chat_id=effective_chat_id,
+                    text=text,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=disable_web_page_preview,
+                    reply_to_message_id=reply_to_message_id
+                )
+                return message.message_id
+            else:
+                # Fallback - would need bot instance
+                self.logger.warning("No context provided, cannot send message")
+                return None
+
         except TelegramError as e:
             self.logger.error(f"Failed to send message: {e}")
-            # Try sending without markdown if parse error
-            if "parse" in str(e).lower():
+            
+            # Try to send without markup if it was the problem
+            if reply_markup and "can't parse" in str(e).lower():
                 try:
-                    message = await update.effective_chat.send_message(
-                        text=text,
-                        reply_markup=reply_markup,
-                        parse_mode=None,
-                        disable_web_page_preview=disable_web_page_preview
-                    )
-                    return message.message_id
-                except TelegramError as e2:
-                    self.logger.error(f"Failed to send message without parse mode: {e2}")
-            return None
+                    if context:
+                        message = await context.bot.send_message(
+                            chat_id=effective_chat_id,
+                            text="⚠️ Message formatting error. Please check your input.",
+                            parse_mode=ParseMode.HTML
+                        )
+                        return message.message_id
+                except TelegramError:
+                    pass
+            
+            raise TelegramServiceError(f"Failed to send message: {e}")
 
     async def edit_message(
         self,
-        update: Update,
-        text: str,
+        update: Optional[Update] = None,
+        context: Optional[ContextTypes.DEFAULT_TYPE] = None,
+        chat_id: Optional[int] = None,
+        message_id: Optional[int] = None,
+        text: str = "",
         reply_markup: Optional[InlineKeyboardMarkup] = None,
-        parse_mode: ParseMode = ParseMode.MARKDOWN
+        parse_mode: ParseMode = ParseMode.MARKDOWN_V2
     ) -> bool:
-        """Edit a message with proper error handling.
+        """Edit an existing message.
         
         Args:
-            update: Telegram update object
+            update: Telegram update
+            context: Bot context
+            chat_id: Chat ID
+            message_id: Message ID to edit
             text: New message text
-            reply_markup: New keyboard markup
-            parse_mode: Message parse mode
+            reply_markup: New reply markup
+            parse_mode: Parse mode
             
         Returns:
-            True if edited successfully, False otherwise
+            True if successful
+            
+        Raises:
+            TelegramServiceError: If editing fails
         """
-        if not update.callback_query:
-            return False
+        if not text.strip():
+            raise ValueError("Message text cannot be empty")
 
-        # Truncate message if too long
-        if len(text) > MAX_MESSAGE_LENGTH:
-            text = text[:MAX_MESSAGE_LENGTH - 3] + "..."
+        # Determine parameters
+        effective_chat_id = chat_id
+        effective_message_id = message_id
+        
+        if not effective_chat_id and update:
+            if update.callback_query:
+                effective_chat_id = update.callback_query.message.chat.id
+                effective_message_id = update.callback_query.message.message_id
+            elif update.message:
+                effective_chat_id = update.message.chat.id
+                effective_message_id = update.message.message_id
+
+        if not effective_chat_id or not effective_message_id:
+            raise ValueError("Cannot determine chat_id or message_id")
+
+        # Escape text for MarkdownV2 if needed
+        if parse_mode == ParseMode.MARKDOWN_V2:
+            text = self._escape_markdown_v2(text)
 
         try:
-            await update.callback_query.edit_message_text(
-                text=text,
-                reply_markup=reply_markup,
-                parse_mode=parse_mode,
-                disable_web_page_preview=True
-            )
-            return True
+            if context:
+                await context.bot.edit_message_text(
+                    chat_id=effective_chat_id,
+                    message_id=effective_message_id,
+                    text=text,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup
+                )
+                return True
+            else:
+                self.logger.warning("No context provided, cannot edit message")
+                return False
+
         except TelegramError as e:
             self.logger.error(f"Failed to edit message: {e}")
-            # Try without markdown if parse error
-            if "parse" in str(e).lower():
-                try:
-                    await update.callback_query.edit_message_text(
-                        text=text,
-                        reply_markup=reply_markup,
-                        parse_mode=None,
-                        disable_web_page_preview=True
-                    )
-                    return True
-                except TelegramError as e2:
-                    self.logger.error(f"Failed to edit message without parse mode: {e2}")
+            raise TelegramServiceError(f"Failed to edit message: {e}")
+
+    async def delete_message(
+        self,
+        update: Optional[Update] = None,
+        context: Optional[ContextTypes.DEFAULT_TYPE] = None,
+        chat_id: Optional[int] = None,
+        message_id: Optional[int] = None
+    ) -> bool:
+        """Delete a message.
+        
+        Args:
+            update: Telegram update
+            context: Bot context
+            chat_id: Chat ID
+            message_id: Message ID to delete
+            
+        Returns:
+            True if successful
+        """
+        # Determine parameters
+        effective_chat_id = chat_id
+        effective_message_id = message_id
+        
+        if not effective_chat_id and update:
+            if update.callback_query:
+                effective_chat_id = update.callback_query.message.chat.id
+                effective_message_id = update.callback_query.message.message_id
+            elif update.message:
+                effective_chat_id = update.message.chat.id
+                effective_message_id = update.message.message_id
+
+        if not effective_chat_id or not effective_message_id:
+            self.logger.warning("Cannot determine chat_id or message_id for deletion")
             return False
 
-    async def send_error_message(
+        try:
+            if context:
+                await context.bot.delete_message(
+                    chat_id=effective_chat_id,
+                    message_id=effective_message_id
+                )
+                return True
+            else:
+                self.logger.warning("No context provided, cannot delete message")
+                return False
+
+        except TelegramError as e:
+            self.logger.warning(f"Failed to delete message: {e}")
+            return False
+
+    async def _send_long_message(
         self,
-        update: Update,
-        error_text: str,
-        include_help: bool = True
+        chat_id: int,
+        text: str,
+        reply_markup: Optional[Union[InlineKeyboardMarkup, ReplyKeyboardMarkup]],
+        parse_mode: ParseMode,
+        disable_web_page_preview: bool,
+        reply_to_message: bool,
+        message_id: Optional[int],
+        context: Optional[ContextTypes.DEFAULT_TYPE]
     ) -> Optional[int]:
-        """Send an error message with consistent formatting.
-        
-        Args:
-            update: Telegram update object
-            error_text: Error message text
-            include_help: Whether to include help text
-            
-        Returns:
-            Message ID if sent successfully, None otherwise
-        """
-        message = f"{EMOJI['ERROR']} **Error**\n\n{error_text}"
-        
-        if include_help:
-            message += f"\n\nType /help for assistance or contact an administrator."
-        
-        return await self.send_message(update, message)
+        """Send a long message by splitting it into chunks."""
+        if not context:
+            return None
 
-    async def send_success_message(
+        chunks = self._split_message(text, MAX_MESSAGE_LENGTH - 100)  # Leave buffer
+        last_message_id = None
+        
+        for i, chunk in enumerate(chunks):
+            # Only add markup to the last chunk
+            chunk_markup = reply_markup if i == len(chunks) - 1 else None
+            
+            try:
+                message = await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=chunk,
+                    parse_mode=parse_mode,
+                    reply_markup=chunk_markup,
+                    disable_web_page_preview=disable_web_page_preview,
+                    reply_to_message_id=message_id if i == 0 else None
+                )
+                last_message_id = message.message_id
+            except TelegramError as e:
+                self.logger.error(f"Failed to send message chunk {i+1}/{len(chunks)}: {e}")
+                break
+        
+        return last_message_id
+
+    def _split_message(self, text: str, max_length: int) -> List[str]:
+        """Split a long message into chunks."""
+        if len(text) <= max_length:
+            return [text]
+        
+        chunks = []
+        current_chunk = ""
+        
+        for line in text.split('\n'):
+            if len(current_chunk) + len(line) + 1 <= max_length:
+                current_chunk += line + '\n'
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.rstrip())
+                    current_chunk = line + '\n'
+                else:
+                    # Line is too long, split it
+                    while len(line) > max_length:
+                        chunks.append(line[:max_length])
+                        line = line[max_length:]
+                    current_chunk = line + '\n'
+        
+        if current_chunk:
+            chunks.append(current_chunk.rstrip())
+        
+        return chunks
+
+    def _escape_markdown_v2(self, text: str) -> str:
+        """Escape special characters for MarkdownV2."""
+        special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+        for char in special_chars:
+            text = text.replace(char, f'\\{char}')
+        return text
+
+    # =============================================================================
+    # MODEL-BASED MESSAGE FORMATTING - NEW FUNCTIONALITY
+    # =============================================================================
+
+    def format_project_message(
         self,
-        update: Update,
-        success_text: str,
-        reply_markup: Optional[InlineKeyboardMarkup] = None
-    ) -> Optional[int]:
-        """Send a success message with consistent formatting.
+        project: Project,
+        include_details: bool = True,
+        include_stats: bool = False
+    ) -> str:
+        """Format a project for display.
         
         Args:
-            update: Telegram update object
-            success_text: Success message text
-            reply_markup: Optional keyboard markup
+            project: Project model instance
+            include_details: Whether to include detailed information
+            include_stats: Whether to include statistics
             
         Returns:
-            Message ID if sent successfully, None otherwise
+            Formatted message text
         """
-        message = f"{EMOJI['SUCCESS']} {success_text}"
-        return await self.send_message(update, message, reply_markup)
+        if self.compact_mode:
+            return f"🏗️ **{project.key}**: {project.name}"
+        
+        emoji = EMOJI.get('PROJECT', '🏗️')
+        status_emoji = '✅' if project.is_active else '❌'
+        
+        message = f"{emoji} **{project.key}: {project.name}**\n"
+        message += f"Status: {status_emoji}\n"
+        
+        if include_details:
+            if project.description:
+                message += f"📝 {project.description}\n"
+            if project.lead:
+                message += f"👤 Lead: {project.lead}\n"
+            if project.project_type:
+                message += f"🔧 Type: {project.project_type.title()}\n"
+            if project.category:
+                message += f"📂 Category: {project.category}\n"
+        
+        if include_stats and project.issue_count > 0:
+            message += f"📊 Issues: {project.issue_count}\n"
+        
+        if project.url:
+            message += f"🔗 [View in Jira]({project.url})\n"
+        
+        return message.strip()
 
-    async def send_info_message(
-        self,
-        update: Update,
-        info_text: str,
-        reply_markup: Optional[InlineKeyboardMarkup] = None
-    ) -> Optional[int]:
-        """Send an info message with consistent formatting.
-        
-        Args:
-            update: Telegram update object
-            info_text: Info message text
-            reply_markup: Optional keyboard markup
-            
-        Returns:
-            Message ID if sent successfully, None otherwise
-        """
-        message = f"{EMOJI['INFO']} {info_text}"
-        return await self.send_message(update, message, reply_markup)
-
-    async def send_warning_message(
-        self,
-        update: Update,
-        warning_text: str,
-        reply_markup: Optional[InlineKeyboardMarkup] = None
-    ) -> Optional[int]:
-        """Send a warning message with consistent formatting.
-        
-        Args:
-            update: Telegram update object
-            warning_text: Warning message text
-            reply_markup: Optional keyboard markup
-            
-        Returns:
-            Message ID if sent successfully, None otherwise
-        """
-        message = f"{EMOJI['WARNING']} {warning_text}"
-        return await self.send_message(update, message, reply_markup)
-
-    # Keyboard creation utilities
-    def create_project_selection_keyboard(
-        self,
-        projects: List[Project],
-        callback_prefix: str = "select_project",
-        max_per_row: int = 1,
-        show_cancel: bool = True
-    ) -> InlineKeyboardMarkup:
-        """Create an inline keyboard for project selection.
-        
-        Args:
-            projects: List of projects to display
-            callback_prefix: Prefix for callback data
-            max_per_row: Maximum buttons per row
-            show_cancel: Whether to show cancel button
-            
-        Returns:
-            InlineKeyboardMarkup object
-        """
-        keyboard = []
-        row = []
-        
-        for project in projects:
-            button_text = f"{EMOJI['PROJECT']} {project.key} - {project.name}"
-            if len(button_text) > 40:  # Telegram button text limit
-                button_text = f"{EMOJI['PROJECT']} {project.key} - {project.name[:30]}..."
-            
-            callback_data = f"{callback_prefix}_{project.key}"
-            if len(callback_data) > MAX_CALLBACK_DATA_LENGTH:
-                callback_data = callback_data[:MAX_CALLBACK_DATA_LENGTH]
-            
-            button = InlineKeyboardButton(button_text, callback_data=callback_data)
-            row.append(button)
-            
-            if len(row) >= max_per_row:
-                keyboard.append(row)
-                row = []
-        
-        if row:  # Add remaining buttons
-            keyboard.append(row)
-        
-        if show_cancel:
-            keyboard.append([InlineKeyboardButton(f"{EMOJI['CANCEL']} Cancel", callback_data="cancel")])
-        
-        return InlineKeyboardMarkup(keyboard)
-
-    def create_priority_selection_keyboard(
-        self,
-        callback_prefix: str = "select_priority",
-        selected_priority: Optional[IssuePriority] = None
-    ) -> InlineKeyboardMarkup:
-        """Create an inline keyboard for priority selection.
-        
-        Args:
-            callback_prefix: Prefix for callback data
-            selected_priority: Currently selected priority (will be marked)
-            
-        Returns:
-            InlineKeyboardMarkup object
-        """
-        keyboard = []
-        
-        for priority in IssuePriority:
-            emoji = priority.get_emoji()
-            text = f"{emoji} {priority.value}"
-            
-            if priority == selected_priority:
-                text = f"{EMOJI['SELECTED']} {text}"
-            
-            callback_data = f"{callback_prefix}_{priority.value}"
-            button = InlineKeyboardButton(text, callback_data=callback_data)
-            keyboard.append([button])
-        
-        keyboard.append([InlineKeyboardButton(f"{EMOJI['CANCEL']} Cancel", callback_data="cancel")])
-        return InlineKeyboardMarkup(keyboard)
-
-    def create_issue_type_selection_keyboard(
-        self,
-        callback_prefix: str = "select_type",
-        selected_type: Optional[IssueType] = None
-    ) -> InlineKeyboardMarkup:
-        """Create an inline keyboard for issue type selection.
-        
-        Args:
-            callback_prefix: Prefix for callback data
-            selected_type: Currently selected type (will be marked)
-            
-        Returns:
-            InlineKeyboardMarkup object
-        """
-        keyboard = []
-        
-        for issue_type in IssueType:
-            emoji = issue_type.get_emoji()
-            text = f"{emoji} {issue_type.value}"
-            
-            if issue_type == selected_type:
-                text = f"{EMOJI['SELECTED']} {text}"
-            
-            callback_data = f"{callback_prefix}_{issue_type.value}"
-            button = InlineKeyboardButton(text, callback_data=callback_data)
-            keyboard.append([button])
-        
-        keyboard.append([InlineKeyboardButton(f"{EMOJI['CANCEL']} Cancel", callback_data="cancel")])
-        return InlineKeyboardMarkup(keyboard)
-
-    def create_pagination_keyboard(
-        self,
-        current_page: int,
-        total_pages: int,
-        callback_prefix: str = "page",
-        show_numbers: bool = True
-    ) -> InlineKeyboardMarkup:
-        """Create pagination keyboard.
-        
-        Args:
-            current_page: Current page number (0-based)
-            total_pages: Total number of pages
-            callback_prefix: Prefix for callback data
-            show_numbers: Whether to show page numbers
-            
-        Returns:
-            InlineKeyboardMarkup object
-        """
-        keyboard = []
-        row = []
-        
-        # Previous page button
-        if current_page > 0:
-            row.append(InlineKeyboardButton(
-                f"{EMOJI['PREVIOUS']} Previous",
-                callback_data=f"{callback_prefix}_{current_page - 1}"
-            ))
-        
-        # Page number display
-        if show_numbers and total_pages > 1:
-            row.append(InlineKeyboardButton(
-                f"{current_page + 1}/{total_pages}",
-                callback_data="noop"
-            ))
-        
-        # Next page button
-        if current_page < total_pages - 1:
-            row.append(InlineKeyboardButton(
-                f"Next {EMOJI['NEXT']}",
-                callback_data=f"{callback_prefix}_{current_page + 1}"
-            ))
-        
-        if row:
-            keyboard.append(row)
-        
-        return InlineKeyboardMarkup(keyboard)
-
-    def create_issue_actions_keyboard(
+    def format_issue_message(
         self,
         issue: JiraIssue,
-        show_comments: bool = True,
-        show_edit: bool = True,
-        show_assign: bool = True
-    ) -> InlineKeyboardMarkup:
-        """Create action keyboard for an issue.
-        
-        Args:
-            issue: Issue to create actions for
-            show_comments: Whether to show comments button
-            show_edit: Whether to show edit button
-            show_assign: Whether to show assign button
-            
-        Returns:
-            InlineKeyboardMarkup object
-        """
-        keyboard = []
-        
-        # First row - View in Jira
-        keyboard.append([
-            InlineKeyboardButton(f"{EMOJI['LINK']} View in Jira", url=issue.url)
-        ])
-        
-        # Second row - Actions
-        row = []
-        if show_comments:
-            row.append(InlineKeyboardButton(
-                f"{EMOJI['COMMENT']} Comments",
-                callback_data=f"comments_{issue.key}"
-            ))
-        
-        if show_edit:
-            row.append(InlineKeyboardButton(
-                f"{EMOJI['EDIT']} Edit",
-                callback_data=f"edit_{issue.key}"
-            ))
-        
-        if row:
-            keyboard.append(row)
-        
-        # Third row - Additional actions
-        row = []
-        if show_assign:
-            row.append(InlineKeyboardButton(
-                f"{EMOJI['USER']} Assign",
-                callback_data=f"assign_{issue.key}"
-            ))
-        
-        row.append(InlineKeyboardButton(
-            f"{EMOJI['REFRESH']} Refresh",
-            callback_data=f"refresh_{issue.key}"
-        ))
-        
-        if row:
-            keyboard.append(row)
-        
-        return InlineKeyboardMarkup(keyboard)
-
-    def create_command_shortcuts_keyboard(self) -> ReplyKeyboardMarkup:
-        """Create reply keyboard with command shortcuts.
-        
-        Returns:
-            ReplyKeyboardMarkup object
-        """
-        keyboard = [
-            [
-                KeyboardButton(f"/{CommandShortcut.PROJECTS.value}"),
-                KeyboardButton(f"/{CommandShortcut.CREATE_ISSUE.value}"),
-                KeyboardButton(f"/{CommandShortcut.MY_ISSUES.value}")
-            ],
-            [
-                KeyboardButton(f"/{CommandShortcut.STATUS.value}"),
-                KeyboardButton(f"/{CommandShortcut.WIZARD.value}"),
-                KeyboardButton("/help")
-            ]
-        ]
-        
-        return ReplyKeyboardMarkup(
-            keyboard,
-            resize_keyboard=True,
-            one_time_keyboard=False,
-            input_field_placeholder="Choose a command or type a message to create an issue..."
-        )
-
-    # Message formatting utilities
-    def format_project_list(
-        self,
-        projects: List[Project],
-        user_default: Optional[str] = None,
-        show_details: bool = True
+        include_description: bool = True,
+        include_details: bool = True
     ) -> str:
-        """Format a list of projects for display.
+        """Format an issue for display.
         
         Args:
-            projects: List of projects to format
-            user_default: User's default project key
-            show_details: Whether to show project details
+            issue: JiraIssue model instance
+            include_description: Whether to include description
+            include_details: Whether to include detailed information
             
         Returns:
-            Formatted project list text
+            Formatted message text
         """
-        if not projects:
-            return f"{EMOJI['INFO']} No projects available."
+        if self.compact_mode:
+            return f"{issue.priority.get_emoji()} **{issue.key}**: {issue.summary}"
         
-        text = f"{EMOJI['PROJECT']} **Available Projects ({len(projects)})**\n\n"
+        # Emojis
+        priority_emoji = issue.priority.get_emoji()
+        type_emoji = issue.issue_type.get_emoji()
+        status_emoji = issue.status.get_emoji()
         
-        for project in projects:
-            default_marker = f" {EMOJI['DEFAULT']}" if project.key == user_default else ""
-            status_emoji = EMOJI['ACTIVE'] if project.is_active else EMOJI['INACTIVE']
+        message = f"{type_emoji} **{issue.key}: {issue.summary}**\n\n"
+        
+        # Basic info
+        message += f"📊 **Status**: {status_emoji} {issue.status.value}\n"
+        message += f"🎯 **Priority**: {priority_emoji} {issue.priority.value}\n"
+        message += f"🏷️ **Type**: {type_emoji} {issue.issue_type.value}\n"
+        message += f"🏗️ **Project**: {issue.project_key}\n"
+        
+        if include_details:
+            if issue.assignee:
+                message += f"👤 **Assignee**: {issue.assignee}\n"
+            if issue.reporter:
+                message += f"📝 **Reporter**: {issue.reporter}\n"
             
-            text += f"{status_emoji} **{project.key}**{default_marker}\n"
-            text += f"└ {project.name}\n"
+            # Dates
+            message += f"📅 **Created**: {self._format_datetime(issue.created_at)}\n"
+            if issue.updated_at and issue.updated_at != issue.created_at:
+                message += f"🔄 **Updated**: {self._format_datetime(issue.updated_at)}\n"
+            if issue.due_date:
+                message += f"⏰ **Due**: {self._format_datetime(issue.due_date)}\n"
+            if issue.resolved_at:
+                message += f"✅ **Resolved**: {self._format_datetime(issue.resolved_at)}\n"
             
-            if show_details:
-                if project.description:
-                    desc = project.description[:100] + "..." if len(project.description) > 100 else project.description
-                    text += f"└ _{desc}_\n"
-                
-                if project.lead:
-                    text += f"└ {EMOJI['USER']} Lead: {project.lead}\n"
-                
-                if project.issue_count > 0:
-                    text += f"└ {EMOJI['ISSUE']} Issues: {project.issue_count}\n"
+            # Labels and components
+            if hasattr(issue, 'labels') and issue.labels:
+                message += f"🏷️ **Labels**: {', '.join(issue.labels)}\n"
+            if hasattr(issue, 'components') and issue.components:
+                message += f"🔧 **Components**: {', '.join(issue.components)}\n"
+        
+        # Description
+        if include_description and issue.description:
+            description = issue.description
+            if len(description) > 300:
+                description = description[:297] + "..."
+            message += f"\n📋 **Description**:\n{description}\n"
+        
+        return message.strip()
+
+    def format_comment_message(self, comment: IssueComment) -> str:
+        """Format a comment for display.
+        
+        Args:
+            comment: IssueComment model instance
             
-            text += "\n"
+        Returns:
+            Formatted message text
+        """
+        message = f"💬 **Comment by {comment.author}**\n"
+        message += f"📅 {self._format_datetime(comment.created_at)}\n\n"
         
-        if user_default:
-            text += f"\n{EMOJI['DEFAULT']} Your default: **{user_default}**"
-        else:
-            text += f"\n{EMOJI['INFO']} No default project set. Use /setdefault to choose one."
+        body = comment.body
+        if len(body) > 500:
+            body = body[:497] + "..."
         
-        return text
+        message += body
+        return message
+
+    def format_user_message(
+        self,
+        user: User,
+        include_stats: bool = False,
+        include_preferences: bool = False,
+        preferences: Optional[UserPreferences] = None
+    ) -> str:
+        """Format user information for display.
+        
+        Args:
+            user: User model instance
+            include_stats: Whether to include statistics
+            include_preferences: Whether to include preferences
+            preferences: User preferences (if available)
+            
+        Returns:
+            Formatted message text
+        """
+        role_emoji = {
+            UserRole.USER: '👤',
+            UserRole.ADMIN: '🛡️',
+            UserRole.SUPER_ADMIN: '👑'
+        }.get(user.role, '👤')
+        
+        status_emoji = '✅' if user.is_active else '❌'
+        
+        message = f"{role_emoji} **{user.get_display_name()}**\n"
+        message += f"Status: {status_emoji}\n"
+        message += f"Role: {user.role.value.replace('_', ' ').title()}\n"
+        
+        if user.username:
+            message += f"Username: @{user.username}\n"
+        
+        if include_stats:
+            message += f"📊 Issues Created: {user.issues_created}\n"
+            message += f"📅 Joined: {self._format_datetime(user.created_at)}\n"
+            message += f"🕐 Last Active: {self._format_datetime(user.last_activity)}\n"
+        
+        if include_preferences and preferences:
+            message += "\n**Preferences**:\n"
+            if preferences.default_project_key:
+                message += f"🏗️ Default Project: {preferences.default_project_key}\n"
+            message += f"🎯 Default Priority: {preferences.default_priority.value}\n"
+            message += f"🏷️ Default Type: {preferences.default_issue_type.value}\n"
+            message += f"📄 Max Issues/Page: {preferences.max_issues_per_page}\n"
+        
+        return message.strip()
 
     def format_issue_list(
         self,
         issues: List[JiraIssue],
         title: str = "Issues",
         show_project: bool = True,
-        show_status: bool = True,
-        compact: bool = False
+        max_items: int = 10
     ) -> str:
         """Format a list of issues for display.
         
         Args:
-            issues: List of issues to format
-            title: Title for the list
-            show_project: Whether to show project information
-            show_status: Whether to show issue status
-            compact: Whether to use compact formatting
+            issues: List of JiraIssue model instances
+            title: List title
+            show_project: Whether to show project key
+            max_items: Maximum items to show
             
         Returns:
-            Formatted issue list text
+            Formatted message text
         """
         if not issues:
-            return f"{EMOJI['INFO']} No issues found."
+            return f"📝 **{title}**\n\nNo issues found."
         
-        text = f"{EMOJI['ISSUE']} **{title} ({len(issues)})**\n\n"
+        message = f"📝 **{title}** ({len(issues)})\n\n"
         
-        for issue in issues:
-            if compact:
-                text += self._format_issue_compact(issue, show_project, show_status)
-            else:
-                text += self._format_issue_detailed(issue, show_project, show_status)
-            text += "\n"
+        for i, issue in enumerate(issues[:max_items]):
+            priority_emoji = issue.priority.get_emoji()
+            status_emoji = issue.status.get_emoji()
+            
+            line = f"{i+1}. {priority_emoji}{status_emoji} **{issue.key}**"
+            if show_project:
+                line += f" ({issue.project_key})"
+            line += f": {issue.summary}\n"
+            
+            # Truncate long summaries
+            if len(line) > 150:
+                line = line[:147] + "...\n"
+            
+            message += line
         
-        return text
+        if len(issues) > max_items:
+            message += f"\n... and {len(issues) - max_items} more"
+        
+        return message
 
-    def _format_issue_compact(
+    def format_project_list(
         self,
-        issue: JiraIssue,
-        show_project: bool = True,
-        show_status: bool = True
+        projects: List[Project],
+        title: str = "Projects",
+        active_only: bool = True,
+        max_items: int = 15
     ) -> str:
-        """Format an issue in compact mode."""
-        priority_emoji = issue.priority.get_emoji()
-        type_emoji = issue.issue_type.get_emoji()
-        
-        text = f"{priority_emoji}{type_emoji} **{issue.key}**: {issue.summary[:50]}"
-        if len(issue.summary) > 50:
-            text += "..."
-        text += "\n"
-        
-        details = []
-        if show_project:
-            details.append(f"Project: {issue.project_key}")
-        if show_status and issue.status:
-            details.append(f"Status: {issue.status.value}")
-        if issue.assignee:
-            details.append(f"Assignee: {issue.assignee}")
-        
-        if details:
-            text += f"└ {' • '.join(details)}\n"
-        
-        return text
-
-    def _format_issue_detailed(
-        self,
-        issue: JiraIssue,
-        show_project: bool = True,
-        show_status: bool = True
-    ) -> str:
-        """Format an issue in detailed mode."""
-        priority_emoji = issue.priority.get_emoji()
-        type_emoji = issue.issue_type.get_emoji()
-        status_emoji = issue.status.get_emoji() if issue.status else ""
-        
-        text = f"{priority_emoji} {type_emoji} **{issue.key}**: {issue.summary}\n"
-        
-        if show_project:
-            text += f"└ {EMOJI['PROJECT']} Project: {issue.project_key}\n"
-        
-        if show_status and issue.status:
-            text += f"└ {status_emoji} Status: {issue.status.value}\n"
-        
-        if issue.assignee:
-            text += f"└ {EMOJI['USER']} Assignee: {issue.assignee}\n"
-        
-        if issue.priority != IssuePriority.MEDIUM:  # Only show if not default
-            text += f"└ {priority_emoji} Priority: {issue.priority.value}\n"
-        
-        if issue.labels:
-            labels_text = ", ".join(issue.labels[:3])
-            if len(issue.labels) > 3:
-                labels_text += f" (+{len(issue.labels) - 3} more)"
-            text += f"└ {EMOJI['LABEL']} Labels: {labels_text}\n"
-        
-        if issue.due_date:
-            due_text = issue.due_date.strftime('%Y-%m-%d')
-            if issue.is_overdue():
-                due_text = f"{EMOJI['OVERDUE']} {due_text} (overdue)"
-            text += f"└ {EMOJI['CALENDAR']} Due: {due_text}\n"
-        
-        # Age of issue
-        age_days = issue.get_age_days()
-        if age_days > 0:
-            text += f"└ {EMOJI['CLOCK']} Age: {age_days} days\n"
-        
-        return text
-
-    def format_user_stats(
-        self,
-        user: User,
-        preferences: Optional[UserPreferences] = None,
-        recent_issues_count: int = 0
-    ) -> str:
-        """Format user statistics for display.
+        """Format a list of projects for display.
         
         Args:
-            user: User object
-            preferences: User preferences
-            recent_issues_count: Number of recent issues
+            projects: List of Project model instances
+            title: List title
+            active_only: Whether to show only active projects
+            max_items: Maximum items to show
             
         Returns:
-            Formatted user stats text
+            Formatted message text
         """
-        text = f"{EMOJI['USER']} **User Profile**\n\n"
-        text += f"**Name:** {user.get_display_name()}\n"
-        text += f"**ID:** `{user.user_id}`\n"
-        text += f"**Role:** {user.role.value.title()}\n"
+        if active_only:
+            projects = [p for p in projects if p.is_active]
         
-        # Activity stats
-        text += f"\n{EMOJI['STATS']} **Activity**\n"
-        text += f"└ Issues Created: {user.issues_created}\n"
-        text += f"└ Recent Issues: {recent_issues_count}\n"
+        if not projects:
+            return f"🏗️ **{title}**\n\nNo projects found."
         
-        # Account info
-        days_since_joined = (datetime.now(timezone.utc) - user.created_at).days
-        days_since_activity = (datetime.now(timezone.utc) - user.last_activity).days
+        message = f"🏗️ **{title}** ({len(projects)})\n\n"
         
-        text += f"\n{EMOJI['INFO']} **Account**\n"
-        text += f"└ Member Since: {days_since_joined} days ago\n"
-        text += f"└ Last Active: {days_since_activity} days ago\n"
+        for i, project in enumerate(projects[:max_items]):
+            status_emoji = '✅' if project.is_active else '❌'
+            message += f"{i+1}. {status_emoji} **{project.key}**: {project.name}\n"
         
-        if user.timezone:
-            text += f"└ Timezone: {user.timezone}\n"
+        if len(projects) > max_items:
+            message += f"\n... and {len(projects) - max_items} more"
         
-        # Preferences
-        if preferences:
-            text += f"\n{EMOJI['SETTINGS']} **Preferences**\n"
-            text += f"└ Default Project: {preferences.default_project_key or 'None'}\n"
-            text += f"└ Default Priority: {preferences.default_priority.get_emoji()} {preferences.default_priority.value}\n"
-            text += f"└ Default Type: {preferences.default_issue_type.get_emoji()} {preferences.default_issue_type.value}\n"
-            text += f"└ Quick Create: {'✅' if preferences.quick_create_mode else '❌'}\n"
-        
-        return text
+        return message
 
-    def format_help_text(
+    def _format_datetime(self, dt: Optional[datetime]) -> str:
+        """Format datetime for display.
+        
+        Args:
+            dt: datetime object
+            
+        Returns:
+            Formatted datetime string
+        """
+        if not dt:
+            return "N/A"
+        
+        # Convert to user's timezone if needed (simplified for now)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        
+        now = datetime.now(timezone.utc)
+        diff = now - dt
+        
+        if diff.days == 0:
+            if diff.seconds < 3600:  # Less than 1 hour
+                minutes = diff.seconds // 60
+                return f"{minutes}m ago"
+            else:  # Less than 24 hours
+                hours = diff.seconds // 3600
+                return f"{hours}h ago"
+        elif diff.days == 1:
+            return "Yesterday"
+        elif diff.days < 7:
+            return f"{diff.days}d ago"
+        else:
+            return dt.strftime("%Y-%m-%d")
+
+    # =============================================================================
+    # KEYBOARD GENERATION - MODEL-AWARE
+    # =============================================================================
+
+    def create_project_keyboard(
         self,
-        user_role: str = "user",
-        show_shortcuts: bool = True,
-        show_examples: bool = True
-    ) -> str:
-        """Format help text based on user role.
+        projects: List[Project],
+        action_prefix: str = "select_project",
+        max_per_row: int = 2,
+        max_projects: int = 20
+    ) -> InlineKeyboardMarkup:
+        """Create keyboard with project selection buttons.
         
         Args:
-            user_role: User's role (user, admin, super_admin)
-            show_shortcuts: Whether to show command shortcuts
-            show_examples: Whether to show examples
+            projects: List of Project model instances
+            action_prefix: Callback data prefix
+            max_per_row: Maximum buttons per row
+            max_projects: Maximum projects to show
             
         Returns:
-            Formatted help text
+            InlineKeyboardMarkup
         """
-        text = f"{EMOJI['HELP']} **Telegram-Jira Bot Help**\n\n"
-        
-        # Basic commands
-        text += f"{EMOJI['COMMAND']} **Basic Commands**\n"
-        text += "• `/start` - Welcome message and setup\n"
-        text += "• `/help` - Show this help message\n"
-        text += "• `/status` - Bot status and your statistics\n"
-        text += "• `/projects` - List available projects\n"
-        text += "• `/setdefault <KEY>` - Set your default project\n"
-        text += "• `/create` - Interactive issue creation\n"
-        text += "• `/myissues` - Your recent issues\n"
-        
-        # Issue management
-        text += f"\n{EMOJI['ISSUE']} **Issue Management**\n"
-        text += "• `/listissues` - List all issues with filters\n"
-        text += "• `/searchissues <query>` - Search issues by text\n"
-        text += "• Send any message - Create issue in default project\n"
-        
-        # Quick formatting
-        if show_examples:
-            text += f"\n{EMOJI['MAGIC']} **Quick Create Examples**\n"
-            text += "• `Login button not working` - Creates Medium Task\n"
-            text += "• `HIGH BUG App crashes on startup` - Creates High Bug\n"
-            text += "• `STORY User wants export feature` - Creates Medium Story\n"
-        
-        # Admin commands
-        if user_role in ["admin", "super_admin"]:
-            text += f"\n{EMOJI['ADMIN']} **Admin Commands**\n"
-            text += "• `/addproject <KEY> <Name> [Description]` - Add new project\n"
-            text += "• `/editproject <KEY>` - Edit project details\n"
-            text += "• `/deleteproject <KEY>` - Delete project\n"
-            text += "• `/users` - List all users and statistics\n"
-            text += "• `/syncjira` - Sync data with Jira\n"
-        
-        # Shortcuts
-        if show_shortcuts:
-            text += f"\n{EMOJI['SHORTCUT']} **Command Shortcuts**\n"
-            text += f"• `/p` → `/projects`\n"
-            text += f"• `/c` → `/create`\n"
-            text += f"• `/mi` → `/myissues`\n"
-            text += f"• `/s` → `/status`\n"
-            text += f"• `/w` → `/wizard`\n"
-            
-            if user_role in ["admin", "super_admin"]:
-                text += f"• `/ap` → `/addproject`\n"
-                text += f"• `/u` → `/users`\n"
-        
-        # Tips
-        text += f"\n{EMOJI['TIP']} **Tips**\n"
-        text += "• Use `/wizard` for step-by-step guidance\n"
-        text += "• Set a default project for quick issue creation\n"
-        text += "• Use priority and type prefixes for quick formatting\n"
-        text += "• All created issues are linked to your Telegram account\n"
-        
-        return text
-
-    def format_wizard_welcome(self) -> str:
-        """Format the wizard welcome message.
-        
-        Returns:
-            Formatted wizard welcome text
-        """
-        text = f"{EMOJI['WIZARD']} **Setup Wizard**\n\n"
-        text += "Welcome to the interactive setup wizard! "
-        text += "I'll guide you through configuring the bot step by step.\n\n"
-        text += "What would you like to do?\n\n"
-        text += f"{EMOJI['PROJECT']} Set up projects\n"
-        text += f"{EMOJI['ISSUE']} Create an issue\n"
-        text += f"{EMOJI['SETTINGS']} Configure preferences\n"
-        text += f"{EMOJI['HELP']} Get help and tips\n"
-        
-        return text
-
-    # Utility methods
-    def extract_command_args(self, message_text: str, command: str) -> List[str]:
-        """Extract arguments from a command message.
-        
-        Args:
-            message_text: Full message text
-            command: Command name (without /)
-            
-        Returns:
-            List of command arguments
-        """
-        if not message_text.startswith(f"/{command}"):
-            return []
-        
-        # Remove command and split by spaces
-        args_text = message_text[len(f"/{command}"):].strip()
-        if not args_text:
-            return []
-        
-        # Simple argument parsing (could be enhanced for quoted args)
-        return args_text.split()
-
-    def is_command_shortcut(self, text: str) -> Optional[str]:
-        """Check if text is a command shortcut and return the full command.
-        
-        Args:
-            text: Message text to check
-            
-        Returns:
-            Full command name if shortcut found, None otherwise
-        """
-        if not text.startswith("/"):
+        if not self.use_inline_keyboards:
             return None
         
-        shortcut = text[1:]  # Remove /
+        keyboard = []
+        current_row = []
         
-        for command_shortcut in CommandShortcut:
-            if command_shortcut.value == shortcut:
-                return command_shortcut.get_full_command()
+        active_projects = [p for p in projects if p.is_active][:max_projects]
         
-        return None
+        for project in active_projects:
+            button_text = f"{project.key}: {project.name}"
+            if len(button_text) > 30:
+                button_text = f"{project.key}: {project.name[:20]}..."
+            
+            callback_data = f"{action_prefix}:{project.key}"
+            if len(callback_data) > MAX_CALLBACK_DATA_LENGTH:
+                callback_data = callback_data[:MAX_CALLBACK_DATA_LENGTH]
+            
+            button = InlineKeyboardButton(button_text, callback_data=callback_data)
+            current_row.append(button)
+            
+            if len(current_row) >= max_per_row:
+                keyboard.append(current_row)
+                current_row = []
+        
+        if current_row:
+            keyboard.append(current_row)
+        
+        return InlineKeyboardMarkup(keyboard)
 
-    def truncate_text(self, text: str, max_length: int = 100, suffix: str = "...") -> str:
-        """Truncate text to specified length.
+    def create_issue_actions_keyboard(
+        self,
+        issue: JiraIssue,
+        user_role: UserRole = UserRole.USER
+    ) -> InlineKeyboardMarkup:
+        """Create keyboard with issue action buttons.
         
         Args:
-            text: Text to truncate
-            max_length: Maximum length
-            suffix: Suffix to add if truncated
+            issue: JiraIssue model instance
+            user_role: User role for permission-based actions
             
         Returns:
-            Truncated text
+            InlineKeyboardMarkup
         """
-        if len(text) <= max_length:
-            return text
+        if not self.use_inline_keyboards:
+            return None
         
-        return text[:max_length - len(suffix)] + suffix
+        keyboard = []
+        
+        # Basic actions
+        row1 = [
+            InlineKeyboardButton("📝 View Details", callback_data=f"view_issue:{issue.key}"),
+            InlineKeyboardButton("💬 Comments", callback_data=f"comments:{issue.key}")
+        ]
+        keyboard.append(row1)
+        
+        # Status transition actions (simplified)
+        row2 = []
+        if issue.status == IssueStatus.TODO:
+            row2.append(InlineKeyboardButton("▶️ Start Work", callback_data=f"transition:{issue.key}:progress"))
+        elif issue.status == IssueStatus.IN_PROGRESS:
+            row2.append(InlineKeyboardButton("✅ Mark Done", callback_data=f"transition:{issue.key}:done"))
+            row2.append(InlineKeyboardButton("🚫 Block", callback_data=f"transition:{issue.key}:blocked"))
+        elif issue.status == IssueStatus.BLOCKED:
+            row2.append(InlineKeyboardButton("▶️ Unblock", callback_data=f"transition:{issue.key}:progress"))
+        
+        if row2:
+            keyboard.append(row2)
+        
+        # Admin actions
+        if user_role in [UserRole.ADMIN, UserRole.SUPER_ADMIN]:
+            row3 = [
+                InlineKeyboardButton("✏️ Edit", callback_data=f"edit_issue:{issue.key}"),
+                InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_issue:{issue.key}")
+            ]
+            keyboard.append(row3)
+        
+        # Navigation
+        row4 = [
+            InlineKeyboardButton("🔙 Back", callback_data="back"),
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_issue:{issue.key}")
+        ]
+        keyboard.append(row4)
+        
+        return InlineKeyboardMarkup(keyboard)
 
-    def escape_markdown(self, text: str) -> str:
-        """Escape special markdown characters.
+    def create_priority_keyboard(self, action_prefix: str = "priority") -> InlineKeyboardMarkup:
+        """Create keyboard with priority selection buttons.
         
         Args:
-            text: Text to escape
+            action_prefix: Callback data prefix
             
         Returns:
-            Escaped text
+            InlineKeyboardMarkup
         """
-        # Characters that need escaping in Telegram markdown
-        special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+        if not self.use_inline_keyboards:
+            return None
         
-        for char in special_chars:
-            text = text.replace(char, f'\\{char}')
+        keyboard = []
         
-        return text
+        for priority in IssuePriority:
+            button_text = f"{priority.get_emoji()} {priority.value}"
+            callback_data = f"{action_prefix}:{priority.value.lower()}"
+            button = InlineKeyboardButton(button_text, callback_data=callback_data)
+            keyboard.append([button])
+        
+        return InlineKeyboardMarkup(keyboard)
+
+    def create_issue_type_keyboard(self, action_prefix: str = "type") -> InlineKeyboardMarkup:
+        """Create keyboard with issue type selection buttons.
+        
+        Args:
+            action_prefix: Callback data prefix
+            
+        Returns:
+            InlineKeyboardMarkup
+        """
+        if not self.use_inline_keyboards:
+            return None
+        
+        keyboard = []
+        
+        for issue_type in IssueType:
+            button_text = f"{issue_type.get_emoji()} {issue_type.value}"
+            callback_data = f"{action_prefix}:{issue_type.value.lower()}"
+            button = InlineKeyboardButton(button_text, callback_data=callback_data)
+            keyboard.append([button])
+        
+        return InlineKeyboardMarkup(keyboard)
 
     def create_confirmation_keyboard(
         self,
-        confirm_callback: str,
-        cancel_callback: str = "cancel",
+        confirm_action: str,
         confirm_text: str = "✅ Confirm",
         cancel_text: str = "❌ Cancel"
     ) -> InlineKeyboardMarkup:
         """Create a confirmation keyboard.
         
         Args:
-            confirm_callback: Callback data for confirm button
-            cancel_callback: Callback data for cancel button
+            confirm_action: Callback data for confirm button
             confirm_text: Text for confirm button
             cancel_text: Text for cancel button
             
         Returns:
-            InlineKeyboardMarkup object
+            InlineKeyboardMarkup
         """
-        keyboard = [[
-            InlineKeyboardButton(confirm_text, callback_data=confirm_callback),
-            InlineKeyboardButton(cancel_text, callback_data=cancel_callback)
-        ]]
+        if not self.use_inline_keyboards:
+            return None
+        
+        keyboard = [
+            [
+                InlineKeyboardButton(confirm_text, callback_data=confirm_action),
+                InlineKeyboardButton(cancel_text, callback_data="cancel")
+            ]
+        ]
         
         return InlineKeyboardMarkup(keyboard)
 
-    def get_user_mention(self, user: User) -> str:
-        """Get a user mention string.
-        
-        Args:
-            user: User to mention
-            
-        Returns:
-            Formatted user mention
-        """
-        if user.username:
-            return f"@{user.username}"
-        else:
-            return f"[{user.get_display_name()}](tg://user?id={user.user_id})"
+    # =============================================================================
+    # ERROR HANDLING AND NOTIFICATIONS
+    # =============================================================================
 
-    def format_callback_data(self, action: str, *args) -> str:
-        """Format callback data with length limits.
+    async def send_error_message(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        error_message: str,
+        show_help: bool = False
+    ) -> Optional[int]:
+        """Send an error message to the user.
         
         Args:
-            action: Action name
-            *args: Additional arguments
+            update: Telegram update
+            context: Bot context
+            error_message: Error message to display
+            show_help: Whether to show help information
             
         Returns:
-            Formatted callback data
+            Message ID of sent message
         """
-        callback_data = "_".join([action] + [str(arg) for arg in args])
+        message = f"❌ **Error**\n\n{error_message}"
         
-        if len(callback_data) > MAX_CALLBACK_DATA_LENGTH:
-            # Truncate while keeping the action
-            available_length = MAX_CALLBACK_DATA_LENGTH - len(action) - 1
-            args_text = "_".join([str(arg) for arg in args])
-            if len(args_text) > available_length:
-                args_text = args_text[:available_length]
-            callback_data = f"{action}_{args_text}"
+        if show_help:
+            message += "\n\nUse /help for available commands."
         
-        return callback_data
+        return await self.send_message(
+            update=update,
+            context=context,
+            text=message,
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+
+    async def send_success_message(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        success_message: str
+    ) -> Optional[int]:
+        """Send a success message to the user.
+        
+        Args:
+            update: Telegram update
+            context: Bot context
+            success_message: Success message to display
+            
+        Returns:
+            Message ID of sent message
+        """
+        message = f"✅ **Success**\n\n{success_message}"
+        
+        return await self.send_message(
+            update=update,
+            context=context,
+            text=message,
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+
+    async def send_info_message(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        info_message: str,
+        reply_markup: Optional[InlineKeyboardMarkup] = None
+    ) -> Optional[int]:
+        """Send an info message to the user.
+        
+        Args:
+            update: Telegram update
+            context: Bot context
+            info_message: Info message to display
+            reply_markup: Optional keyboard markup
+            
+        Returns:
+            Message ID of sent message
+        """
+        message = f"ℹ️ **Info**\n\n{info_message}"
+        
+        return await self.send_message(
+            update=update,
+            context=context,
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
