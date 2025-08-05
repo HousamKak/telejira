@@ -23,14 +23,14 @@ from telegram.ext import Application, ContextTypes
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from telegram_jira_bot.config.settings import BotConfig
-from telegram_jira_bot.services.database import DatabaseManager
-from telegram_jira_bot.services.jira_service import JiraService
-from telegram_jira_bot.services.telegram_service import TelegramService
-from telegram_jira_bot.models.project import Project
-from telegram_jira_bot.models.issue import JiraIssue
-from telegram_jira_bot.models.user import User as BotUser
-from telegram_jira_bot.models.enums import IssuePriority, IssueType, IssueStatus, UserRole
+from config.settings import BotConfig
+from services.database import DatabaseManager
+from services.jira_service import JiraService
+from services.telegram_service import TelegramService
+from models.project import Project
+from models.issue import JiraIssue
+from models.user import User as BotUser
+from models.enums import IssuePriority, IssueType, IssueStatus, UserRole
 
 
 @pytest.fixture(scope="session")
