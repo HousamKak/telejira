@@ -30,6 +30,7 @@ Usage:
 """
 
 import sys
+import warnings
 from pathlib import Path
 
 # Add the parent directory to Python path for imports
@@ -58,20 +59,25 @@ TEST_JIRA_DOMAIN = "test.atlassian.net"
 TEST_TELEGRAM_TOKEN = "TEST_TOKEN:123456789"
 
 # Export commonly used test utilities
-from .conftest import (
-    TestDatabase,
-    TestUtils,
-    AsyncContextManagerMock
-)
-
 __all__ = [
     "TEST_CONFIG",
     "TEST_USER_ID", 
     "TEST_PROJECT_KEY",
     "TEST_ISSUE_KEY",
     "TEST_JIRA_DOMAIN",
-    "TEST_TELEGRAM_TOKEN",
-    "TestDatabase",
-    "TestUtils",
-    "AsyncContextManagerMock"
+    "TEST_TELEGRAM_TOKEN"
 ]
+
+try:
+    from .conftest import (
+        TestDatabase,
+        TestUtils,
+        AsyncContextManagerMock
+    )
+    __all__.extend([
+        "TestDatabase",
+        "TestUtils", 
+        "AsyncContextManagerMock"
+    ])
+except ImportError as e:
+    warnings.warn(f"Test utilities import failed: {e}", ImportWarning)
