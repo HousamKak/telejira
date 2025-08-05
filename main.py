@@ -492,7 +492,7 @@ def main() -> None:
     """
     try:
         # Load configuration
-        config = load_config_from_env()
+        config = load_config_from_env(env_file=str(Path(__file__).parent / ".env"))
 
         # Create and run bot
         bot = TelegramJiraBot(config)
