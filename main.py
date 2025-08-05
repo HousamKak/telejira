@@ -166,27 +166,24 @@ class TelegramJiraBot:
 
             # Initialize database
             self.database = DatabaseService(
-                db_path=self.config.database_path,
-                pool_size=self.config.database_pool_size,
-                timeout=self.config.database_timeout,
+                database_path=self.config.database_path,
             )
             await self.database.initialize()
             self.logger.info("✅ Database service initialized")
 
-            # Initialize Jira service
+            # Initialize Jira service - FIXED PARAMETERS
             self.jira_service = JiraService(
-                domain=self.config.jira_domain,
-                email=self.config.jira_email,
+                base_url=self.config.get_jira_base_url(),  # Use method to get proper URL format
+                username=self.config.jira_email,  # Changed from 'email' to 'username'
                 api_token=self.config.jira_api_token,
                 timeout=self.config.jira_timeout,
                 max_retries=self.config.jira_max_retries,
             )
             self.logger.info("✅ Jira service initialized")
 
-            # Initialize Telegram service
+            # Initialize Telegram service - FIXED PARAMETER
             self.telegram_service = TelegramService(
-                token=self.config.telegram_token,
-                timeout=self.config.telegram_timeout,
+                bot_token=self.config.telegram_token,  # Changed from 'token' to 'bot_token'
             )
             self.logger.info("✅ Telegram service initialized")
 
@@ -244,39 +241,34 @@ class TelegramJiraBot:
 
             self.logger.info("Initializing handlers...")
 
-            # Initialize base handler
+            # Initialize base handler - FIXED PARAMETERS
             self.base_handler = BaseHandler(
-                config=self.config,
-                db=self.database,
+                database_service=self.database,  # Changed from 'db' to 'database_service'
                 jira_service=self.jira_service,
                 telegram_service=self.telegram_service,
             )
 
-            # Initialize specialized handlers
+            # Initialize specialized handlers - FIXED PARAMETERS
             self.admin_handlers = AdminHandlers(
-                config=self.config,
-                db=self.database,
+                database_service=self.database,  # Changed from 'db' to 'database_service'
                 jira_service=self.jira_service,
                 telegram_service=self.telegram_service,
             )
 
             self.project_handlers = ProjectHandlers(
-                config=self.config,
-                db=self.database,
+                database_service=self.database,  # Changed from 'db' to 'database_service'
                 jira_service=self.jira_service,
                 telegram_service=self.telegram_service,
             )
 
             self.issue_handlers = IssueHandlers(
-                config=self.config,
-                db=self.database,
+                database_service=self.database,  # Changed from 'db' to 'database_service'
                 jira_service=self.jira_service,
                 telegram_service=self.telegram_service,
             )
 
             self.wizard_handlers = WizardHandlers(
-                config=self.config,
-                db=self.database,
+                database_service=self.database,  # Changed from 'db' to 'database_service'
                 jira_service=self.jira_service,
                 telegram_service=self.telegram_service,
             )
@@ -559,8 +551,8 @@ class TelegramJiraBot:
 async def main() -> None:
     """Main entry point for the application."""
     try:
-        # Load configuration from environment
-        config = load_config_from_env()
+        env_path = Path(__file__).with_name(".env")  # resolves to ...\MVP\.env
+        config = load_config_from_env(str(env_path))
         
         # Create and run the bot
         bot = TelegramJiraBot(config)

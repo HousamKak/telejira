@@ -62,28 +62,26 @@ class DatabaseService:
             raise TypeError("database_path must be non-empty string")
 
         self.database_path = database_path
-        self._connection: Optional[Connection] = None
+        self._connection: Optional[aiosqlite.Connection] = None
         self._initialized = False
 
     async def initialize(self) -> None:
-        """
-        Initialize database connection and create tables if needed.
-        
-        Raises:
-            DatabaseError: If initialization fails
-        """
         try:
-            self._connection = await aiosqlite.connect(self.database_path)
-            self._connection.row_factory = aiosqlite.Row
-            
-            # Create tables
-            await self._create_tables()
+            conn = await aiosqlite.connect(self.database_path)
+            conn.row_factory = aiosqlite.Row   # <- no Optional here
+            self._connection = conn
+
+            # Option A: mark initialized before table creation (fixes your earlier bug)
             self._initialized = True
-            
+            await self._create_tables()
+
             logger.info(f"Database initialized: {self.database_path}")
-            
         except Exception as e:
             logger.error(f"Failed to initialize database: {e}")
+            self._initialized = False
+            if self._connection:
+                await self._connection.close()
+                self._connection = None
             raise DatabaseError(f"Database initialization failed: {e}", e)
 
     async def close(self) -> None:
@@ -97,15 +95,11 @@ class DatabaseService:
         """Check if database is initialized and ready for operations."""
         return self._initialized and self._connection is not None
 
-    async def _ensure_connection(self) -> Connection:
-        """Ensure database connection is available."""
-        if not self.is_initialized():
+    async def _ensure_connection(self) -> aiosqlite.Connection:
+        conn = self._connection
+        if conn is None:
             raise DatabaseError("Database not initialized. Call initialize() first.")
-        
-        if self._connection is None:
-            raise DatabaseError("Database connection is None")
-            
-        return self._connection
+        return conn
 
     async def _create_tables(self) -> None:
         """Create database tables if they don't exist."""
