@@ -2,416 +2,82 @@
 """
 Base handler for the Telegram-Jira bot.
 
-Contains the base handler class with common functionality for all handlers.
+Provides common functionality and base methods for all handler classes.
+Includes user management, error handling, message formatting, and shared utilities.
 """
 
 import logging
+import asyncio
+from typing import Optional, Dict, Any, List, Union, TYPE_CHECKING
+from datetime import datetime, timezone
 from abc import ABC, abstractmethod
-from typing import Optional, List, Dict, Any, Union
 
-from telegram import Update, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import ContextTypes
-from telegram.error import TelegramError
+from telegram.error import TelegramError, BadRequest, Forbidden
 
-from config.settings import BotConfig
-from services.database import DatabaseManager, DatabaseError
-from services.jira_service import JiraService, JiraAPIError
-from services.telegram_service import TelegramService
-from models.user import User, UserPreferences, UserSession
-from models.enums import UserRole, WizardState, ErrorType
-from utils.constants import EMOJI, ERROR_MESSAGES, SUCCESS_MESSAGES
+if TYPE_CHECKING:
+    from config.settings import BotConfig
+    from services.database import DatabaseManager
+    from services.jira_service import JiraService
+    from services.telegram_service import TelegramService
+
+from models.user import User
+from models.enums import UserRole, ErrorType
+from services.database import DatabaseError
+from services.jira_service import JiraAPIError
+from utils.constants import EMOJI, SUCCESS_MESSAGES, ERROR_MESSAGES, INFO_MESSAGES, BOT_INFO
 from utils.validators import InputValidator, ValidationResult
+from utils.formatters import MessageFormatter
 
 
 class BaseHandler(ABC):
-    """Base class for all bot handlers."""
+    """Base class for all bot handlers with common functionality."""
 
     def __init__(
         self,
-        config: BotConfig,
-        db: DatabaseManager,
-        jira_service: JiraService,
-        telegram_service: TelegramService
-    ):
-        """Initialize the base handler.
+        config: 'BotConfig',
+        db: 'DatabaseManager',
+        jira_service: 'JiraService',
+        telegram_service: 'TelegramService'
+    ) -> None:
+        """Initialize base handler.
         
         Args:
             config: Bot configuration
-            db: Database manager
-            jira_service: Jira service
-            telegram_service: Telegram service
+            db: Database manager instance
+            jira_service: Jira service instance
+            telegram_service: Telegram service instance
         """
         self.config = config
         self.db = db
         self.jira = jira_service
         self.telegram = telegram_service
-        self.logger = logging.getLogger(self.__class__.__name__)
-
-    # =============================================================================
-    # USER MANAGEMENT METHODS - FIXED
-    # =============================================================================
-
-    async def get_or_create_user(self, update: Update) -> Optional[User]:
-        """Get or create user from update.
         
-        Args:
-            update: Telegram update
-            
-        Returns:
-            User object or None if no effective user
-        """
-        if not update.effective_user:
-            return None
-
-        try:
-            telegram_user_id = str(update.effective_user.id)  # Convert to string
-            
-            # FIX: Use correct method name
-            user = await self.db.get_user_by_telegram_id(telegram_user_id)
-            if user:
-                # Activity is automatically updated in get_user_by_telegram_id()
-                return user
-            else:
-                # Create new user with individual parameters
-                user_data = {
-                    'user_id': telegram_user_id,
-                    'username': update.effective_user.username or '',
-                    'first_name': update.effective_user.first_name or '',
-                    'last_name': update.effective_user.last_name or '',
-                    'is_active': True,
-                    'preferred_language': 'en',
-                    'timezone': 'UTC'
-                }
-                
-                # Set role based on config
-                if self.config.is_user_super_admin(update.effective_user.id):
-                    role = UserRole.SUPER_ADMIN
-                elif self.config.is_user_admin(update.effective_user.id):
-                    role = UserRole.ADMIN
-                else:
-                    role = UserRole.USER
-                
-                user_data['role'] = role
-                
-                # FIX: Use correct method signature with individual parameters
-                user_db_id = await self.db.create_user(**user_data)
-                
-                # Get the created user
-                created_user = await self.db.get_user_by_id(user_db_id)
-                
-                self.logger.info(f"Created new user: {telegram_user_id}")
-                return created_user
-
-        except DatabaseError as e:
-            self.logger.error(f"Failed to get/create user: {e}")
-            await self.send_error_message(update, "Database error occurred")
-            return None
-
-    async def get_user_preferences(self, user_id: str) -> Optional[UserPreferences]:
-        """Get user preferences.
+        # Initialize logger with handler name
+        self.logger = logging.getLogger(f"{__name__}.{self.get_handler_name()}")
         
-        Args:
-            user_id: User ID (Telegram user ID as string)
-            
-        Returns:
-            UserPreferences or None if not found
-        """
-        try:
-            return await self.db.get_user_preferences(user_id)
-        except DatabaseError as e:
-            self.logger.error(f"Failed to get user preferences: {e}")
-            return None
-
-    async def get_user_session(self, user_id: str) -> Optional[UserSession]:
-        """Get user session.
-        
-        Args:
-            user_id: User ID (Telegram user ID as string)
-            
-        Returns:
-            UserSession or None if not found
-        """
-        try:
-            session = await self.db.get_user_session(user_id)
-            if session and session.is_expired():
-                # Clean up expired session
-                session.clear_wizard()
-                await self.db.save_user_session(session)
-                return session
-            return session
-        except DatabaseError as e:
-            self.logger.error(f"Failed to get user session: {e}")
-            return None
-
-    async def save_user_session(self, session: UserSession) -> bool:
-        """Save user session.
-        
-        Args:
-            session: User session to save
-            
-        Returns:
-            True if saved successfully
-        """
-        try:
-            await self.db.save_user_session(session)
-            return True
-        except DatabaseError as e:
-            self.logger.error(f"Failed to save user session: {e}")
-            return False
-
-    # =============================================================================
-    # PERMISSION CHECKING METHODS
-    # =============================================================================
-
-    def check_user_access(self, user_id: int) -> bool:
-        """Check if user has access to the bot.
-        
-        Args:
-            user_id: User ID to check
-            
-        Returns:
-            True if user has access
-        """
-        return self.config.is_user_allowed(user_id)
-
-    def check_user_role(self, user: User, required_role: UserRole) -> bool:
-        """Check if user has required role.
-        
-        Args:
-            user: User to check
-            required_role: Required role
-            
-        Returns:
-            True if user has required role or higher
-        """
-        return user.has_permission(required_role)
-
-    def is_admin(self, user: User) -> bool:
-        """Check if user is an admin.
-        
-        Args:
-            user: User to check
-            
-        Returns:
-            True if user is admin or super admin
-        """
-        return user.is_admin()
-
-    def is_super_admin(self, user: User) -> bool:
-        """Check if user is a super admin.
-        
-        Args:
-            user: User to check
-            
-        Returns:
-            True if user is super admin
-        """
-        return user.is_super_admin()
-
-    async def enforce_user_access(self, update: Update) -> Optional[User]:
-        """Enforce user access requirement.
-        
-        Args:
-            update: Telegram update
-            
-        Returns:
-            User object if authorized, None otherwise
-        """
-        if not update.effective_user:
-            return None
-
-        if not self.check_user_access(update.effective_user.id):
-            await self.send_error_message(
-                update,
-                "Access denied. Contact an administrator.",
-                ErrorType.PERMISSION_ERROR
-            )
-            return None
-
-        return await self.get_or_create_user(update)
-
-    async def enforce_role(self, update: Update, required_role: UserRole) -> Optional[User]:
-        """Enforce role requirement and return user if authorized.
-        
-        Args:
-            update: Telegram update
-            required_role: Required user role
-            
-        Returns:
-            User object if authorized, None otherwise
-        """
-        user = await self.enforce_user_access(update)
-        if not user:
-            return None
-
-        if not self.check_user_role(user, required_role):
-            role_name = required_role.value.replace('_', ' ').title()
-            await self.send_error_message(
-                update,
-                f"You need {role_name} permissions to use this command.",
-                ErrorType.PERMISSION_ERROR
-            )
-            return None
-
-        return user
-
-    async def enforce_admin(self, update: Update) -> Optional[User]:
-        """Enforce admin requirement.
-        
-        Args:
-            update: Telegram update
-            
-        Returns:
-            User object if admin, None otherwise
-        """
-        return await self.enforce_role(update, UserRole.ADMIN)
-
-    async def enforce_super_admin(self, update: Update) -> Optional[User]:
-        """Enforce super admin requirement.
-        
-        Args:
-            update: Telegram update
-            
-        Returns:
-            User object if super admin, None otherwise
-        """
-        return await self.enforce_role(update, UserRole.SUPER_ADMIN)
-
-    # =============================================================================
-    # MESSAGE SENDING UTILITIES
-    # =============================================================================
-
-    async def send_message(
-        self,
-        update: Update,
-        text: str,
-        reply_markup: Optional[InlineKeyboardMarkup] = None,
-        reply_to_message: bool = False
-    ) -> Optional[int]:
-        """Send a message with error handling.
-        
-        Args:
-            update: Telegram update
-            text: Message text
-            reply_markup: Optional keyboard markup
-            reply_to_message: Whether to reply to the original message
-            
-        Returns:
-            Message ID if sent successfully
-        """
-        return await self.telegram.send_message(
-            update, text, reply_markup, reply_to_message=reply_to_message
+        # Initialize utilities
+        self.formatter = MessageFormatter(
+            compact_mode=config.compact_mode,
+            use_emoji=True
         )
+        self.validator = InputValidator()
 
-    async def edit_message(
-        self,
-        update: Update,
-        text: str,
-        reply_markup: Optional[InlineKeyboardMarkup] = None
-    ) -> bool:
-        """Edit a message with error handling.
-        
-        Args:
-            update: Telegram update
-            text: New message text
-            reply_markup: New keyboard markup
-            
-        Returns:
-            True if edited successfully
-        """
-        return await self.telegram.edit_message(update, text, reply_markup)
-
-    async def send_error_message(
-        self,
-        update: Update,
-        error_text: str,
-        error_type: ErrorType = ErrorType.UNKNOWN_ERROR,
-        include_help: bool = True
-    ) -> Optional[int]:
-        """Send an error message.
-        
-        Args:
-            update: Telegram update
-            error_text: Error message text
-            error_type: Type of error
-            include_help: Whether to include help text
-            
-        Returns:
-            Message ID if sent successfully
-        """
-        emoji = error_type.get_emoji()
-        message = f"{emoji} **Error**\n\n{error_text}"
-        
-        if include_help:
-            message += f"\n\n{EMOJI['TIP']} Type /help for assistance."
-        
-        return await self.send_message(update, message)
-
-    async def send_success_message(
-        self,
-        update: Update,
-        success_text: str,
-        reply_markup: Optional[InlineKeyboardMarkup] = None
-    ) -> Optional[int]:
-        """Send a success message.
-        
-        Args:
-            update: Telegram update
-            success_text: Success message text
-            reply_markup: Optional keyboard markup
-            
-        Returns:
-            Message ID if sent successfully
-        """
-        message = f"{EMOJI['SUCCESS']} **Success**\n\n{success_text}"
-        return await self.send_message(update, message, reply_markup)
-
-    async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle callback queries with user verification.
-        
-        Args:
-            update: Telegram update
-            context: Telegram context
-        """
-        query = update.callback_query
-        if not query:
-            return
-
-        try:
-            # Always answer callback queries to remove loading state
-            await query.answer()
-            
-            # Verify user access
-            user = await self.get_or_create_user(update)
-            if not user:
-                await self.edit_message(update, "Access denied.")
-                return
-
-            # Log callback query
-            self.log_user_action(user, f"callback_query: {query.data}")
-
-        except Exception as e:
-            self.logger.error(f"Error handling callback query: {e}")
-            try:
-                await query.answer("An error occurred.")
-            except:
-                pass
+    @abstractmethod
+    def get_handler_name(self) -> str:
+        """Get the handler name for logging purposes."""
+        pass
 
     # =============================================================================
-    # BASIC COMMAND HANDLERS
+    # CORE COMMAND HANDLERS
     # =============================================================================
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /start command - welcome message and setup.
-        
-        Args:
-            update: Telegram update
-            context: Telegram context
-        """
+        """Handle /start command - welcome message and initial setup."""
         self.log_handler_start(update, "start_command")
         
         try:
-            # Get or create user (this will handle the database calls correctly)
             user = await self.get_or_create_user(update)
             if not user:
                 return
@@ -419,25 +85,82 @@ class BaseHandler(ABC):
             # Log user action
             self.log_user_action(user, "start_command")
 
-            # Create welcome message
-            welcome_message = f"""
-{EMOJI.get('WAVE', '👋')} **Welcome to the Telegram-Jira Bot!**
+            # Check if this is a new user
+            is_new_user = user.created_at and (
+                datetime.now(timezone.utc) - user.created_at
+            ).total_seconds() < 300  # Less than 5 minutes ago
 
-Hello {user.get_display_name()}! I'm here to help you manage Jira issues directly from Telegram.
+            if is_new_user:
+                welcome_message = f"""
+{EMOJI.get('WELCOME', '👋')} **Welcome to {BOT_INFO['NAME']}!**
 
-**Quick Start:**
-• Use `/wizard` for interactive setup
-• Use `/help` to see all available commands
-• Use `/projects` to view available projects
+Hi **{user.username}**! I'm your Jira assistant bot.
 
-**Create Issues Fast:**
-Just send me a message like:
-`HIGH BUG Login button not working`
+**🚀 Quick Start:**
+1. Use `/wizard` for guided setup
+2. Set your default project with `/projects`
+3. Create issues by typing: `HIGH BUG Something is broken`
 
-Let's get started! 🚀
+**📋 Essential Commands:**
+• `/help` - Complete command reference
+• `/projects` - View available projects
+• `/create` - Interactive issue creation
+• `/myissues` - Your recent issues
+
+**Role:** {user.role.value.replace('_', ' ').title()}
+
+Ready to get started? Try `/wizard` for step-by-step setup!
+                """
+            else:
+                # Get user statistics
+                try:
+                    user_stats = await self.db.get_user_statistics(user.user_id)
+                    issues_created = user_stats.get('issues_created', 0)
+                    last_activity = user_stats.get('last_activity')
+                except Exception:
+                    issues_created = 0
+                    last_activity = None
+
+                # Get default project
+                default_project = await self.db.get_user_default_project(user.user_id)
+
+                welcome_message = f"""
+{EMOJI.get('WELCOME', '👋')} **Welcome back, {user.username}!**
+
+**Your Status:**
+• Issues Created: {issues_created}
+• Default Project: {default_project.key if default_project else 'Not set'}
+• Role: {user.role.value.replace('_', ' ').title()}
+
+**Quick Actions:**
             """
 
-            await self.send_message(update, welcome_message)
+            # Add action buttons
+            keyboard_buttons = []
+
+            if default_project:
+                keyboard_buttons.append([
+                    InlineKeyboardButton("📝 Create Issue", callback_data="quick_create"),
+                    InlineKeyboardButton("📋 My Issues", callback_data="my_issues")
+                ])
+            else:
+                keyboard_buttons.append([
+                    InlineKeyboardButton("🧙‍♂️ Run Setup Wizard", callback_data="run_wizard")
+                ])
+
+            keyboard_buttons.extend([
+                [
+                    InlineKeyboardButton("📁 Projects", callback_data="list_projects"),
+                    InlineKeyboardButton("❓ Help", callback_data="show_help")
+                ],
+                [
+                    InlineKeyboardButton("📊 Status", callback_data="show_status")
+                ]
+            ])
+
+            keyboard = InlineKeyboardMarkup(keyboard_buttons)
+
+            await self.send_message(update, welcome_message, reply_markup=keyboard)
             self.log_handler_end(update, "start_command")
 
         except Exception as e:
@@ -445,12 +168,7 @@ Let's get started! 🚀
             self.log_handler_end(update, "start_command", success=False)
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /help command - show comprehensive help.
-        
-        Args:
-            update: Telegram update
-            context: Telegram context
-        """
+        """Handle /help command - show comprehensive help."""
         self.log_handler_start(update, "help_command")
         
         try:
@@ -463,61 +181,97 @@ Let's get started! 🚀
 
             # Build help message based on user role
             help_message = f"""
-{EMOJI.get('HELP', '❓')} **Telegram-Jira Bot Help**
+{EMOJI.get('HELP', '❓')} **{BOT_INFO['NAME']} Help**
 
-**Basic Commands:**
+**🚀 Quick Issue Creation:**
+Just type: `[PRIORITY] [TYPE] Description`
+
+**Examples:**
+• `HIGH BUG Login button not working`
+• `MEDIUM TASK Update documentation`
+• `LOW IMPROVEMENT Add dark mode`
+
+**📋 Basic Commands:**
 • `/start` - Welcome message and setup
 • `/help` - Show this help message
 • `/wizard` - Interactive setup wizard
 • `/status` - Your statistics and bot status
 
-**Project Commands:**
+**📁 Project Commands:**
 • `/projects` - List available projects
 • `/setdefault <KEY>` - Set your default project
 
-**Issue Commands:**
+**📝 Issue Commands:**
 • `/create` - Interactive issue creation
 • `/myissues` - View your recent issues
+• `/listissues [filters]` - List all issues
+• `/searchissues <query>` - Search issues
+• `/view <KEY>` - View issue details
+• `/comment <KEY> <text>` - Add comment
 
-**Quick Issue Creation:**
-Send a message like: `HIGH BUG Login button not working`
-
-Format: `[PRIORITY] [TYPE] Description`
-• Priority: LOWEST, LOW, MEDIUM, HIGH, HIGHEST
-• Type: TASK, BUG, STORY, EPIC, IMPROVEMENT
+**⚡ Shortcuts (if enabled):**
+• `/c` = `/create`
+• `/mi` = `/myissues` 
+• `/p` = `/projects`
+• `/w` = `/wizard`
+• `/q` = `/quick`
             """
 
             # Add admin commands if user is admin
             if self.is_admin(user):
-                help_message += """
+                help_message += f"""
 
-**Admin Commands:**
-• `/addproject <KEY> "<NAME>" [description]` - Add project
-• `/editproject <KEY>` - Edit project
-• `/deleteproject <KEY>` - Delete project
-• `/users` - List all users
-• `/syncjira` - Sync with Jira
+**🔧 Admin Commands:**
+• `/admin` - Admin control panel
+• `/addproject <KEY> "<name>" [desc]` - Add project
+• `/adduser @username <role>` - Add user
+• `/listusers` - List all users
+• `/stats` - System statistics
+• `/refresh` - Sync with Jira
                 """
 
             # Add super admin commands if user is super admin
             if self.is_super_admin(user):
-                help_message += """
+                help_message += f"""
 
-**Super Admin Commands:**
+**⚙️ Super Admin Commands:**
 • `/config` - Bot configuration
 • `/broadcast <message>` - Message all users
 • `/maintenance` - System maintenance
                 """
 
-            help_message += """
+            help_message += f"""
 
-**Need More Help?**
-Contact your system administrator or check the project documentation.
+**💡 Tips:**
+• Set a default project for faster issue creation
+• Use inline keyboards for easier navigation
+• Type `/cancel` in wizards to exit
 
 **Current Role:** {user.role.value.replace('_', ' ').title()}
+
+**Need more help?** Contact your administrator.
             """
 
-            await self.send_message(update, help_message)
+            # Add help navigation buttons
+            keyboard_buttons = [
+                [
+                    InlineKeyboardButton("🧙‍♂️ Setup Wizard", callback_data="run_wizard"),
+                    InlineKeyboardButton("📊 Bot Status", callback_data="show_status")
+                ],
+                [
+                    InlineKeyboardButton("📁 Projects", callback_data="list_projects"),
+                    InlineKeyboardButton("📝 Create Issue", callback_data="quick_create")
+                ]
+            ]
+
+            if self.is_admin(user):
+                keyboard_buttons.append([
+                    InlineKeyboardButton("🔧 Admin Panel", callback_data="admin_menu")
+                ])
+
+            keyboard = InlineKeyboardMarkup(keyboard_buttons)
+
+            await self.send_message(update, help_message, reply_markup=keyboard)
             self.log_handler_end(update, "help_command")
 
         except Exception as e:
@@ -525,12 +279,7 @@ Contact your system administrator or check the project documentation.
             self.log_handler_end(update, "help_command", success=False)
 
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /status command - show user and bot status.
-        
-        Args:
-            update: Telegram update
-            context: Telegram context
-        """
+        """Handle /status command - show user and bot status."""
         self.log_handler_start(update, "status_command")
         
         try:
@@ -541,39 +290,66 @@ Contact your system administrator or check the project documentation.
             # Log user action
             self.log_user_action(user, "status_command")
 
+            # Get user statistics
             try:
-                # Get user statistics if the method exists
-                user_stats = await self.db.get_user_stats(user.user_id)
-            except (AttributeError, DatabaseError):
-                # Fallback if get_user_stats doesn't exist or fails
-                user_stats = {
-                    'total_issues': user.issues_created,
-                    'active_issues': 0,
-                    'resolved_issues': 0
-                }
+                user_stats = await self.db.get_user_statistics(user.user_id)
+            except Exception:
+                user_stats = {}
 
-            # Build status message
+            # Get default project
+            default_project = await self.db.get_user_default_project(user.user_id)
+
+            # Get accessible projects count
+            projects = await self.db.get_user_projects(user.user_id)
+
+            # Format status message
             status_message = f"""
-{EMOJI.get('STATUS', '📊')} **Your Status**
+{EMOJI.get('STATUS', '📊')} **Bot Status & Your Statistics**
 
-**User Information:**
-• Name: {user.get_display_name()}
+**👤 Your Account:**
+• Username: @{user.username}
 • Role: {user.role.value.replace('_', ' ').title()}
-• Member since: {user.created_at.strftime('%B %d, %Y')}
-• Last active: {user.last_activity.strftime('%B %d, %Y at %I:%M %p')}
+• Joined: {user.created_at.strftime('%Y-%m-%d') if user.created_at else 'Unknown'}
+• Status: {'🟢 Active' if user.is_active else '🔴 Inactive'}
 
-**Statistics:**
-• Total issues created: {user_stats.get('total_issues', 0)}
-• Active issues: {user_stats.get('active_issues', 0)}
-• Resolved issues: {user_stats.get('resolved_issues', 0)}
+**📊 Your Activity:**
+• Issues Created: {user_stats.get('issues_created', 0)}
+• Comments Added: {user_stats.get('comments_added', 0)}
+• Commands Used: {user_stats.get('commands_used', 0)}
+• Last Activity: {user_stats.get('last_activity', 'Unknown')}
 
-**Bot Status:** ✅ Online and ready
-**Jira Connection:** ✅ Connected
+**📁 Project Access:**
+• Available Projects: {len(projects)}
+• Default Project: {default_project.key if default_project else 'Not set'}
 
-Use `/help` for available commands.
+**🤖 Bot Information:**
+• Bot Version: {BOT_INFO['VERSION']}
+• Bot Status: 🟢 Online
+• Jira Domain: {self.config.jira_domain}
+• Features: {'Quick Create, ' if self.config.enable_quick_create else ''}{'Shortcuts, ' if self.config.enable_shortcuts else ''}{'Wizards' if self.config.enable_wizards else ''}
             """
 
-            await self.send_message(update, status_message)
+            # Add management buttons
+            keyboard_buttons = [
+                [
+                    InlineKeyboardButton("📁 My Projects", callback_data="list_projects"),
+                    InlineKeyboardButton("📋 My Issues", callback_data="my_issues")
+                ],
+                [
+                    InlineKeyboardButton("⚙️ Preferences", callback_data="user_preferences"),
+                    InlineKeyboardButton("🔄 Refresh", callback_data="refresh_status")
+                ]
+            ]
+
+            if self.is_admin(user):
+                keyboard_buttons.append([
+                    InlineKeyboardButton("📊 System Stats", callback_data="system_stats"),
+                    InlineKeyboardButton("🔧 Admin Panel", callback_data="admin_menu")
+                ])
+
+            keyboard = InlineKeyboardMarkup(keyboard_buttons)
+
+            await self.send_message(update, status_message, reply_markup=keyboard)
             self.log_handler_end(update, "status_command")
 
         except Exception as e:
@@ -581,288 +357,409 @@ Use `/help` for available commands.
             self.log_handler_end(update, "status_command", success=False)
 
     # =============================================================================
-    # VALIDATION METHODS
+    # CALLBACK QUERY HANDLER
     # =============================================================================
 
-    def validate_project_key(self, project_key: str) -> ValidationResult:
-        """Validate project key.
-        
-        Args:
-            project_key: Project key to validate
-            
-        Returns:
-            ValidationResult
-        """
-        return InputValidator.validate_project_key(project_key)
+    async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Central callback query handler that routes to appropriate handlers."""
+        if not update.callback_query:
+            return
 
-    def validate_issue_summary(self, summary: str) -> ValidationResult:
-        """Validate issue summary.
-        
-        Args:
-            summary: Issue summary to validate
-            
-        Returns:
-            ValidationResult
-        """
-        return InputValidator.validate_issue_summary(summary, self.config.max_summary_length)
+        query = update.callback_query
+        self.log_handler_start(update, f"callback_query:{query.data}")
 
-    def validate_issue_description(self, description: str) -> ValidationResult:
-        """Validate issue description.
+        try:
+            # Always answer the callback query to remove loading state
+            await query.answer()
+
+            # Route to appropriate handler based on callback data
+            if query.data.startswith(("quick_create", "my_issues", "list_projects", "show_help", "show_status", "run_wizard")):
+                await self._handle_navigation_callback(update, context)
+            elif query.data.startswith(("view_issue_", "edit_issue_", "transition_issue_", "create_issue_", "confirm_create_")):
+                # Route to issue handlers
+                from .issue_handlers import IssueHandlers
+                if hasattr(self, 'issue_handlers') and isinstance(self.issue_handlers, IssueHandlers):
+                    await self.issue_handlers.handle_issue_callback(update, context)
+                else:
+                    await self._handle_fallback_callback(update, context)
+            elif query.data.startswith(("setdefault_", "project_", "refresh_project_")):
+                # Route to project handlers  
+                from .project_handlers import ProjectHandlers
+                if hasattr(self, 'project_handlers') and isinstance(self.project_handlers, ProjectHandlers):
+                    await self.project_handlers.handle_project_callback(update, context)
+                else:
+                    await self._handle_fallback_callback(update, context)
+            elif query.data.startswith(("admin_", "remove_user_", "add_project_")):
+                # Route to admin handlers
+                from .admin_handlers import AdminHandlers
+                if hasattr(self, 'admin_handlers') and isinstance(self.admin_handlers, AdminHandlers):
+                    await self.admin_handlers.handle_admin_callback(update, context)
+                else:
+                    await self._handle_fallback_callback(update, context)
+            else:
+                # Handle unknown callbacks
+                await self._handle_unknown_callback(update, context)
+
+            self.log_handler_end(update, f"callback_query:{query.data}")
+
+        except Exception as e:
+            await self.handle_error(update, e, f"callback_query:{query.data}")
+            self.log_handler_end(update, f"callback_query:{query.data}", success=False)
+
+    async def _handle_navigation_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle navigation callbacks from start command."""
+        query = update.callback_query
         
-        Args:
-            description: Issue description to validate
-            
-        Returns:
-            ValidationResult
-        """
-        return InputValidator.validate_issue_description(description, self.config.max_description_length)
+        if query.data == "quick_create":
+            await query.edit_message_text(
+                "🚀 Starting quick issue creation...\n\n"
+                "Use `/create` or `/quick` commands to create issues with the wizard."
+            )
+        elif query.data == "my_issues":
+            await query.edit_message_text(
+                "📋 Loading your issues...\n\n"
+                "Use `/myissues` command to see your recent issues."
+            )
+        elif query.data == "list_projects":
+            await query.edit_message_text(
+                "📁 Loading projects...\n\n"
+                "Use `/projects` command to see all available projects."
+            )
+        elif query.data == "show_help":
+            await self.help_command(update, context)
+        elif query.data == "show_status":
+            await self.status_command(update, context)
+        elif query.data == "run_wizard":
+            await query.edit_message_text(
+                "🧙‍♂️ Starting setup wizard...\n\n"
+                "Use `/wizard` command to run the interactive setup."
+            )
+        elif query.data == "refresh_status":
+            await self.status_command(update, context)
+
+    async def _handle_fallback_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle callback when specific handler is not available."""
+        await update.callback_query.edit_message_text(
+            "⚠️ This feature requires additional setup. Please contact your administrator."
+        )
+
+    async def _handle_unknown_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle unknown callback queries."""
+        self.logger.warning(f"Unknown callback query: {update.callback_query.data}")
+        await update.callback_query.edit_message_text(
+            "❌ Unknown action. Please try again or use /help for available commands."
+        )
 
     # =============================================================================
-    # COMMAND ARGUMENT PARSING
+    # USER MANAGEMENT AND ACCESS CONTROL
     # =============================================================================
 
-    def parse_command_args(self, update: Update, expected_args: int) -> Optional[List[str]]:
-        """Parse command arguments from message.
-        
-        Args:
-            update: Telegram update
-            expected_args: Expected number of arguments
-            
-        Returns:
-            List of arguments or None if invalid
-        """
-        if not update.message or not update.message.text:
+    async def get_or_create_user(self, update: Update) -> Optional[User]:
+        """Get or create user from update."""
+        if not update.effective_user:
+            self.logger.error("No effective user in update")
             return None
 
-        # Split message and remove command
-        parts = update.message.text.split()
-        if len(parts) < 1:
+        try:
+            telegram_user = update.effective_user
+            
+            # Try to get existing user
+            user = await self.db.get_user_by_telegram_id(telegram_user.id)
+            
+            if user:
+                # Update last activity
+                await self.db.update_user_last_activity(user.user_id)
+                return user
+
+            # Check if user is pre-authorized
+            username = telegram_user.username or f"user_{telegram_user.id}"
+            authorized_role = await self.db.get_preauthorized_user_role(username)
+            
+            if not authorized_role:
+                # User not authorized
+                await self.send_message(
+                    update,
+                    f"❌ **Access Denied**\n\n"
+                    f"You are not authorized to use this bot.\n"
+                    f"Contact your administrator to request access.\n\n"
+                    f"**Your Info:**\n"
+                    f"• Username: @{username}\n"
+                    f"• Telegram ID: {telegram_user.id}"
+                )
+                return None
+
+            # Create new user
+            user = await self.db.create_user(
+                telegram_id=telegram_user.id,
+                username=username,
+                first_name=telegram_user.first_name,
+                last_name=telegram_user.last_name,
+                role=authorized_role,
+                is_active=True
+            )
+
+            self.logger.info(f"Created new user: {username} (ID: {user.user_id}) with role {authorized_role.value}")
+            return user
+
+        except Exception as e:
+            self.logger.error(f"Error getting/creating user: {e}")
+            await self.send_error_message(
+                update,
+                "Failed to authenticate user. Please try again later.",
+                ErrorType.AUTHENTICATION_ERROR
+            )
             return None
 
-        args = parts[1:]  # Remove command itself
-        
-        if len(args) < expected_args:
+    async def enforce_user_access(self, update: Update) -> Optional[User]:
+        """Enforce user access and return user if authorized."""
+        user = await self.get_or_create_user(update)
+        if not user or not user.is_active:
+            return None
+        return user
+
+    async def enforce_role(self, update: Update, required_role: UserRole) -> Optional[User]:
+        """Enforce minimum role requirement."""
+        user = await self.enforce_user_access(update)
+        if not user:
             return None
 
-        return args
+        if not self.has_role(user, required_role):
+            await self.send_error_message(
+                update,
+                f"This command requires {required_role.value.replace('_', ' ').title()} role or higher.",
+                ErrorType.PERMISSION_ERROR
+            )
+            return None
 
-    def extract_callback_data(self, update: Update) -> Optional[str]:
-        """Extract callback data from update.
-        
-        Args:
-            update: Telegram update
-            
-        Returns:
-            Callback data or None
-        """
-        if update.callback_query and update.callback_query.data:
-            return update.callback_query.data
-        return None
+        return user
 
-    def parse_callback_data(self, callback_data: str) -> List[str]:
-        """Parse callback data into components.
+    def has_role(self, user: User, required_role: UserRole) -> bool:
+        """Check if user has required role or higher."""
+        role_hierarchy = {
+            UserRole.USER: 1,
+            UserRole.ADMIN: 2,
+            UserRole.SUPER_ADMIN: 3
+        }
         
-        Args:
-            callback_data: Callback data string
-            
-        Returns:
-            List of callback data components
-        """
-        return callback_data.split('_') if callback_data else []
+        user_level = role_hierarchy.get(user.role, 0)
+        required_level = role_hierarchy.get(required_role, 999)
+        
+        return user_level >= required_level
+
+    def is_admin(self, user: User) -> bool:
+        """Check if user is admin or higher."""
+        return self.has_role(user, UserRole.ADMIN)
+
+    def is_super_admin(self, user: User) -> bool:
+        """Check if user is super admin."""
+        return user.role == UserRole.SUPER_ADMIN
 
     # =============================================================================
-    # ERROR HANDLING UTILITIES
+    # MESSAGE AND ERROR HANDLING
     # =============================================================================
+
+    async def send_message(
+        self,
+        update: Update,
+        text: str,
+        reply_markup: Optional[InlineKeyboardMarkup] = None,
+        reply_to_message: bool = False,
+        parse_mode: str = "Markdown"
+    ) -> Optional[Message]:
+        """Send message with error handling."""
+        try:
+            chat_id = update.effective_chat.id
+            reply_to_message_id = None
+            
+            if reply_to_message and update.message:
+                reply_to_message_id = update.message.message_id
+
+            message = await self.telegram.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=reply_markup,
+                reply_to_message_id=reply_to_message_id,
+                parse_mode=parse_mode
+            )
+            
+            return message
+
+        except TelegramError as e:
+            self.logger.error(f"Failed to send message: {e}")
+            return None
+
+    async def edit_message(
+        self,
+        update: Update,
+        text: str,
+        reply_markup: Optional[InlineKeyboardMarkup] = None,
+        parse_mode: str = "Markdown"
+    ) -> bool:
+        """Edit message with error handling."""
+        try:
+            if update.callback_query and update.callback_query.message:
+                await update.callback_query.edit_message_text(
+                    text=text,
+                    reply_markup=reply_markup,
+                    parse_mode=parse_mode
+                )
+                return True
+            else:
+                # Fallback to sending new message
+                await self.send_message(update, text, reply_markup, parse_mode=parse_mode)
+                return False
+
+        except BadRequest as e:
+            if "Message is not modified" in str(e):
+                # Message content is the same, ignore
+                return True
+            self.logger.error(f"Failed to edit message: {e}")
+            return False
+        except TelegramError as e:
+            self.logger.error(f"Failed to edit message: {e}")
+            return False
+
+    async def send_error_message(
+        self,
+        update: Update,
+        error_text: str,
+        error_type: ErrorType = ErrorType.UNKNOWN_ERROR
+    ) -> None:
+        """Send formatted error message."""
+        emoji = EMOJI.get('ERROR', '❌')
+        error_message = f"{emoji} **Error**\n\n{error_text}"
+        
+        await self.send_message(update, error_message)
+
+    async def send_success_message(
+        self,
+        update: Update,
+        success_text: str,
+        details: Optional[str] = None
+    ) -> None:
+        """Send formatted success message."""
+        emoji = EMOJI.get('SUCCESS', '✅')
+        message = f"{emoji} **Success**\n\n{success_text}"
+        
+        if details:
+            message += f"\n\n{details}"
+        
+        await self.send_message(update, message)
+
+    async def handle_error(self, update: Update, error: Exception, context: str = "") -> None:
+        """Handle errors with appropriate user feedback."""
+        error_context = f" in {context}" if context else ""
+        self.logger.error(f"Error{error_context}: {str(error)}", exc_info=True)
+
+        # Determine error type and user message
+        if isinstance(error, DatabaseError):
+            await self.handle_database_error(update, error, context)
+        elif isinstance(error, JiraAPIError):
+            await self.handle_jira_error(update, error, context)
+        elif isinstance(error, TelegramError):
+            await self.handle_telegram_error(update, error, context)
+        else:
+            await self.send_error_message(
+                update,
+                "An unexpected error occurred. Please try again later.",
+                ErrorType.UNKNOWN_ERROR
+            )
 
     async def handle_database_error(self, update: Update, error: DatabaseError, context: str = "") -> None:
-        """Handle database errors consistently.
-        
-        Args:
-            update: Telegram update
-            error: Database error
-            context: Additional context for logging
-        """
-        self.logger.error(f"Database error{' in ' + context if context else ''}: {error}")
+        """Handle database-specific errors."""
         await self.send_error_message(
             update,
-            "Database error occurred. Please try again later.",
+            "Database operation failed. Please try again later.",
             ErrorType.DATABASE_ERROR
         )
 
     async def handle_jira_error(self, update: Update, error: JiraAPIError, context: str = "") -> None:
-        """Handle Jira API errors consistently.
-        
-        Args:
-            update: Telegram update
-            error: Jira API error
-            context: Additional context for logging
-        """
-        self.logger.error(f"Jira API error{' in ' + context if context else ''}: {error}")
-        
+        """Handle Jira API-specific errors."""
         if error.status_code == 401:
-            await self.send_error_message(
-                update,
-                "Jira authentication failed. Please check the bot configuration.",
-                ErrorType.JIRA_AUTH_ERROR
-            )
+            message = "Jira authentication failed. Please contact your administrator."
         elif error.status_code == 403:
-            await self.send_error_message(
-                update,
-                "Jira access denied. Check your permissions.",
-                ErrorType.PERMISSION_ERROR
-            )
+            message = "Insufficient Jira permissions for this operation."
         elif error.status_code == 404:
-            await self.send_error_message(
-                update,
-                "Jira resource not found.",
-                ErrorType.NOT_FOUND_ERROR
-            )
+            message = "Requested Jira resource not found."
         else:
-            await self.send_error_message(
-                update,
-                f"Jira API error: {str(error)}",
-                ErrorType.JIRA_API_ERROR
-            )
+            message = f"Jira operation failed: {str(error)}"
+
+        await self.send_error_message(update, message, ErrorType.JIRA_ERROR)
+
+    async def handle_telegram_error(self, update: Update, error: TelegramError, context: str = "") -> None:
+        """Handle Telegram API-specific errors."""
+        if isinstance(error, Forbidden):
+            self.logger.warning(f"Bot blocked by user: {update.effective_user.id if update.effective_user else 'Unknown'}")
+        else:
+            self.logger.error(f"Telegram error: {error}")
+
+    # =============================================================================
+    # LOGGING AND ANALYTICS
+    # =============================================================================
+
+    def log_handler_start(self, update: Update, handler_name: str) -> None:
+        """Log handler start."""
+        user_info = "Unknown"
+        if update.effective_user:
+            user_info = f"{update.effective_user.username or update.effective_user.id}"
+        
+        self.logger.debug(f"🔄 {handler_name} started by {user_info}")
+
+    def log_handler_end(self, update: Update, handler_name: str, success: bool = True) -> None:
+        """Log handler completion."""
+        user_info = "Unknown"
+        if update.effective_user:
+            user_info = f"{update.effective_user.username or update.effective_user.id}"
+        
+        status = "✅" if success else "❌"
+        self.logger.debug(f"{status} {handler_name} completed for {user_info}")
+
+    def log_user_action(self, user: User, action: str, details: Optional[Dict[str, Any]] = None) -> None:
+        """Log user action for analytics."""
+        self.logger.info(f"User action: {user.username} -> {action}")
+        
+        # Store in database for analytics (fire and forget)
+        asyncio.create_task(self._store_user_action(user.user_id, action, details))
+
+    async def _store_user_action(self, user_id: int, action: str, details: Optional[Dict[str, Any]] = None) -> None:
+        """Store user action in database."""
+        try:
+            await self.db.log_user_action(user_id, action, details)
+        except Exception as e:
+            self.logger.error(f"Failed to store user action: {e}")
 
     # =============================================================================
     # UTILITY METHODS
     # =============================================================================
 
-    def get_user_display_name(self, user: User) -> str:
-        """Get display name for user.
+    def format_timestamp(self, dt: datetime) -> str:
+        """Format timestamp for display."""
+        if not dt:
+            return "Unknown"
         
-        Args:
-            user: User object
-            
-        Returns:
-            Display name
-        """
-        return user.get_display_name()
-
-    def format_error_list(self, errors: List[str]) -> str:
-        """Format list of errors for display.
+        now = datetime.now(timezone.utc)
+        diff = now - dt
         
-        Args:
-            errors: List of error messages
-            
-        Returns:
-            Formatted error text
-        """
-        if len(errors) == 1:
-            return errors[0]
+        if diff.days > 7:
+            return dt.strftime("%Y-%m-%d")
+        elif diff.days > 0:
+            return f"{diff.days} day{'s' if diff.days != 1 else ''} ago"
+        elif diff.seconds > 3600:
+            hours = diff.seconds // 3600
+            return f"{hours} hour{'s' if hours != 1 else ''} ago"
+        elif diff.seconds > 60:
+            minutes = diff.seconds // 60
+            return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
         else:
-            return "Multiple errors occurred:\n" + "\n".join([f"• {error}" for error in errors])
+            return "Just now"
 
     def truncate_text(self, text: str, max_length: int = 100) -> str:
-        """Truncate text to specified length.
+        """Truncate text with ellipsis."""
+        if not text or len(text) <= max_length:
+            return text or ""
         
-        Args:
-            text: Text to truncate
-            max_length: Maximum length
-            
-        Returns:
-            Truncated text
-        """
-        if len(text) <= max_length:
-            return text
-        return text[:max_length - 3] + "..."
+        return text[:max_length-3] + "..."
 
-    # =============================================================================
-    # LOGGING UTILITIES
-    # =============================================================================
-
-    def log_user_action(self, user: User, action: str, details: Optional[Dict[str, Any]] = None) -> None:
-        """Log user action for audit purposes.
-        
-        Args:
-            user: User who performed the action
-            action: Action performed
-            details: Additional details
-        """
-        log_data = {
-            'user_id': user.user_id,
-            'username': user.username,
-            'action': action,
-            'handler': self.get_handler_name()
-        }
-        
-        if details:
-            log_data.update(details)
-        
-        self.logger.info(f"User action: {action}", extra=log_data)
-
-    def log_handler_start(self, update: Update, handler_method: str) -> None:
-        """Log handler method start.
-        
-        Args:
-            update: Telegram update
-            handler_method: Method name
-        """
-        user_id = update.effective_user.id if update.effective_user else "unknown"
-        self.logger.debug(
-            f"Handler {self.get_handler_name()}.{handler_method} started",
-            extra={'user_id': user_id, 'method': handler_method}
-        )
-
-    def log_handler_end(self, update: Update, handler_method: str, success: bool = True) -> None:
-        """Log handler method end.
-        
-        Args:
-            update: Telegram update
-            handler_method: Method name
-            success: Whether handler completed successfully
-        """
-        user_id = update.effective_user.id if update.effective_user else "unknown"
-        status = "completed" if success else "failed"
-        self.logger.debug(
-            f"Handler {self.get_handler_name()}.{handler_method} {status}",
-            extra={'user_id': user_id, 'method': handler_method, 'success': success}
-        )
-
-    # =============================================================================
-    # CONCRETE IMPLEMENTATIONS OF ABSTRACT METHODS
-    # =============================================================================
-
-    async def handle_error(self, update: Update, error: Exception, context: str = "") -> None:
-        """Default error handler implementation.
-        
-        Args:
-            update: Telegram update
-            error: Exception that occurred
-            context: Additional context
-        """
-        # Log the error
-        handler_name = self.get_handler_name()
-        self.logger.error(f"Error in {handler_name}{' (' + context + ')' if context else ''}: {error}")
-        
-        # Handle specific error types
-        if isinstance(error, DatabaseError):
-            await self.handle_database_error(update, error, context)
-        elif isinstance(error, JiraAPIError):
-            await self.handle_jira_error(update, error, context)
-        elif isinstance(error, ValueError):
-            await self.send_error_message(
-                update, 
-                f"Invalid input: {str(error)}", 
-                ErrorType.VALIDATION_ERROR
-            )
-        elif isinstance(error, TelegramError):
-            await self.send_error_message(
-                update,
-                "Telegram API error occurred. Please try again.",
-                ErrorType.NETWORK_ERROR
-            )
-        else:
-            await self.send_error_message(
-                update,
-                f"{handler_name} error: {str(error)}",
-                ErrorType.UNKNOWN_ERROR
-            )
-
-    def get_handler_name(self) -> str:
-        """Default implementation of get_handler_name.
-        
-        Returns:
-            Handler name based on class name
-        """
-        return self.__class__.__name__
+    async def validate_input(self, value: str, validation_type: str) -> ValidationResult:
+        """Validate user input."""
+        return self.validator.validate(value, validation_type)
