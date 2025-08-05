@@ -4,7 +4,7 @@ Telegram service for the Telegram-Jira bot.
 
 Handles Telegram-specific operations, message formatting, and bot interactions.
 """
-
+import asyncio
 import logging
 import re
 import time
