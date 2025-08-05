@@ -5,18 +5,19 @@ Database service for the Telegram-Jira bot.
 Manages all database operations using SQLite with async support.
 """
 
-import aiosqlite
+import asyncio
 import logging
-import json
+import sqlite3
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Union, Tuple
+from typing import Optional, List, Dict, Any, Union, Callable
+import aiosqlite
 
-from ..models.project import Project, ProjectStats
-from ..models.issue import JiraIssue, IssueComment, IssueSearchResult
 from ..models.user import User, UserPreferences, UserSession
-from ..models.enums import IssuePriority, IssueType, IssueStatus, UserRole, WizardState
+from ..models.project import Project, ProjectStats
+from ..models.issue import JiraIssue, IssueComment
+from ..models.enums import UserRole, IssuePriority, IssueType, IssueStatus
 
 
 class DatabaseError(Exception):
@@ -25,954 +26,569 @@ class DatabaseError(Exception):
 
 
 class DatabaseManager:
-    """Manages SQLite database operations for the bot."""
+    """Enhanced database manager with comprehensive fixes."""
 
-    def __init__(self, db_path: str, pool_size: int = 10, timeout: int = 30) -> None:
-        """Initialize database manager.
-        
-        Args:
-            db_path: Path to SQLite database file
-            pool_size: Maximum number of connections (not used in SQLite)
-            timeout: Database operation timeout in seconds
-            
-        Raises:
-            TypeError: If arguments have wrong types
-            ValueError: If arguments are invalid
-            DatabaseError: If database initialization fails
-        """
-        if not isinstance(db_path, str):
-            raise TypeError("db_path must be a string")
-        if not db_path.strip():
-            raise ValueError("db_path cannot be empty")
-        if not isinstance(pool_size, int) or pool_size <= 0:
-            raise ValueError("pool_size must be a positive integer")
-        if not isinstance(timeout, int) or timeout <= 0:
-            raise ValueError("timeout must be a positive integer")
-            
+    def __init__(
+        self, 
+        db_path: str = "bot_data.db",
+        pool_size: int = 5,
+        timeout: float = 30.0,
+        enable_wal: bool = True,
+        enable_foreign_keys: bool = True
+    ) -> None:
+        """Initialize database manager with enhanced configuration."""
         self.db_path = Path(db_path)
-        self.timeout = timeout
-        self.logger = logging.getLogger(__name__)
+        self.pool_size = max(1, min(pool_size, 20))  # Clamp between 1-20
+        self.timeout = max(5.0, min(timeout, 300.0))  # Clamp between 5-300 seconds
+        self.enable_wal = enable_wal
+        self.enable_foreign_keys = enable_foreign_keys
+        
+        # Connection management
+        self._connection_pool: List[aiosqlite.Connection] = []
+        self._pool_lock = asyncio.Lock()
         self._initialized = False
         
-        # Ensure database directory exists
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.logger = logging.getLogger(self.__class__.__name__)
 
     async def initialize(self) -> None:
-        """Initialize database schema.
-        
-        Raises:
-            DatabaseError: If database initialization fails
-        """
-        try:
-            async with self._get_connection() as conn:
-                await self._create_tables(conn)
-                await self._create_indexes(conn)
-                await conn.commit()
-                self._initialized = True
-                self.logger.info("Database initialized successfully")
-                
-        except Exception as e:
-            self.logger.error(f"Database initialization failed: {e}")
-            raise DatabaseError(f"Failed to initialize database: {e}")
+        """Initialize database with enhanced setup."""
+        if self._initialized:
+            self.logger.warning("Database already initialized")
+            return
 
-    def is_initialized(self) -> bool:
-        """Check if database is initialized."""
-        return self._initialized
+        try:
+            # Ensure directory exists
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Test basic connectivity
+            async with aiosqlite.connect(self.db_path) as conn:
+                await conn.execute("SELECT 1")
+            
+            # Create tables and setup
+            await self._create_tables()
+            await self._setup_database_settings()
+            
+            self._initialized = True
+            self.logger.info(f"✅ Database initialized: {self.db_path}")
+            
+        except Exception as e:
+            self.logger.error(f"❌ Database initialization failed: {e}")
+            raise DatabaseError(f"Failed to initialize database: {e}")
 
     @asynccontextmanager
     async def _get_connection(self):
-        """Get database connection with proper timeout and error handling."""
+        """Get database connection with proper resource management."""
+        if not self._initialized:
+            raise DatabaseError("Database not initialized")
+        
+        conn = None
         try:
+            # Create new connection with optimized settings
             conn = await aiosqlite.connect(
                 self.db_path,
                 timeout=self.timeout,
-                check_same_thread=False
+                isolation_level=None  # Explicit transaction control
             )
-            conn.row_factory = aiosqlite.Row  # Enable column access by name
+            
+            # Configure connection
+            if self.enable_foreign_keys:
+                await conn.execute("PRAGMA foreign_keys = ON")
+            
+            if self.enable_wal:
+                await conn.execute("PRAGMA journal_mode = WAL")
+            
+            # Performance optimizations
+            await conn.execute("PRAGMA synchronous = NORMAL")
+            await conn.execute("PRAGMA cache_size = -64000")  # 64MB cache
+            await conn.execute("PRAGMA temp_store = MEMORY")
+            await conn.execute("PRAGMA mmap_size = 268435456")  # 256MB mmap
+            
             yield conn
+            
+        except sqlite3.Error as e:
+            if conn:
+                try:
+                    await conn.rollback()
+                except:
+                    pass
+            raise DatabaseError(f"Database operation failed: {e}")
         except Exception as e:
-            self.logger.error(f"Database connection failed: {e}")
-            raise DatabaseError(f"Failed to connect to database: {e}")
+            if conn:
+                try:
+                    await conn.rollback()
+                except:
+                    pass
+            raise DatabaseError(f"Unexpected database error: {e}")
         finally:
-            if 'conn' in locals():
-                await conn.close()
+            if conn:
+                try:
+                    await conn.close()
+                except Exception as e:
+                    self.logger.warning(f"Error closing connection: {e}")
 
-    async def _create_tables(self, conn: aiosqlite.Connection) -> None:
-        """Create database tables."""
-        
-        # Users table - FIXED: user_id as TEXT to match Telegram IDs
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT UNIQUE NOT NULL CHECK (length(user_id) > 0),
-                username TEXT,
-                first_name TEXT NOT NULL CHECK (length(first_name) > 0),
-                last_name TEXT,
-                role TEXT DEFAULT 'user' CHECK (role IN ('user', 'admin', 'super_admin')),
-                is_active BOOLEAN DEFAULT 1,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                issues_created INTEGER DEFAULT 0 CHECK (issues_created >= 0),
-                preferred_language TEXT DEFAULT 'en',
-                timezone TEXT DEFAULT 'UTC'
-            )
-        """)
-        
-        # User preferences table
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_preferences (
-                user_id TEXT PRIMARY KEY CHECK (length(user_id) > 0),
-                default_project_key TEXT,
-                default_priority TEXT DEFAULT 'medium' CHECK (default_priority IN ('lowest', 'low', 'medium', 'high', 'critical')),
-                default_issue_type TEXT DEFAULT 'task' CHECK (default_issue_type IN ('task', 'story', 'bug', 'epic', 'subtask')),
-                auto_assign_to_self BOOLEAN DEFAULT 0,
-                notifications_enabled BOOLEAN DEFAULT 1,
-                include_description_in_summary BOOLEAN DEFAULT 1,
-                max_issues_per_page INTEGER DEFAULT 10 CHECK (max_issues_per_page > 0),
-                date_format TEXT DEFAULT 'YYYY-MM-DD',
-                show_issue_details BOOLEAN DEFAULT 1,
-                quick_create_mode BOOLEAN DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE,
-                FOREIGN KEY(default_project_key) REFERENCES projects(key) ON DELETE SET NULL
-            )
-        """)
-        
-        # User sessions table
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_sessions (
-                user_id TEXT PRIMARY KEY CHECK (length(user_id) > 0),
-                wizard_state TEXT DEFAULT 'idle' CHECK (length(wizard_state) > 0),
-                wizard_data TEXT DEFAULT '{}',
-                last_command TEXT,
-                last_message_id INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                expires_at TIMESTAMP DEFAULT (datetime('now', '+1 day')),
-                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
-            )
-        """)
-        
-        # Projects table
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS projects (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                key TEXT UNIQUE NOT NULL CHECK (length(key) > 0),
-                name TEXT NOT NULL CHECK (length(name) > 0),
-                description TEXT NOT NULL DEFAULT '',
-                is_active BOOLEAN DEFAULT 1,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                jira_id TEXT,
-                project_type TEXT DEFAULT 'software',
-                lead TEXT,
-                url TEXT,
-                avatar_url TEXT,
-                category TEXT,
-                issue_count INTEGER DEFAULT 0 CHECK (issue_count >= 0),
-                default_priority TEXT DEFAULT 'medium' CHECK (default_priority IN ('lowest', 'low', 'medium', 'high', 'critical')),
-                default_issue_type TEXT DEFAULT 'task' CHECK (default_issue_type IN ('task', 'story', 'bug', 'epic', 'subtask'))
-            )
-        """)
-        
-        # Issues table
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS issues (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                jira_key TEXT UNIQUE NOT NULL CHECK (length(jira_key) > 0),
-                jira_id TEXT NOT NULL,
-                project_key TEXT NOT NULL,
-                summary TEXT NOT NULL CHECK (length(summary) > 0),
-                description TEXT DEFAULT '',
-                issue_type TEXT NOT NULL CHECK (issue_type IN ('task', 'story', 'bug', 'epic', 'subtask')),
-                status TEXT NOT NULL CHECK (status IN ('todo', 'in_progress', 'done', 'blocked', 'review')),
-                priority TEXT NOT NULL CHECK (priority IN ('lowest', 'low', 'medium', 'high', 'critical')),
-                assignee TEXT,
-                reporter TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                due_date TIMESTAMP,
-                resolved_at TIMESTAMP,
-                telegram_user_id TEXT,
-                telegram_message_id INTEGER,
-                FOREIGN KEY(project_key) REFERENCES projects(key) ON DELETE CASCADE,
-                FOREIGN KEY(telegram_user_id) REFERENCES users(user_id) ON DELETE SET NULL
-            )
-        """)
-        
-        # Issue comments table
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS issue_comments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                jira_comment_id TEXT UNIQUE NOT NULL,
-                jira_key TEXT NOT NULL,
-                author TEXT NOT NULL,
-                body TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(jira_key) REFERENCES issues(jira_key) ON DELETE CASCADE
-            )
-        """)
+    async def _execute_transaction(
+        self, 
+        operations: List[Callable],
+        read_only: bool = False
+    ) -> List[Any]:
+        """Execute multiple operations in a single transaction."""
+        async with self._get_connection() as conn:
+            try:
+                if not read_only:
+                    await conn.execute("BEGIN IMMEDIATE TRANSACTION")
+                else:
+                    await conn.execute("BEGIN TRANSACTION")
+                
+                results = []
+                for operation in operations:
+                    if asyncio.iscoroutinefunction(operation):
+                        result = await operation(conn)
+                    else:
+                        result = operation(conn)
+                    results.append(result)
+                
+                if not read_only:
+                    await conn.commit()
+                
+                return results
+                
+            except Exception as e:
+                if not read_only:
+                    await conn.rollback()
+                self.logger.error(f"Transaction failed: {e}")
+                raise DatabaseError(f"Transaction execution failed: {e}")
 
-    async def _create_indexes(self, conn: aiosqlite.Connection) -> None:
-        """Create database indexes for performance."""
-        indexes = [
-            # User indexes
-            "CREATE INDEX IF NOT EXISTS idx_users_user_id ON users(user_id)",
-            "CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)",
-            "CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)",
-            "CREATE INDEX IF NOT EXISTS idx_users_last_activity ON users(last_activity)",
-            
-            # Project indexes
-            "CREATE INDEX IF NOT EXISTS idx_projects_key ON projects(key)",
-            "CREATE INDEX IF NOT EXISTS idx_projects_active ON projects(is_active)",
-            "CREATE INDEX IF NOT EXISTS idx_projects_name ON projects(name)",
-            "CREATE INDEX IF NOT EXISTS idx_projects_category ON projects(category)",
-            
-            # Issue indexes
-            "CREATE INDEX IF NOT EXISTS idx_issues_user_message ON issues(telegram_user_id, telegram_message_id)",
-            "CREATE INDEX IF NOT EXISTS idx_issues_jira_key ON issues(jira_key)",
-            "CREATE INDEX IF NOT EXISTS idx_issues_project_key ON issues(project_key)",
-            "CREATE INDEX IF NOT EXISTS idx_issues_created_at ON issues(created_at)",
-            "CREATE INDEX IF NOT EXISTS idx_issues_priority ON issues(priority)",
-            "CREATE INDEX IF NOT EXISTS idx_issues_type ON issues(issue_type)",
-            "CREATE INDEX IF NOT EXISTS idx_issues_status ON issues(status)",
-            "CREATE INDEX IF NOT EXISTS idx_issues_assignee ON issues(assignee)",
-            "CREATE INDEX IF NOT EXISTS idx_issues_due_date ON issues(due_date)",
-            
-            # Comment indexes
-            "CREATE INDEX IF NOT EXISTS idx_comments_jira_key ON issue_comments(jira_key)",
-            "CREATE INDEX IF NOT EXISTS idx_comments_author ON issue_comments(author)",
-            "CREATE INDEX IF NOT EXISTS idx_comments_created_at ON issue_comments(created_at)",
-            
-            # Session indexes
-            "CREATE INDEX IF NOT EXISTS idx_sessions_state ON user_sessions(wizard_state)",
-            "CREATE INDEX IF NOT EXISTS idx_sessions_expires ON user_sessions(expires_at)",
-        ]
-        
-        for index_sql in indexes:
-            await conn.execute(index_sql)
+    async def _create_tables(self) -> None:
+        """Create all database tables with enhanced schema."""
+        async with self._get_connection() as conn:
+            try:
+                # Users table with enhanced constraints
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id TEXT UNIQUE NOT NULL CHECK (length(user_id) > 0 AND length(user_id) <= 20),
+                        username TEXT CHECK (username IS NULL OR (length(username) > 0 AND length(username) <= 32)),
+                        first_name TEXT CHECK (first_name IS NULL OR (length(first_name) > 0 AND length(first_name) <= 64)),
+                        last_name TEXT CHECK (last_name IS NULL OR (length(last_name) <= 64)),
+                        role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'admin', 'super_admin')),
+                        is_active BOOLEAN NOT NULL DEFAULT 1,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        last_activity TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        issues_created INTEGER NOT NULL DEFAULT 0 CHECK (issues_created >= 0),
+                        preferred_language TEXT NOT NULL DEFAULT 'en' CHECK (length(preferred_language) <= 10),
+                        timezone TEXT NOT NULL DEFAULT 'UTC' CHECK (length(timezone) <= 50),
+                        default_project_key TEXT CHECK (default_project_key IS NULL OR length(default_project_key) <= 20),
+                        FOREIGN KEY(default_project_key) REFERENCES projects(key) ON DELETE SET NULL
+                    )
+                """)
 
-    # =============================================================================
-    # USER OPERATIONS - FIXED METHOD SIGNATURES
-    # =============================================================================
+                # Create indexes for performance
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_user_id ON users(user_id)")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_active ON users(is_active)")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_last_activity ON users(last_activity)")
 
+                # User sessions table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS user_sessions (
+                        user_id TEXT PRIMARY KEY CHECK (length(user_id) > 0),
+                        wizard_state TEXT NOT NULL DEFAULT 'idle' CHECK (length(wizard_state) > 0),
+                        wizard_data TEXT NOT NULL DEFAULT '{}',
+                        last_command TEXT CHECK (last_command IS NULL OR length(last_command) <= 100),
+                        last_message_id INTEGER CHECK (last_message_id IS NULL OR last_message_id > 0),
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        expires_at TIMESTAMP NOT NULL DEFAULT (datetime('now', '+1 day')),
+                        FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+                    )
+                """)
+
+                # Projects table with enhanced validation
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS projects (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        key TEXT UNIQUE NOT NULL CHECK (length(key) > 0 AND length(key) <= 20),
+                        name TEXT NOT NULL CHECK (length(name) > 0 AND length(name) <= 255),
+                        description TEXT NOT NULL DEFAULT '',
+                        is_active BOOLEAN NOT NULL DEFAULT 1,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        jira_id TEXT CHECK (jira_id IS NULL OR length(jira_id) <= 50),
+                        project_type TEXT NOT NULL DEFAULT 'software' CHECK (
+                            project_type IN ('software', 'service_desk', 'business', 'product_discovery')
+                        ),
+                        lead TEXT CHECK (lead IS NULL OR length(lead) <= 100),
+                        url TEXT CHECK (url IS NULL OR length(url) <= 500),
+                        avatar_url TEXT CHECK (avatar_url IS NULL OR length(avatar_url) <= 500),
+                        category TEXT CHECK (category IS NULL OR length(category) <= 100),
+                        issue_count INTEGER NOT NULL DEFAULT 0 CHECK (issue_count >= 0),
+                        default_priority TEXT NOT NULL DEFAULT 'medium' CHECK (
+                            default_priority IN ('lowest', 'low', 'medium', 'high', 'critical')
+                        ),
+                        default_issue_type TEXT NOT NULL DEFAULT 'task' CHECK (
+                            default_issue_type IN ('task', 'story', 'bug', 'epic', 'improvement', 'subtask')
+                        )
+                    )
+                """)
+
+                # Project indexes
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_projects_key ON projects(key)")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_projects_active ON projects(is_active)")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_projects_type ON projects(project_type)")
+
+                # Issues table with comprehensive validation
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS issues (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        jira_id TEXT UNIQUE NOT NULL CHECK (length(jira_id) > 0 AND length(jira_id) <= 50),
+                        key TEXT UNIQUE NOT NULL CHECK (length(key) > 0 AND length(key) <= 50),
+                        summary TEXT NOT NULL CHECK (length(summary) > 0 AND length(summary) <= 500),
+                        description TEXT NOT NULL DEFAULT '',
+                        priority TEXT NOT NULL DEFAULT 'medium' CHECK (
+                            priority IN ('lowest', 'low', 'medium', 'high', 'critical')
+                        ),
+                        issue_type TEXT NOT NULL DEFAULT 'task' CHECK (
+                            issue_type IN ('task', 'story', 'bug', 'epic', 'improvement', 'subtask')
+                        ),
+                        status TEXT NOT NULL DEFAULT 'todo' CHECK (length(status) > 0 AND length(status) <= 50),
+                        project_id INTEGER NOT NULL,
+                        creator_id INTEGER NOT NULL,
+                        assignee_id INTEGER CHECK (assignee_id IS NULL OR assignee_id > 0),
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        jira_created_at TIMESTAMP,
+                        jira_updated_at TIMESTAMP,
+                        resolution TEXT CHECK (resolution IS NULL OR length(resolution) <= 100),
+                        labels TEXT NOT NULL DEFAULT '[]',
+                        components TEXT NOT NULL DEFAULT '[]',
+                        fix_versions TEXT NOT NULL DEFAULT '[]',
+                        story_points INTEGER CHECK (story_points IS NULL OR story_points >= 0),
+                        original_estimate INTEGER CHECK (original_estimate IS NULL OR original_estimate >= 0),
+                        remaining_estimate INTEGER CHECK (remaining_estimate IS NULL OR remaining_estimate >= 0),
+                        time_spent INTEGER CHECK (time_spent IS NULL OR time_spent >= 0),
+                        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                        FOREIGN KEY(creator_id) REFERENCES users(id) ON DELETE CASCADE,
+                        FOREIGN KEY(assignee_id) REFERENCES users(id) ON DELETE SET NULL
+                    )
+                """)
+
+                # Issue indexes for performance
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_issues_jira_id ON issues(jira_id)")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_issues_key ON issues(key)")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_issues_project_id ON issues(project_id)")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_issues_creator_id ON issues(creator_id)")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_issues_assignee_id ON issues(assignee_id)")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_issues_status ON issues(status)")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_issues_priority ON issues(priority)")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_issues_created_at ON issues(created_at)")
+
+                # Issue comments table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS issue_comments (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        jira_id TEXT UNIQUE NOT NULL CHECK (length(jira_id) > 0),
+                        issue_id INTEGER NOT NULL,
+                        author_id INTEGER NOT NULL,
+                        body TEXT NOT NULL CHECK (length(body) > 0),
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        jira_created_at TIMESTAMP,
+                        jira_updated_at TIMESTAMP,
+                        visibility TEXT CHECK (visibility IS NULL OR length(visibility) <= 50),
+                        FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE,
+                        FOREIGN KEY(author_id) REFERENCES users(id) ON DELETE CASCADE
+                    )
+                """)
+
+                # Comment indexes
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_comments_issue_id ON issue_comments(issue_id)")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_comments_author_id ON issue_comments(author_id)")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_comments_created_at ON issue_comments(created_at)")
+
+                await conn.commit()
+                self.logger.info("✅ Database tables created successfully")
+
+            except Exception as e:
+                await conn.rollback()
+                self.logger.error(f"❌ Failed to create tables: {e}")
+                raise DatabaseError(f"Table creation failed: {e}")
+
+    async def _setup_database_settings(self) -> None:
+        """Setup database-wide settings and triggers."""
+        async with self._get_connection() as conn:
+            try:
+                # Create trigger to update project issue count
+                await conn.execute("""
+                    CREATE TRIGGER IF NOT EXISTS update_project_issue_count_insert
+                    AFTER INSERT ON issues
+                    BEGIN
+                        UPDATE projects 
+                        SET issue_count = issue_count + 1,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = NEW.project_id;
+                    END
+                """)
+
+                await conn.execute("""
+                    CREATE TRIGGER IF NOT EXISTS update_project_issue_count_delete
+                    AFTER DELETE ON issues
+                    BEGIN
+                        UPDATE projects 
+                        SET issue_count = issue_count - 1,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = OLD.project_id;
+                    END
+                """)
+
+                # Create trigger to update user issues_created count
+                await conn.execute("""
+                    CREATE TRIGGER IF NOT EXISTS update_user_issues_created
+                    AFTER INSERT ON issues
+                    BEGIN
+                        UPDATE users 
+                        SET issues_created = issues_created + 1,
+                            last_activity = CURRENT_TIMESTAMP
+                        WHERE id = NEW.creator_id;
+                    END
+                """)
+
+                # Create trigger to update timestamps
+                await conn.execute("""
+                    CREATE TRIGGER IF NOT EXISTS update_issue_timestamp
+                    AFTER UPDATE ON issues
+                    BEGIN
+                        UPDATE issues 
+                        SET updated_at = CURRENT_TIMESTAMP
+                        WHERE id = NEW.id;
+                    END
+                """)
+
+                await conn.commit()
+                self.logger.info("✅ Database triggers created successfully")
+
+            except Exception as e:
+                await conn.rollback()
+                self.logger.error(f"❌ Failed to setup database settings: {e}")
+                raise DatabaseError(f"Database setup failed: {e}")
+
+    # Enhanced user operations with comprehensive validation
     async def create_user(
         self,
         user_id: str,
         username: Optional[str] = None,
-        first_name: str = "",
+        first_name: Optional[str] = None,
         last_name: Optional[str] = None,
         role: Union[UserRole, str] = UserRole.USER,
         is_active: bool = True,
         preferred_language: str = "en",
         timezone: str = "UTC"
     ) -> int:
-        """Create a new user and return the database ID.
-        
-        Args:
-            user_id: Telegram user ID (string)
-            username: Telegram username
-            first_name: User's first name
-            last_name: User's last name
-            role: User role (enum or string)
-            is_active: Whether user is active
-            preferred_language: User's preferred language
-            timezone: User's timezone
-            
-        Returns:
-            Database ID of created user
-            
-        Raises:
-            DatabaseError: If user creation fails
-            ValueError: If arguments are invalid
-        """
-        if not isinstance(user_id, str) or not user_id.strip():
+        """Create a new user with comprehensive validation."""
+        # Input validation
+        if not user_id or not isinstance(user_id, str) or len(user_id.strip()) == 0:
             raise ValueError("user_id must be a non-empty string")
-        if not isinstance(first_name, str) or not first_name.strip():
-            raise ValueError("first_name must be a non-empty string")
         
-        # Convert role to string if needed
-        role_str = role.value if isinstance(role, UserRole) else str(role)
+        user_id = user_id.strip()
+        if len(user_id) > 20:
+            raise ValueError("user_id must be 20 characters or less")
         
+        if username is not None:
+            username = username.strip() if username else None
+            if username and len(username) > 32:
+                raise ValueError("username must be 32 characters or less")
+        
+        if first_name is not None:
+            first_name = first_name.strip() if first_name else None
+            if first_name and len(first_name) > 64:
+                raise ValueError("first_name must be 64 characters or less")
+        
+        if last_name is not None:
+            last_name = last_name.strip() if last_name else None
+            if last_name and len(last_name) > 64:
+                raise ValueError("last_name must be 64 characters or less")
+        
+        # Role validation and conversion
+        if isinstance(role, str):
+            try:
+                role = UserRole.from_string(role)
+            except ValueError as e:
+                raise ValueError(f"Invalid role: {e}")
+        elif not isinstance(role, UserRole):
+            raise TypeError("role must be a UserRole instance or valid string")
+        
+        # Language and timezone validation
+        if not preferred_language or len(preferred_language) > 10:
+            preferred_language = "en"
+        
+        if not timezone or len(timezone) > 50:
+            timezone = "UTC"
+
         try:
             async with self._get_connection() as conn:
+                # Check if user already exists
+                cursor = await conn.execute(
+                    "SELECT id FROM users WHERE user_id = ?", (user_id,)
+                )
+                existing = await cursor.fetchone()
+                if existing:
+                    raise ValueError(f"User with ID {user_id} already exists")
+                
+                # Insert new user
                 cursor = await conn.execute("""
-                    INSERT INTO users 
-                    (user_id, username, first_name, last_name, role, is_active, 
-                     preferred_language, timezone, created_at, last_activity)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO users (
+                        user_id, username, first_name, last_name, role, 
+                        is_active, preferred_language, timezone, created_at, last_activity
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    user_id, username, first_name, last_name, role_str, is_active,
-                    preferred_language, timezone, 
+                    user_id, username, first_name, last_name, role.value,
+                    is_active, preferred_language, timezone,
                     datetime.now(timezone.utc).isoformat(),
                     datetime.now(timezone.utc).isoformat()
                 ))
-                await conn.commit()
-                return cursor.lastrowid
                 
+                await conn.commit()
+                user_db_id = cursor.lastrowid
+                
+                self.logger.info(f"✅ User created: {user_id} (DB ID: {user_db_id})")
+                return user_db_id
+                
+        except sqlite3.IntegrityError as e:
+            self.logger.error(f"❌ User creation integrity error: {e}")
+            raise ValueError(f"User creation failed: {e}")
         except Exception as e:
-            self.logger.error(f"Failed to create user {user_id}: {e}")
+            self.logger.error(f"❌ Failed to create user {user_id}: {e}")
             raise DatabaseError(f"Failed to create user: {e}")
 
-    async def save_user(self, user: User) -> None:
-        """Save or update a user in the database."""
-        if not isinstance(user, User):
-            raise TypeError("user must be a User instance")
-
-        try:
-            async with self._get_connection() as conn:
-                await conn.execute("""
-                    INSERT OR REPLACE INTO users 
-                    (user_id, username, first_name, last_name, role, is_active,
-                     created_at, last_activity, issues_created, preferred_language, timezone)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    user.user_id, user.username, user.first_name, user.last_name,
-                    user.role.value, user.is_active, user.created_at.isoformat(),
-                    user.last_activity.isoformat(), user.issues_created,
-                    user.preferred_language, user.timezone
-                ))
-                await conn.commit()
-        except Exception as e:
-            self.logger.error(f"Failed to save user {user.user_id}: {e}")
-            raise DatabaseError(f"Failed to save user: {e}")
-
-    async def get_user(self, user_id: str) -> Optional[User]:
-        """Get a user by Telegram user ID (string).
-        
-        Args:
-            user_id: Telegram user ID as string
-            
-        Returns:
-            User object or None if not found
-            
-        Raises:
-            DatabaseError: If database operation fails
-        """
-        if not isinstance(user_id, str) or not user_id.strip():
+    async def get_user_by_telegram_id(self, user_id: str) -> Optional[User]:
+        """Get user by Telegram ID with enhanced error handling."""
+        if not user_id or not isinstance(user_id, str):
             raise ValueError("user_id must be a non-empty string")
-
+        
         try:
             async with self._get_connection() as conn:
                 cursor = await conn.execute(
-                    "SELECT * FROM users WHERE user_id = ?", (user_id,)
+                    "SELECT * FROM users WHERE user_id = ? AND is_active = 1", 
+                    (user_id.strip(),)
                 )
                 row = await cursor.fetchone()
                 
-                if row:
-                    return User(
-                        user_id=row['user_id'],
-                        username=row['username'],
-                        first_name=row['first_name'],
-                        last_name=row['last_name'],
-                        role=UserRole.from_string(row['role']),
-                        is_active=bool(row['is_active']),
-                        created_at=datetime.fromisoformat(row['created_at']),
-                        last_activity=datetime.fromisoformat(row['last_activity']),
-                        issues_created=row['issues_created'],
-                        preferred_language=row['preferred_language'],
-                        timezone=row['timezone']
-                    )
-                return None
-        except Exception as e:
-            self.logger.error(f"Failed to get user {user_id}: {e}")
-            raise DatabaseError(f"Failed to retrieve user: {e}")
-
-    async def get_user_by_telegram_id(self, telegram_id: str) -> Optional[User]:
-        """Alias for get_user for backward compatibility."""
-        return await self.get_user(telegram_id)
-
-    async def get_user_by_id(self, db_id: int) -> Optional[User]:
-        """Get a user by database ID (integer).
-        
-        Args:
-            db_id: Database ID (integer primary key)
-            
-        Returns:
-            User object or None if not found
-        """
-        if not isinstance(db_id, int) or db_id <= 0:
-            raise ValueError("db_id must be a positive integer")
-
-        try:
-            async with self._get_connection() as conn:
-                cursor = await conn.execute(
-                    "SELECT * FROM users WHERE id = ?", (db_id,)
-                )
-                row = await cursor.fetchone()
+                if not row:
+                    return None
                 
-                if row:
-                    return User(
-                        user_id=row['user_id'],
-                        username=row['username'],
-                        first_name=row['first_name'],
-                        last_name=row['last_name'],
-                        role=UserRole.from_string(row['role']),
-                        is_active=bool(row['is_active']),
-                        created_at=datetime.fromisoformat(row['created_at']),
-                        last_activity=datetime.fromisoformat(row['last_activity']),
-                        issues_created=row['issues_created'],
-                        preferred_language=row['preferred_language'],
-                        timezone=row['timezone']
-                    )
-                return None
-        except Exception as e:
-            self.logger.error(f"Failed to get user by ID {db_id}: {e}")
-            raise DatabaseError(f"Failed to retrieve user: {e}")
-
-    async def update_user_activity(self, user_id: str) -> None:
-        """Update user's last activity timestamp.
-        
-        Args:
-            user_id: Telegram user ID
-            
-        Raises:
-            DatabaseError: If update fails
-        """
-        if not isinstance(user_id, str) or not user_id.strip():
-            raise ValueError("user_id must be a non-empty string")
-
-        try:
-            async with self._get_connection() as conn:
+                # Update last activity
                 await conn.execute(
                     "UPDATE users SET last_activity = ? WHERE user_id = ?",
-                    (datetime.now(timezone.utc).isoformat(), user_id)
+                    (datetime.now(timezone.utc).isoformat(), user_id.strip())
                 )
                 await conn.commit()
-        except Exception as e:
-            self.logger.error(f"Failed to update user activity {user_id}: {e}")
-            raise DatabaseError(f"Failed to update user activity: {e}")
-
-    async def update_user(
-        self,
-        user_id: Union[str, int],
-        **kwargs
-    ) -> None:
-        """Update user fields.
-        
-        Args:
-            user_id: User ID (string for telegram_id, int for db_id)
-            **kwargs: Fields to update
-            
-        Raises:
-            DatabaseError: If update fails
-        """
-        if not kwargs:
-            return
-
-        # Determine if we're using telegram user_id or database id
-        if isinstance(user_id, str):
-            where_clause = "user_id = ?"
-        elif isinstance(user_id, int):
-            where_clause = "id = ?"
-        else:
-            raise ValueError("user_id must be string or int")
-
-        # Build SET clause
-        set_clauses = []
-        values = []
-        
-        for field, value in kwargs.items():
-            if field == 'role' and isinstance(value, UserRole):
-                value = value.value
-            set_clauses.append(f"{field} = ?")
-            values.append(value)
-        
-        if not set_clauses:
-            return
-
-        values.append(user_id)
-
-        try:
-            async with self._get_connection() as conn:
-                await conn.execute(
-                    f"UPDATE users SET {', '.join(set_clauses)} WHERE {where_clause}",
-                    values
+                
+                return User(
+                    user_id=row['user_id'],
+                    username=row['username'],
+                    first_name=row['first_name'],
+                    last_name=row['last_name'],
+                    role=UserRole.from_string(row['role']),
+                    is_active=bool(row['is_active']),
+                    created_at=datetime.fromisoformat(row['created_at']),
+                    last_activity=datetime.fromisoformat(row['last_activity']),
+                    issues_created=row['issues_created'],
+                    preferred_language=row['preferred_language'],
+                    timezone=row['timezone']
                 )
-                await conn.commit()
+                
+        except ValueError:
+            raise
         except Exception as e:
-            self.logger.error(f"Failed to update user {user_id}: {e}")
-            raise DatabaseError(f"Failed to update user: {e}")
+            self.logger.error(f"❌ Failed to get user {user_id}: {e}")
+            raise DatabaseError(f"Failed to retrieve user: {e}")
 
-    async def delete_user(self, user_id: Union[str, int]) -> None:
-        """Delete a user.
-        
-        Args:
-            user_id: User ID (string for telegram_id, int for db_id)
-        """
-        if isinstance(user_id, str):
-            where_clause = "user_id = ?"
-        elif isinstance(user_id, int):
-            where_clause = "id = ?"
-        else:
-            raise ValueError("user_id must be string or int")
-
+    async def health_check(self) -> Dict[str, Any]:
+        """Perform comprehensive database health check."""
         try:
             async with self._get_connection() as conn:
-                await conn.execute(f"DELETE FROM users WHERE {where_clause}", (user_id,))
-                await conn.commit()
-        except Exception as e:
-            self.logger.error(f"Failed to delete user {user_id}: {e}")
-            raise DatabaseError(f"Failed to delete user: {e}")
-
-    async def get_all_users(self, active_only: bool = True) -> List[User]:
-        """Get all users from the database."""
-        try:
-            async with self._get_connection() as conn:
-                if active_only:
-                    cursor = await conn.execute(
-                        "SELECT * FROM users WHERE is_active = 1 ORDER BY created_at"
-                    )
-                else:
-                    cursor = await conn.execute(
-                        "SELECT * FROM users ORDER BY created_at"
-                    )
+                start_time = asyncio.get_event_loop().time()
                 
-                rows = await cursor.fetchall()
-                users = []
+                # Basic connectivity
+                await conn.execute("SELECT 1")
                 
-                for row in rows:
-                    try:
-                        user = User(
-                            user_id=row['user_id'],
-                            username=row['username'],
-                            first_name=row['first_name'],
-                            last_name=row['last_name'],
-                            role=UserRole.from_string(row['role']),
-                            is_active=bool(row['is_active']),
-                            created_at=datetime.fromisoformat(row['created_at']),
-                            last_activity=datetime.fromisoformat(row['last_activity']),
-                            issues_created=row['issues_created'],
-                            preferred_language=row['preferred_language'],
-                            timezone=row['timezone']
-                        )
-                        users.append(user)
-                    except (ValueError, TypeError) as e:
-                        self.logger.warning(f"Skipping invalid user data for {row['user_id']}: {e}")
-                        continue
-                
-                return users
-        except Exception as e:
-            self.logger.error(f"Failed to get all users: {e}")
-            raise DatabaseError(f"Failed to retrieve users: {e}")
-
-    # =============================================================================
-    # PROJECT OPERATIONS - FIXED METHOD SIGNATURES
-    # =============================================================================
-
-    async def create_project(
-        self,
-        key: str,
-        name: str,
-        description: str = "",
-        jira_id: Optional[str] = None,
-        is_active: bool = True,
-        project_type: str = "software",
-        lead: Optional[str] = None,
-        url: Optional[str] = None,
-        avatar_url: Optional[str] = None,
-        category: Optional[str] = None,
-        default_priority: Union[IssuePriority, str] = IssuePriority.MEDIUM,
-        default_issue_type: Union[IssueType, str] = IssueType.TASK
-    ) -> int:
-        """Create a new project and return database ID."""
-        if not isinstance(key, str) or not key.strip():
-            raise ValueError("key must be a non-empty string")
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("name must be a non-empty string")
-        
-        # Convert enums to strings
-        priority_str = default_priority.value if isinstance(default_priority, IssuePriority) else str(default_priority)
-        type_str = default_issue_type.value if isinstance(default_issue_type, IssueType) else str(default_issue_type)
-
-        try:
-            async with self._get_connection() as conn:
+                # Check table existence
                 cursor = await conn.execute("""
-                    INSERT INTO projects 
-                    (key, name, description, jira_id, is_active, project_type, lead, url, 
-                     avatar_url, category, default_priority, default_issue_type, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    key, name, description, jira_id, is_active, project_type, lead, url,
-                    avatar_url, category, priority_str, type_str,
-                    datetime.now(timezone.utc).isoformat(),
-                    datetime.now(timezone.utc).isoformat()
-                ))
-                await conn.commit()
-                return cursor.lastrowid
+                    SELECT name FROM sqlite_master 
+                    WHERE type='table' AND name IN ('users', 'projects', 'issues')
+                """)
+                tables = [row[0] for row in await cursor.fetchall()]
+                
+                # Check foreign key constraints
+                await conn.execute("PRAGMA foreign_key_check")
+                
+                # Check database integrity
+                cursor = await conn.execute("PRAGMA integrity_check")
+                integrity_result = await cursor.fetchone()
+                
+                # Get basic stats
+                cursor = await conn.execute("SELECT COUNT(*) FROM users WHERE is_active = 1")
+                active_users = (await cursor.fetchone())[0]
+                
+                cursor = await conn.execute("SELECT COUNT(*) FROM projects WHERE is_active = 1")
+                active_projects = (await cursor.fetchone())[0]
+                
+                cursor = await conn.execute("SELECT COUNT(*) FROM issues")
+                total_issues = (await cursor.fetchone())[0]
+                
+                response_time = asyncio.get_event_loop().time() - start_time
+                
+                return {
+                    'status': 'healthy',
+                    'response_time_ms': round(response_time * 1000, 2),
+                    'tables_present': len(tables) == 3,
+                    'integrity_check': integrity_result[0] == 'ok',
+                    'stats': {
+                        'active_users': active_users,
+                        'active_projects': active_projects,
+                        'total_issues': total_issues
+                    },
+                    'database_path': str(self.db_path),
+                    'database_size_mb': round(self.db_path.stat().st_size / 1024 / 1024, 2)
+                }
                 
         except Exception as e:
-            self.logger.error(f"Failed to create project {key}: {e}")
-            raise DatabaseError(f"Failed to create project: {e}")
-
-    async def get_project_by_key(self, key: str) -> Optional[Project]:
-        """Get project by key."""
-        if not isinstance(key, str) or not key.strip():
-            raise ValueError("key must be a non-empty string")
-
-        try:
-            async with self._get_connection() as conn:
-                cursor = await conn.execute(
-                    "SELECT * FROM projects WHERE key = ?", (key,)
-                )
-                row = await cursor.fetchone()
-                
-                if row:
-                    return self._row_to_project(row)
-                return None
-        except Exception as e:
-            self.logger.error(f"Failed to get project {key}: {e}")
-            raise DatabaseError(f"Failed to retrieve project: {e}")
-
-    async def get_project_by_id(self, project_id: int) -> Optional[Project]:
-        """Get project by database ID."""
-        if not isinstance(project_id, int) or project_id <= 0:
-            raise ValueError("project_id must be a positive integer")
-
-        try:
-            async with self._get_connection() as conn:
-                cursor = await conn.execute(
-                    "SELECT * FROM projects WHERE id = ?", (project_id,)
-                )
-                row = await cursor.fetchone()
-                
-                if row:
-                    return self._row_to_project(row)
-                return None
-        except Exception as e:
-            self.logger.error(f"Failed to get project by ID {project_id}: {e}")
-            raise DatabaseError(f"Failed to retrieve project: {e}")
-
-    async def update_project(
-        self,
-        project_id: int,
-        **kwargs
-    ) -> None:
-        """Update project fields."""
-        if not kwargs:
-            return
-
-        # Build SET clause
-        set_clauses = []
-        values = []
-        
-        for field, value in kwargs.items():
-            if field == 'default_priority' and isinstance(value, IssuePriority):
-                value = value.value
-            elif field == 'default_issue_type' and isinstance(value, IssueType):
-                value = value.value
-            set_clauses.append(f"{field} = ?")
-            values.append(value)
-        
-        # Add updated_at
-        set_clauses.append("updated_at = ?")
-        values.append(datetime.now(timezone.utc).isoformat())
-        values.append(project_id)
-
-        try:
-            async with self._get_connection() as conn:
-                await conn.execute(
-                    f"UPDATE projects SET {', '.join(set_clauses)} WHERE id = ?",
-                    values
-                )
-                await conn.commit()
-        except Exception as e:
-            self.logger.error(f"Failed to update project {project_id}: {e}")
-            raise DatabaseError(f"Failed to update project: {e}")
-
-    async def delete_project(self, project_id: int) -> None:
-        """Delete a project."""
-        try:
-            async with self._get_connection() as conn:
-                await conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
-                await conn.commit()
-        except Exception as e:
-            self.logger.error(f"Failed to delete project {project_id}: {e}")
-            raise DatabaseError(f"Failed to delete project: {e}")
-
-    async def get_all_projects(self, active_only: bool = True) -> List[Project]:
-        """Get all projects."""
-        try:
-            async with self._get_connection() as conn:
-                if active_only:
-                    cursor = await conn.execute(
-                        "SELECT * FROM projects WHERE is_active = 1 ORDER BY name"
-                    )
-                else:
-                    cursor = await conn.execute(
-                        "SELECT * FROM projects ORDER BY name"
-                    )
-                
-                rows = await cursor.fetchall()
-                projects = []
-                
-                for row in rows:
-                    try:
-                        project = self._row_to_project(row)
-                        projects.append(project)
-                    except (ValueError, TypeError) as e:
-                        self.logger.warning(f"Skipping invalid project data for {row['key']}: {e}")
-                        continue
-                
-                return projects
-        except Exception as e:
-            self.logger.error(f"Failed to get all projects: {e}")
-            raise DatabaseError(f"Failed to retrieve projects: {e}")
-
-    def _row_to_project(self, row) -> Project:
-        """Convert database row to Project model."""
-        return Project(
-            key=row['key'],
-            name=row['name'],
-            description=row['description'] or "",
-            jira_id=row['jira_id'],
-            created_at=datetime.fromisoformat(row['created_at']),
-            updated_at=datetime.fromisoformat(row['updated_at']) if row['updated_at'] else None,
-            is_active=bool(row['is_active']),
-            project_type=row['project_type'] or "software",
-            lead=row['lead'],
-            url=row['url'],
-            avatar_url=row['avatar_url'],
-            category=row['category'],
-            issue_count=row['issue_count'] or 0,
-            default_priority=IssuePriority.from_string(row['default_priority']),
-            default_issue_type=IssueType.from_string(row['default_issue_type'])
-        )
-
-    # =============================================================================
-    # USER PREFERENCES OPERATIONS
-    # =============================================================================
-
-    async def save_user_preferences(self, preferences: UserPreferences) -> None:
-        """Save user preferences."""
-        if not isinstance(preferences, UserPreferences):
-            raise TypeError("preferences must be a UserPreferences instance")
-
-        try:
-            async with self._get_connection() as conn:
-                await conn.execute("""
-                    INSERT OR REPLACE INTO user_preferences 
-                    (user_id, default_project_key, default_priority, default_issue_type,
-                     auto_assign_to_self, notifications_enabled, include_description_in_summary,
-                     max_issues_per_page, date_format, show_issue_details, quick_create_mode,
-                     created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    preferences.user_id, preferences.default_project_key,
-                    preferences.default_priority.value, preferences.default_issue_type.value,
-                    preferences.auto_assign_to_self, preferences.notifications_enabled,
-                    preferences.include_description_in_summary, preferences.max_issues_per_page,
-                    preferences.date_format, preferences.show_issue_details,
-                    preferences.quick_create_mode, preferences.created_at.isoformat(),
-                    preferences.updated_at.isoformat()
-                ))
-                await conn.commit()
-        except Exception as e:
-            self.logger.error(f"Failed to save user preferences {preferences.user_id}: {e}")
-            raise DatabaseError(f"Failed to save user preferences: {e}")
-
-    async def get_user_preferences(self, user_id: str) -> Optional[UserPreferences]:
-        """Get user preferences."""
-        if not isinstance(user_id, str) or not user_id.strip():
-            raise ValueError("user_id must be a non-empty string")
-
-        try:
-            async with self._get_connection() as conn:
-                cursor = await conn.execute(
-                    "SELECT * FROM user_preferences WHERE user_id = ?", (user_id,)
-                )
-                row = await cursor.fetchone()
-                
-                if row:
-                    return UserPreferences(
-                        user_id=str(row['user_id']),  # Ensure it's a string
-                        default_project_key=row['default_project_key'],
-                        default_priority=IssuePriority.from_string(row['default_priority']),
-                        default_issue_type=IssueType.from_string(row['default_issue_type']),
-                        auto_assign_to_self=bool(row['auto_assign_to_self']),
-                        notifications_enabled=bool(row['notifications_enabled']),
-                        include_description_in_summary=bool(row['include_description_in_summary']),
-                        max_issues_per_page=row['max_issues_per_page'],
-                        date_format=row['date_format'],
-                        show_issue_details=bool(row['show_issue_details']),
-                        quick_create_mode=bool(row['quick_create_mode']),
-                        created_at=datetime.fromisoformat(row['created_at']),
-                        updated_at=datetime.fromisoformat(row['updated_at'])
-                    )
-                return None
-        except Exception as e:
-            self.logger.error(f"Failed to get user preferences {user_id}: {e}")
-            raise DatabaseError(f"Failed to retrieve user preferences: {e}")
-
-    # =============================================================================
-    # USER SESSION OPERATIONS
-    # =============================================================================
-
-    async def save_user_session(self, session: UserSession) -> None:
-        """Save user session."""
-        if not isinstance(session, UserSession):
-            raise TypeError("session must be a UserSession instance")
-
-        try:
-            async with self._get_connection() as conn:
-                await conn.execute("""
-                    INSERT OR REPLACE INTO user_sessions 
-                    (user_id, wizard_state, wizard_data, last_command, last_message_id,
-                     created_at, expires_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    session.user_id, session.wizard_state.value,
-                    json.dumps(session.wizard_data), session.last_command,
-                    session.last_message_id, session.created_at.isoformat(),
-                    session.expires_at.isoformat()
-                ))
-                await conn.commit()
-        except Exception as e:
-            self.logger.error(f"Failed to save user session {session.user_id}: {e}")
-            raise DatabaseError(f"Failed to save user session: {e}")
-
-    async def get_user_session(self, user_id: str) -> Optional[UserSession]:
-        """Get user session."""
-        if not isinstance(user_id, str) or not user_id.strip():
-            raise ValueError("user_id must be a non-empty string")
-
-        try:
-            async with self._get_connection() as conn:
-                cursor = await conn.execute(
-                    "SELECT * FROM user_sessions WHERE user_id = ?", (user_id,)
-                )
-                row = await cursor.fetchone()
-                
-                if row:
-                    return UserSession(
-                        user_id=row['user_id'],
-                        wizard_state=WizardState.from_string(row['wizard_state']),
-                        wizard_data=json.loads(row['wizard_data']) if row['wizard_data'] else {},
-                        last_command=row['last_command'],
-                        last_message_id=row['last_message_id'],
-                        created_at=datetime.fromisoformat(row['created_at']),
-                        expires_at=datetime.fromisoformat(row['expires_at'])
-                    )
-                return None
-        except Exception as e:
-            self.logger.error(f"Failed to get user session {user_id}: {e}")
-            raise DatabaseError(f"Failed to retrieve user session: {e}")
-
-    # =============================================================================
-    # ISSUE OPERATIONS - PLACEHOLDER IMPLEMENTATIONS
-    # =============================================================================
-
-    async def create_issue(
-        self,
-        jira_key: str,
-        jira_id: str,
-        project_key: str,
-        summary: str,
-        description: str = "",
-        issue_type: Union[IssueType, str] = IssueType.TASK,
-        status: Union[IssueStatus, str] = IssueStatus.TODO,
-        priority: Union[IssuePriority, str] = IssuePriority.MEDIUM,
-        assignee: Optional[str] = None,
-        reporter: Optional[str] = None,
-        telegram_user_id: Optional[str] = None,
-        telegram_message_id: Optional[int] = None,
-        due_date: Optional[datetime] = None
-    ) -> int:
-        """Create a new issue and return database ID."""
-        # Convert enums to strings
-        type_str = issue_type.value if isinstance(issue_type, IssueType) else str(issue_type)
-        status_str = status.value if isinstance(status, IssueStatus) else str(status)
-        priority_str = priority.value if isinstance(priority, IssuePriority) else str(priority)
-
-        try:
-            async with self._get_connection() as conn:
-                cursor = await conn.execute("""
-                    INSERT INTO issues 
-                    (jira_key, jira_id, project_key, summary, description, issue_type, 
-                     status, priority, assignee, reporter, telegram_user_id, telegram_message_id,
-                     due_date, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    jira_key, jira_id, project_key, summary, description, type_str,
-                    status_str, priority_str, assignee, reporter, telegram_user_id,
-                    telegram_message_id, due_date.isoformat() if due_date else None,
-                    datetime.now(timezone.utc).isoformat(),
-                    datetime.now(timezone.utc).isoformat()
-                ))
-                await conn.commit()
-                return cursor.lastrowid
-                
-        except Exception as e:
-            self.logger.error(f"Failed to create issue {jira_key}: {e}")
-            raise DatabaseError(f"Failed to create issue: {e}")
-
-    async def get_issue_by_key(self, jira_key: str) -> Optional[JiraIssue]:
-        """Get issue by Jira key."""
-        if not isinstance(jira_key, str) or not jira_key.strip():
-            raise ValueError("jira_key must be a non-empty string")
-
-        try:
-            async with self._get_connection() as conn:
-                cursor = await conn.execute(
-                    "SELECT * FROM issues WHERE jira_key = ?", (jira_key,)
-                )
-                row = await cursor.fetchone()
-                
-                if row:
-                    return self._row_to_issue(row)
-                return None
-        except Exception as e:
-            self.logger.error(f"Failed to get issue {jira_key}: {e}")
-            raise DatabaseError(f"Failed to retrieve issue: {e}")
-
-    def _row_to_issue(self, row) -> JiraIssue:
-        """Convert database row to JiraIssue model."""
-        return JiraIssue(
-            key=row['jira_key'],
-            jira_id=row['jira_id'],
-            project_key=row['project_key'],
-            summary=row['summary'],
-            description=row['description'] or "",
-            issue_type=IssueType.from_string(row['issue_type']),
-            status=IssueStatus.from_string(row['status']),
-            priority=IssuePriority.from_string(row['priority']),
-            assignee=row['assignee'],
-            reporter=row['reporter'],
-            created_at=datetime.fromisoformat(row['created_at']),
-            updated_at=datetime.fromisoformat(row['updated_at']),
-            due_date=datetime.fromisoformat(row['due_date']) if row['due_date'] else None,
-            resolved_at=datetime.fromisoformat(row['resolved_at']) if row['resolved_at'] else None
-        )
-
-    # =============================================================================
-    # UTILITY METHODS
-    # =============================================================================
+            self.logger.error(f"❌ Database health check failed: {e}")
+            return {
+                'status': 'unhealthy',
+                'error': str(e),
+                'database_path': str(self.db_path)
+            }
 
     async def cleanup_expired_sessions(self) -> int:
         """Clean up expired user sessions."""
         try:
             async with self._get_connection() as conn:
-                cursor = await conn.execute(
-                    "DELETE FROM user_sessions WHERE expires_at < ?",
-                    (datetime.now(timezone.utc).isoformat(),)
-                )
+                cursor = await conn.execute("""
+                    DELETE FROM user_sessions 
+                    WHERE expires_at < datetime('now')
+                """)
                 await conn.commit()
-                return cursor.rowcount
+                
+                deleted_count = cursor.rowcount
+                if deleted_count > 0:
+                    self.logger.info(f"🧹 Cleaned up {deleted_count} expired sessions")
+                
+                return deleted_count
+                
         except Exception as e:
-            self.logger.error(f"Failed to cleanup expired sessions: {e}")
-            raise DatabaseError(f"Failed to cleanup sessions: {e}")
-
-    async def vacuum(self) -> None:
-        """Vacuum the database to reclaim space."""
-        try:
-            async with self._get_connection() as conn:
-                await conn.execute("VACUUM")
-                self.logger.info("Database vacuumed successfully")
-        except Exception as e:
-            self.logger.error(f"Failed to vacuum database: {e}")
-            raise DatabaseError(f"Failed to vacuum database: {e}")
+            self.logger.error(f"❌ Failed to cleanup expired sessions: {e}")
+            raise DatabaseError(f"Session cleanup failed: {e}")
 
     async def close(self) -> None:
-        """Close database connections (placeholder for connection pool)."""
-        self.logger.info("Database connections closed")
+        """Close database connections and cleanup."""
+        try:
+            async with self._pool_lock:
+                for conn in self._connection_pool:
+                    if not conn._connection.is_closed:
+                        await conn.close()
+                self._connection_pool.clear()
+            
+            self._initialized = False
+            self.logger.info("✅ Database connections closed")
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error closing database: {e}")
