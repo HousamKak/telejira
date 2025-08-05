@@ -632,3 +632,11 @@ class JiraService:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit."""
         await self.close()
+        
+
+    async def get_current_user(self) -> Dict[str, Any]:
+        """
+        Return the current Jira user (the account tied to the API token).
+        Docs: GET /rest/api/3/myself
+        """
+        return await self._make_request('GET', 'myself')
