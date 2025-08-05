@@ -59,18 +59,27 @@ class DatabaseManager:
         try:
             # Ensure directory exists
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            
+
             # Test basic connectivity
             async with aiosqlite.connect(self.db_path) as conn:
                 await conn.execute("SELECT 1")
-            
-            # Create tables and setup
-            await self._create_tables()
-            await self._setup_database_settings()
-            
+
+            # Temporarily set initialized to True to allow _get_connection()
+            old_flag = self._initialized
             self._initialized = True
-            self.logger.info(f"✅ Database initialized: {self.db_path}")
-            
+
+            try:
+                # Create tables and setup
+                await self._create_tables()
+                await self._setup_database_settings()
+
+                # Leave initialized=True on success
+                self.logger.info(f"✅ Database initialized: {self.db_path}")
+            except Exception as e:
+                # Restore flag if an exception occurs
+                self._initialized = old_flag
+                raise e
+
         except Exception as e:
             self.logger.error(f"❌ Database initialization failed: {e}")
             raise DatabaseError(f"Failed to initialize database: {e}")
@@ -102,6 +111,9 @@ class DatabaseManager:
             await conn.execute("PRAGMA cache_size = -64000")  # 64MB cache
             await conn.execute("PRAGMA temp_store = MEMORY")
             await conn.execute("PRAGMA mmap_size = 268435456")  # 256MB mmap
+            
+            # Set row factory for dictionary-like access
+            conn.row_factory = aiosqlite.Row
             
             yield conn
             
@@ -380,7 +392,7 @@ class DatabaseManager:
         role: Union[UserRole, str] = UserRole.USER,
         is_active: bool = True,
         preferred_language: str = "en",
-        timezone: str = "UTC"
+        user_timezone: str = "UTC"
     ) -> int:
         """Create a new user with comprehensive validation."""
         # Input validation
@@ -419,8 +431,8 @@ class DatabaseManager:
         if not preferred_language or len(preferred_language) > 10:
             preferred_language = "en"
         
-        if not timezone or len(timezone) > 50:
-            timezone = "UTC"
+        if not user_timezone or len(user_timezone) > 50:
+            user_timezone = "UTC"
 
         try:
             async with self._get_connection() as conn:
@@ -440,7 +452,7 @@ class DatabaseManager:
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     user_id, username, first_name, last_name, role.value,
-                    is_active, preferred_language, timezone,
+                    is_active, preferred_language, user_timezone,
                     datetime.now(timezone.utc).isoformat(),
                     datetime.now(timezone.utc).isoformat()
                 ))
@@ -592,3 +604,26 @@ class DatabaseManager:
             
         except Exception as e:
             self.logger.error(f"❌ Error closing database: {e}")
+            
+    def is_initialized(self) -> bool:
+        """Check if database is initialized."""
+        return self._initialized
+
+    @asynccontextmanager
+    async def get_connection(self):
+        """Public interface for getting database connections."""
+        async with self._get_connection() as conn:
+            yield conn
+
+    @asynccontextmanager
+    async def transaction(self):
+        """Context manager for database transactions."""
+        async with self._get_connection() as conn:
+            try:
+                await conn.execute("BEGIN IMMEDIATE TRANSACTION")
+                yield conn
+                await conn.commit()
+            except Exception as e:
+                await conn.rollback()
+                self.logger.error(f"Transaction failed: {e}")
+                raise DatabaseError(f"Transaction execution failed: {e}")

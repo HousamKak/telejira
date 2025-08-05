@@ -6,13 +6,13 @@ Handles all interactions with the Jira REST API and converts responses to our mo
 """
 
 import asyncio
+import json
 import logging
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Union
 from urllib.parse import quote, urljoin
-import json
 
 import aiohttp
 from aiohttp import ClientTimeout, ClientError, ClientSession
@@ -79,7 +79,7 @@ class JiraService:
         self.domain = domain.rstrip('/')
         self.email = email.strip()
         self.api_token = api_token
-        self.base_url = f"https://{self.domain}/rest/api/2"
+        self.base_url = f"https://{self.domain}/rest/api/3"
         
         # Timeout and retry configuration
         self.timeout = max(5, min(timeout, 120))  # Clamp between 5-120 seconds
@@ -118,49 +118,44 @@ class JiraService:
     async def _create_session(self) -> None:
         """Create new HTTP session with optimized settings."""
         try:
-            # Create timeout configuration
-            timeout = ClientTimeout(
-                total=self.timeout,
-                connect=min(10, self.timeout // 3),
-                sock_read=self.timeout - 5
-            )
-            
-            # Create connector with connection pooling
+            # Keep this simple & robust across aiohttp versions
+            timeout = aiohttp.ClientTimeout(total=self.timeout)
+
             connector = aiohttp.TCPConnector(
                 limit=self.connection_pool_size,
                 limit_per_host=max(2, self.connection_pool_size // 2),
                 ttl_dns_cache=300,
                 use_dns_cache=True,
-                keepalive_timeout=30,
-                enable_cleanup_closed=True,
-                force_close=False,
-                auto_decompress=True
+                # Avoid deprecated/fragile kwargs:
+                # keepalive_timeout -> let defaults handle
+                # enable_cleanup_closed -> deprecated in recent aiohttp
+                # force_close=False is default anyway
+                # auto_decompress -> ❌ not valid here
             )
-            
-            # Default headers
+
             headers = {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json',
-                'User-Agent': 'telegram-jira-bot/2.0 (aiohttp)',
-                'Accept-Encoding': 'gzip, deflate',
-                'Connection': 'keep-alive'
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "telegram-jira-bot/2.0 (aiohttp)",
+                # Don't set Accept-Encoding; aiohttp manages this automatically.
             }
-            
-            # Create session
-            self._session = ClientSession(
+
+            self._session = aiohttp.ClientSession(
                 timeout=timeout,
                 connector=connector,
                 auth=aiohttp.BasicAuth(self.email, self.api_token),
                 headers=headers,
-                raise_for_status=False,  # Handle status codes manually
-                skip_auto_headers={'User-Agent'}  # Use our custom user agent
+                raise_for_status=False,
+                skip_auto_headers={"User-Agent"},  # keep our UA
+                # auto_decompress=True  # optional; default is True
             )
-            
+
             self.logger.debug("✅ HTTP session created successfully")
-            
+
         except Exception as e:
             self.logger.error(f"❌ Failed to create HTTP session: {e}")
             raise JiraAPIError(f"Session creation failed: {e}")
+
 
     async def _check_rate_limit(self) -> None:
         """Check and enforce client-side rate limiting."""

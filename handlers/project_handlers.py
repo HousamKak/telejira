@@ -29,7 +29,7 @@ class ProjectHandlers(BaseHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.formatter = MessageFormatter(
-            compact_mode=self.config.compact_messages,
+            compact_mode=self.config.compact_mode,
             use_emoji=True
         )
         self.validator = InputValidator()
@@ -101,7 +101,7 @@ class ProjectHandlers(BaseHandler):
                 project_line = f"{i}. {status_emoji} **{project.key}**: {project.name}{default_indicator}"
                 
                 # Add issue count and description
-                if not self.config.compact_messages:
+                if not self.config.compact_mode:
                     if project.issue_count > 0:
                         project_line += f" ({project.issue_count} issues)"
                     
@@ -461,7 +461,7 @@ Try a different search term or use `/projects` to see all available projects.
                 status_emoji = "✅" if project.is_active else "❌"
                 project_line = f"{i}. {status_emoji} **{project.key}**: {project.name}"
                 
-                if not self.config.compact_messages and project.description:
+                if not self.config.compact_mode and project.description:
                     description = self.formatter._truncate_text(project.description, 100)
                     project_line += f"\n   📄 {description}"
                 
@@ -670,7 +670,7 @@ Select a project to set as your default:
         
         summary = f"{status_emoji} **{project.key}**: {project.name}{default_indicator}"
         
-        if not self.config.compact_messages:
+        if not self.config.compact_mode:
             if project.issue_count > 0:
                 summary += f" ({project.issue_count} issues)"
             

@@ -206,7 +206,7 @@ class TelegramJiraBot:
             RuntimeError: If handler initialization fails
         """
         try:
-            if not all([self.database, self.jira_service, self.telegram_service]):
+            if not self.database or not self.jira_service or not self.telegram_service:
                 raise RuntimeError("Services must be initialized before handlers")
 
             self.logger.info("Initializing handlers...")
@@ -214,7 +214,7 @@ class TelegramJiraBot:
             # Initialize base handler
             self.base_handler = BaseHandler(
                 config=self.config,
-                database=self.database,
+                db=self.database,
                 jira_service=self.jira_service,
                 telegram_service=self.telegram_service,
             )
@@ -222,28 +222,28 @@ class TelegramJiraBot:
             # Initialize specialized handlers
             self.admin_handlers = AdminHandlers(
                 config=self.config,
-                database=self.database,
+                db=self.database,
                 jira_service=self.jira_service,
                 telegram_service=self.telegram_service,
             )
 
             self.project_handlers = ProjectHandlers(
                 config=self.config,
-                database=self.database,
+                db=self.database,
                 jira_service=self.jira_service,
                 telegram_service=self.telegram_service,
             )
 
             self.issue_handlers = IssueHandlers(
                 config=self.config,
-                database=self.database,
+                db=self.database,
                 jira_service=self.jira_service,
                 telegram_service=self.telegram_service,
             )
 
             self.wizard_handlers = WizardHandlers(
                 config=self.config,
-                database=self.database,
+                db=self.database,
                 jira_service=self.jira_service,
                 telegram_service=self.telegram_service,
             )
@@ -458,20 +458,17 @@ class TelegramJiraBot:
             self._setup_signal_handlers()
 
             async with self._application_context() as app:
-                self.logger.info("✅ Bot started successfully!")
-                self.logger.info("🔄 Bot is now running... Press Ctrl+C to stop.")
+              self.logger.info("✅ Bot started successfully!")
+              self.logger.info("🔄 Bot is now running... Press Ctrl+C to stop.")
 
-                # Start polling for updates
-                await app.updater.start_polling(
-                    allowed_updates=Update.ALL_TYPES, drop_pending_updates=True
-                )
-
-                # Wait for shutdown signal
-                await self._shutdown_event.wait()
-
-                # Stop polling
-                await app.updater.stop()
-
+              # let Application handle everything
+              await app.run_polling(
+                  allowed_updates=Update.ALL_TYPES,
+                  drop_pending_updates=True,
+                  stop_signals=None,      
+                  close_loop=False        
+              )
+              
         except KeyboardInterrupt:
             self.logger.info("🛑 Received keyboard interrupt")
         except JiraAPIError as e:

@@ -37,7 +37,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "rate_limit_per_minute": 30,
     "enable_wizards": True,
     "enable_shortcuts": True,
-    "compact_messages": False,
+    "compact_mode": False,
     "use_emoji": True
 }
 

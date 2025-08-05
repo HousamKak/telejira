@@ -31,7 +31,7 @@ class AdminHandlers(BaseHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.formatter = MessageFormatter(
-            compact_mode=self.config.compact_messages,
+            compact_mode=self.config.compact_mode,
             use_emoji=True
         )
         self.validator = InputValidator()
@@ -429,7 +429,7 @@ class AdminHandlers(BaseHandler):
                 "**Features:**",
                 f"• Wizards: {'✅' if self.config.enable_wizards else '❌'}",
                 f"• Shortcuts: {'✅' if self.config.enable_shortcuts else '❌'}",
-                f"• Compact Messages: {'✅' if self.config.compact_messages else '❌'}",
+                f"• Compact Messages: {'✅' if self.config.compact_mode else '❌'}",
                 "",
                 "**Access Control:**",
                 f"• Allowed Users: {len(self.config.allowed_users)} configured",

@@ -73,7 +73,7 @@ class WizardHandlers(BaseHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.formatter = MessageFormatter(
-            compact_mode=self.config.compact_messages,
+            compact_mode=self.config.compact_mode,
             use_emoji=True
         )
         self.validator = InputValidator()
