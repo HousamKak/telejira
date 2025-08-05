@@ -1,652 +1,634 @@
-#!/usr/bin/env python3
 """
-Jira service for the Telegram-Jira bot.
+Jira Service for interacting with Jira Cloud API.
 
-Handles all interactions with the Jira REST API and converts responses to our models.
+This service provides a clean interface for all Jira operations, handling API calls,
+response parsing, and error handling. All methods return domain model instances.
 """
+
+from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import time
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any, Union
-from urllib.parse import quote, urljoin
+from typing import Any, Dict, List, Optional
 
 import aiohttp
-from aiohttp import ClientTimeout, ClientError, ClientSession
+from aiohttp import ClientSession, ClientTimeout
+
+from .models import (
+    IssueComment,
+    IssuePriority,
+    IssueSearchResult,
+    IssueType,
+    JiraIssue,
+    Project,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class JiraAPIError(Exception):
-    """Enhanced exception for Jira API operations."""
+    """Exception raised for Jira API errors."""
     
-    def __init__(
-        self, 
-        message: str, 
-        status_code: Optional[int] = None, 
-        response_data: Optional[Dict[str, Any]] = None,
-        retry_after: Optional[int] = None
-    ):
+    def __init__(self, message: str, status_code: Optional[int] = None, response_data: Optional[Dict[str, Any]] = None):
+        """Initialize Jira API error.
+        
+        Args:
+            message: Error message
+            status_code: HTTP status code if available
+            response_data: Raw response data if available
+        """
         super().__init__(message)
         self.status_code = status_code
         self.response_data = response_data or {}
-        self.retry_after = retry_after
 
-    def is_retryable(self) -> bool:
-        """Check if this error indicates a retryable condition."""
-        if self.status_code is None:
-            return True  # Network errors are retryable
-        
-        # Retryable HTTP status codes
-        retryable_codes = {408, 429, 500, 502, 503, 504}
-        return self.status_code in retryable_codes
 
-    def is_rate_limit(self) -> bool:
-        """Check if this is a rate limit error."""
-        return self.status_code == 429
+class JiraAuthenticationError(JiraAPIError):
+    """Exception raised for Jira authentication errors."""
+    pass
+
+
+class JiraNotFoundError(JiraAPIError):
+    """Exception raised when Jira resource is not found."""
+    pass
 
 
 class JiraService:
-    """Enhanced Jira service with comprehensive fixes."""
+    """
+    Service for interacting with Jira Cloud API.
+    
+    Provides methods for project management, issue operations, and comments.
+    All methods return domain model instances and handle API errors appropriately.
+    """
 
     def __init__(
-        self, 
-        domain: str, 
-        email: str, 
+        self,
+        base_url: str,
+        username: str,
         api_token: str,
+        *,
         timeout: int = 30,
         max_retries: int = 3,
         retry_delay: float = 1.0,
-        page_size: int = 50,
-        rate_limit_requests: int = 100,
-        rate_limit_window: int = 60,
-        connection_pool_size: int = 10
     ) -> None:
-        """Initialize Jira service with enhanced configuration."""
-        # Input validation
-        if not all([domain, email, api_token]):
-            raise ValueError("Domain, email, and API token are required")
+        """
+        Initialize Jira service.
         
-        if domain.startswith(('http://', 'https://')):
-            raise ValueError("Domain should not include protocol (use 'company.atlassian.net')")
-        
-        if not domain.endswith('.atlassian.net'):
-            self.logger = logging.getLogger(self.__class__.__name__)
-            self.logger.warning("Domain doesn't end with '.atlassian.net', this might cause issues")
-        
-        # Configuration
-        self.domain = domain.rstrip('/')
-        self.email = email.strip()
+        Args:
+            base_url: Jira instance base URL (e.g., 'https://company.atlassian.net')
+            username: Jira username/email
+            api_token: Jira API token
+            timeout: Request timeout in seconds
+            max_retries: Maximum number of retry attempts
+            retry_delay: Delay between retries in seconds
+            
+        Raises:
+            TypeError: If parameters have incorrect types
+            ValueError: If parameters have invalid values
+        """
+        if not isinstance(base_url, str) or not base_url:
+            raise TypeError("base_url must be non-empty string")
+        if not isinstance(username, str) or not username:
+            raise TypeError("username must be non-empty string")
+        if not isinstance(api_token, str) or not api_token:
+            raise TypeError("api_token must be non-empty string")
+        if not isinstance(timeout, int) or timeout <= 0:
+            raise TypeError("timeout must be positive integer")
+        if not isinstance(max_retries, int) or max_retries < 0:
+            raise TypeError("max_retries must be non-negative integer")
+        if not isinstance(retry_delay, (int, float)) or retry_delay < 0:
+            raise TypeError("retry_delay must be non-negative number")
+
+        self.base_url = base_url.rstrip('/')
+        self.username = username
         self.api_token = api_token
-        self.base_url = f"https://{self.domain}/rest/api/3"
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
         
-        # Timeout and retry configuration
-        self.timeout = max(5, min(timeout, 120))  # Clamp between 5-120 seconds
-        self.max_retries = max(1, min(max_retries, 10))
-        self.retry_delay = max(0.1, min(retry_delay, 10.0))
-        self.page_size = max(10, min(page_size, 100))
-        
-        # Rate limiting configuration
-        self.rate_limit_requests = max(10, min(rate_limit_requests, 1000))
-        self.rate_limit_window = max(10, min(rate_limit_window, 3600))
-        self._request_timestamps: List[float] = []
-        self._rate_limit_lock = asyncio.Lock()
-        
-        # Session management
         self._session: Optional[ClientSession] = None
-        self._session_lock = asyncio.Lock()
-        self.connection_pool_size = max(5, min(connection_pool_size, 50))
-        
-        # Statistics and monitoring
-        self._request_count = 0
-        self._error_count = 0
-        self._last_request_time: Optional[float] = None
-        
-        self.logger = logging.getLogger(self.__class__.__name__)
-        self.logger.info(f"🔧 Jira service initialized for domain: {self.domain}")
+        self._closed = False
 
     async def _get_session(self) -> ClientSession:
-        """Get or create HTTP session with optimized configuration."""
+        """Get or create HTTP session with proper configuration."""
         if self._session is None or self._session.closed:
-            async with self._session_lock:
-                if self._session is None or self._session.closed:
-                    await self._create_session()
+            timeout = ClientTimeout(total=self.timeout)
+            auth = aiohttp.BasicAuth(self.username, self.api_token)
+            
+            self._session = ClientSession(
+                timeout=timeout,
+                auth=auth,
+                headers={
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json',
+                }
+            )
         
         return self._session
 
-    async def _create_session(self) -> None:
-        """Create new HTTP session with optimized settings."""
-        try:
-            # Keep this simple & robust across aiohttp versions
-            timeout = aiohttp.ClientTimeout(total=self.timeout)
-
-            connector = aiohttp.TCPConnector(
-                limit=self.connection_pool_size,
-                limit_per_host=max(2, self.connection_pool_size // 2),
-                ttl_dns_cache=300,
-                use_dns_cache=True,
-                # Avoid deprecated/fragile kwargs:
-                # keepalive_timeout -> let defaults handle
-                # enable_cleanup_closed -> deprecated in recent aiohttp
-                # force_close=False is default anyway
-                # auto_decompress -> ❌ not valid here
-            )
-
-            headers = {
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "User-Agent": "telegram-jira-bot/2.0 (aiohttp)",
-                # Don't set Accept-Encoding; aiohttp manages this automatically.
-            }
-
-            self._session = aiohttp.ClientSession(
-                timeout=timeout,
-                connector=connector,
-                auth=aiohttp.BasicAuth(self.email, self.api_token),
-                headers=headers,
-                raise_for_status=False,
-                skip_auto_headers={"User-Agent"},  # keep our UA
-                # auto_decompress=True  # optional; default is True
-            )
-
-            self.logger.debug("✅ HTTP session created successfully")
-
-        except Exception as e:
-            self.logger.error(f"❌ Failed to create HTTP session: {e}")
-            raise JiraAPIError(f"Session creation failed: {e}")
-
-
-    async def _check_rate_limit(self) -> None:
-        """Check and enforce client-side rate limiting."""
-        async with self._rate_limit_lock:
-            now = time.time()
-            
-            # Remove timestamps outside the window
-            self._request_timestamps = [
-                ts for ts in self._request_timestamps 
-                if now - ts < self.rate_limit_window
-            ]
-            
-            # Check if we're at the limit
-            if len(self._request_timestamps) >= self.rate_limit_requests:
-                # Calculate wait time
-                oldest_timestamp = min(self._request_timestamps)
-                wait_time = self.rate_limit_window - (now - oldest_timestamp) + 0.1
-                
-                if wait_time > 0:
-                    self.logger.warning(f"⏱️ Rate limit reached, waiting {wait_time:.1f}s")
-                    await asyncio.sleep(wait_time)
-                    
-                    # Refresh timestamp after waiting
-                    now = time.time()
-            
-            # Add current request timestamp
-            self._request_timestamps.append(now)
-
     async def _make_request(
-        self, 
-        method: str, 
-        endpoint: str, 
-        data: Optional[Dict[str, Any]] = None,
+        self,
+        method: str,
+        endpoint: str,
+        *,
         params: Optional[Dict[str, Any]] = None,
-        timeout_override: Optional[int] = None,
-        headers: Optional[Dict[str, str]] = None
+        json_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Make HTTP request with comprehensive error handling and retries."""
-        # Apply rate limiting
-        await self._check_rate_limit()
+        """
+        Make HTTP request to Jira API with retry logic.
         
-        # Prepare URL
-        url = urljoin(self.base_url + '/', endpoint.lstrip('/'))
+        Args:
+            method: HTTP method (GET, POST, PUT, DELETE)
+            endpoint: API endpoint (relative to base_url)
+            params: Query parameters
+            json_data: JSON request body
+            
+        Returns:
+            Parsed JSON response
+            
+        Raises:
+            JiraAuthenticationError: For authentication failures
+            JiraNotFoundError: For 404 errors
+            JiraAPIError: For other API errors
+        """
+        if not isinstance(method, str) or method not in ('GET', 'POST', 'PUT', 'DELETE'):
+            raise TypeError(f"method must be valid HTTP method, got {method}")
+        if not isinstance(endpoint, str):
+            raise TypeError(f"endpoint must be string, got {type(endpoint)}")
+
+        url = f"{self.base_url}/rest/api/3/{endpoint.lstrip('/')}"
         session = await self._get_session()
-        
-        # Prepare request parameters
-        request_kwargs = {
-            'method': method,
-            'url': url,
-            'params': params,
-            'headers': headers or {}
-        }
-        
-        # Add data for non-GET requests
-        if method != 'GET' and data is not None:
-            request_kwargs['json'] = data
-        
-        # Apply timeout override
-        if timeout_override:
-            timeout = ClientTimeout(total=timeout_override)
-            request_kwargs['timeout'] = timeout
-        
-        # Retry logic with exponential backoff
-        last_exception = None
         
         for attempt in range(self.max_retries + 1):
             try:
-                self._request_count += 1
-                self._last_request_time = time.time()
-                
-                self.logger.debug(f"🌐 {method} {endpoint} (attempt {attempt + 1}/{self.max_retries + 1})")
-                
-                async with session.request(**request_kwargs) as response:
-                    # Log response details
-                    self.logger.debug(f"📥 Response: {response.status} for {method} {endpoint}")
+                async with session.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    json=json_data,
+                ) as response:
                     
-                    # Handle successful responses
-                    if response.status in (200, 201):
-                        if response.content_type == 'application/json':
-                            result = await response.json()
-                            self.logger.debug(f"✅ Request successful: {method} {endpoint}")
-                            return result
-                        else:
-                            # Handle non-JSON responses
-                            text = await response.text()
-                            return {'text': text}
+                    if response.status == 401:
+                        raise JiraAuthenticationError(
+                            "Authentication failed. Check username and API token.",
+                            status_code=response.status
+                        )
                     
-                    elif response.status == 204:
-                        # No content response (successful)
-                        return {}
+                    if response.status == 404:
+                        raise JiraNotFoundError(
+                            f"Resource not found: {endpoint}",
+                            status_code=response.status
+                        )
                     
-                    elif response.status == 400:
-                        # Bad request - not retryable
-                        error_data = {}
+                    if response.status >= 400:
                         try:
-                            if response.content_type == 'application/json':
-                                error_data = await response.json()
-                        except:
-                            error_data = {'text': await response.text()}
+                            error_data = await response.json()
+                        except Exception:
+                            error_data = {"message": await response.text()}
                         
-                        error_messages = error_data.get('errorMessages', [])
-                        error_details = error_data.get('errors', {})
-                        
-                        if error_messages:
-                            error_msg = '; '.join(error_messages)
-                        elif error_details:
-                            error_msg = '; '.join([f"{k}: {v}" for k, v in error_details.items()])
-                        else:
-                            error_msg = error_data.get('text', 'Bad request')
-                        
+                        error_msg = error_data.get('errorMessages', [])
+                        if isinstance(error_msg, list) and error_msg:
+                            error_msg = '; '.join(error_msg)
+                        elif not error_msg:
+                            error_msg = error_data.get('message', f'HTTP {response.status}')
+                            
                         raise JiraAPIError(
-                            f"Bad request: {error_msg}",
-                            status_code=400,
+                            f"Jira API error: {error_msg}",
+                            status_code=response.status,
                             response_data=error_data
                         )
                     
-                    elif response.status == 401:
-                        # Authentication failed - not retryable
-                        raise JiraAPIError(
-                            "Authentication failed. Please check your email and API token.",
-                            status_code=401
-                        )
+                    # Success case
+                    if response.status == 204:  # No content
+                        return {}
                     
-                    elif response.status == 403:
-                        # Access denied - not retryable
-                        raise JiraAPIError(
-                            "Access denied. Please check your account permissions.",
-                            status_code=403
-                        )
+                    return await response.json()
                     
-                    elif response.status == 404:
-                        # Not found - not retryable
-                        raise JiraAPIError(
-                            f"Resource not found: {endpoint}",
-                            status_code=404
-                        )
-                    
-                    elif response.status == 429:
-                        # Rate limited by Jira - retryable
-                        retry_after = int(response.headers.get('Retry-After', self.retry_delay))
-                        self.logger.warning(f"🚫 Rate limited by Jira, waiting {retry_after}s")
-                        
-                        if attempt < self.max_retries:
-                            await asyncio.sleep(retry_after)
-                            continue
-                        else:
-                            raise JiraAPIError(
-                                f"Rate limited by Jira after {self.max_retries} retries",
-                                status_code=429,
-                                retry_after=retry_after
-                            )
-                    
-                    elif 500 <= response.status < 600:
-                        # Server error - retryable
-                        error_text = await response.text()
-                        last_exception = JiraAPIError(
-                            f"Server error {response.status}: {error_text[:200]}",
-                            status_code=response.status
-                        )
-                        
-                        if attempt < self.max_retries:
-                            wait_time = self.retry_delay * (2 ** attempt)  # Exponential backoff
-                            wait_time = min(wait_time, 60)  # Cap at 60 seconds
-                            self.logger.warning(f"🔄 Server error, retrying in {wait_time:.1f}s")
-                            await asyncio.sleep(wait_time)
-                            continue
-                        else:
-                            raise last_exception
-                    
-                    else:
-                        # Unexpected status code
-                        error_text = await response.text()
-                        raise JiraAPIError(
-                            f"Unexpected status {response.status}: {error_text[:200]}",
-                            status_code=response.status
-                        )
-            
-            except JiraAPIError:
-                # Re-raise our custom exceptions
-                raise
-            
-            except asyncio.TimeoutError:
-                last_exception = JiraAPIError(f"Request timeout after {self.timeout}s")
-                self._error_count += 1
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                if attempt == self.max_retries:
+                    raise JiraAPIError(f"Network error after {self.max_retries} retries: {e}")
                 
-                if attempt < self.max_retries:
-                    wait_time = self.retry_delay * (2 ** attempt)
-                    self.logger.warning(f"⏰ Timeout, retrying in {wait_time:.1f}s")
-                    await asyncio.sleep(wait_time)
-                    continue
-                else:
-                    raise last_exception
-            
-            except ClientError as e:
-                last_exception = JiraAPIError(f"Network error: {e}")
-                self._error_count += 1
-                
-                if attempt < self.max_retries:
-                    wait_time = self.retry_delay * (2 ** attempt)
-                    self.logger.warning(f"🌐 Network error, retrying in {wait_time:.1f}s")
-                    await asyncio.sleep(wait_time)
-                    continue
-                else:
-                    raise last_exception
-            
-            except Exception as e:
-                # Unexpected error - not retryable
-                self._error_count += 1
-                self.logger.error(f"❌ Unexpected error in request: {e}")
-                raise JiraAPIError(f"Unexpected error: {e}")
-        
-        # If we get here, all retries failed
-        if last_exception:
-            raise last_exception
-        else:
-            raise JiraAPIError("All retry attempts failed")
+                logger.warning(f"Request failed (attempt {attempt + 1}/{self.max_retries + 1}): {e}")
+                await asyncio.sleep(self.retry_delay * (2 ** attempt))  # Exponential backoff
 
-    # API Methods with enhanced error handling
-    
-    async def get_current_user(self) -> Dict[str, Any]:
-        """Get current user information with validation."""
-        try:
-            result = await self._make_request('GET', 'myself')
-            
-            # Validate required fields
-            required_fields = ['accountId', 'displayName']
-            for field in required_fields:
-                if field not in result:
-                    self.logger.warning(f"Missing field '{field}' in user response")
-            
-            return result
-            
-        except JiraAPIError:
-            raise
-        except Exception as e:
-            raise JiraAPIError(f"Failed to get current user: {e}")
-
-    async def get_projects(self, max_results: int = 50) -> List[Dict[str, Any]]:
-        """Get accessible projects with enhanced filtering."""
-        try:
-            max_results = max(1, min(max_results, 100))  # Clamp between 1-100
-            
-            params = {
-                'maxResults': max_results,
-                'expand': 'description,lead,issueTypes,url,projectKeys'
-            }
-            
-            result = await self._make_request('GET', 'project', params=params)
-            
-            if not isinstance(result, list):
-                self.logger.warning("Expected list of projects, got different format")
-                return []
-            
-            # Filter and validate projects
-            valid_projects = []
-            for project in result:
-                if isinstance(project, dict) and 'key' in project and 'name' in project:
-                    valid_projects.append(project)
-                else:
-                    self.logger.warning(f"Invalid project data: {project}")
-            
-            self.logger.info(f"📁 Retrieved {len(valid_projects)} valid projects")
-            return valid_projects
-            
-        except JiraAPIError:
-            raise
-        except Exception as e:
-            raise JiraAPIError(f"Failed to get projects: {e}")
-
-    async def get_project(self, project_key: str) -> Dict[str, Any]:
-        """Get specific project details."""
-        if not project_key or not isinstance(project_key, str):
-            raise ValueError("project_key must be a non-empty string")
-        
-        try:
-            project_key = project_key.strip().upper()
-            endpoint = f'project/{quote(project_key)}'
-            
-            params = {
-                'expand': 'description,lead,issueTypes,url,projectKeys,roles'
-            }
-            
-            result = await self._make_request('GET', endpoint, params=params)
-            
-            # Validate project data
-            required_fields = ['key', 'name', 'id']
-            for field in required_fields:
-                if field not in result:
-                    raise JiraAPIError(f"Missing required field '{field}' in project response")
-            
-            return result
-            
-        except JiraAPIError:
-            raise
-        except Exception as e:
-            raise JiraAPIError(f"Failed to get project {project_key}: {e}")
-
-    async def search_issues(
-        self,
-        jql: str,
-        max_results: int = 50,
-        start_at: int = 0,
-        fields: Optional[List[str]] = None
-    ) -> Dict[str, Any]:
-        """Search for issues using JQL with enhanced validation."""
-        if not jql or not isinstance(jql, str):
-            raise ValueError("jql must be a non-empty string")
-        
-        try:
-            # Clamp parameters
-            max_results = max(1, min(max_results, 100))
-            start_at = max(0, start_at)
-            
-            # Default fields if not specified
-            if fields is None:
-                fields = [
-                    'summary', 'description', 'status', 'priority', 'issuetype',
-                    'assignee', 'reporter', 'created', 'updated', 'resolution',
-                    'labels', 'components', 'fixVersions', 'parent'
-                ]
-            
-            data = {
-                'jql': jql.strip(),
-                'maxResults': max_results,
-                'startAt': start_at,
-                'fields': fields,
-                'expand': ['changelog']
-            }
-            
-            result = await self._make_request('POST', 'search', data=data)
-            
-            # Validate search result structure
-            if not isinstance(result, dict):
-                raise JiraAPIError("Invalid search result format")
-            
-            if 'issues' not in result:
-                raise JiraAPIError("Missing 'issues' field in search result")
-            
-            # Log search statistics
-            total = result.get('total', 0)
-            returned = len(result.get('issues', []))
-            self.logger.info(f"🔍 JQL search returned {returned}/{total} issues")
-            
-            return result
-            
-        except JiraAPIError:
-            raise
-        except Exception as e:
-            raise JiraAPIError(f"Issue search failed: {e}")
-
-    async def create_issue(
-        self,
-        project_key: str,
-        summary: str,
-        issue_type: str,
-        description: str = "",
-        priority: str = "Medium",
-        assignee: Optional[str] = None,
-        labels: Optional[List[str]] = None,
-        components: Optional[List[str]] = None
-    ) -> Dict[str, Any]:
-        """Create a new issue with comprehensive validation."""
-        # Input validation
-        if not all([project_key, summary, issue_type]):
-            raise ValueError("project_key, summary, and issue_type are required")
-        
-        if len(summary.strip()) < 5:
-            raise ValueError("Summary must be at least 5 characters long")
-        
-        if len(summary) > 255:
-            raise ValueError("Summary must be 255 characters or less")
-        
-        try:
-            # Prepare issue data
-            issue_data = {
-                'fields': {
-                    'project': {'key': project_key.strip().upper()},
-                    'summary': summary.strip(),
-                    'description': description.strip() if description else "",
-                    'issuetype': {'name': issue_type.strip()},
-                    'priority': {'name': priority.strip()}
-                }
-            }
-            
-            # Add optional fields
-            if assignee:
-                issue_data['fields']['assignee'] = {'accountId': assignee}
-            
-            if labels:
-                issue_data['fields']['labels'] = [label.strip() for label in labels if label.strip()]
-            
-            if components:
-                issue_data['fields']['components'] = [
-                    {'name': comp.strip()} for comp in components if comp.strip()
-                ]
-            
-            result = await self._make_request('POST', 'issue', data=issue_data)
-            
-            # Validate creation result
-            if not isinstance(result, dict) or 'key' not in result:
-                raise JiraAPIError("Invalid issue creation response")
-            
-            self.logger.info(f"✅ Issue created: {result.get('key')}")
-            return result
-            
-        except JiraAPIError:
-            raise
-        except Exception as e:
-            raise JiraAPIError(f"Failed to create issue: {e}")
-
-    async def get_issue(self, issue_key: str) -> Dict[str, Any]:
-        """Get specific issue details."""
-        if not issue_key or not isinstance(issue_key, str):
-            raise ValueError("issue_key must be a non-empty string")
-        
-        try:
-            issue_key = issue_key.strip().upper()
-            endpoint = f'issue/{quote(issue_key)}'
-            
-            params = {
-                'expand': 'changelog,transitions,operations,versionedRepresentations'
-            }
-            
-            result = await self._make_request('GET', endpoint, params=params)
-            
-            # Validate issue data
-            if not isinstance(result, dict) or 'key' not in result:
-                raise JiraAPIError(f"Invalid issue data for {issue_key}")
-            
-            return result
-            
-        except JiraAPIError:
-            raise
-        except Exception as e:
-            raise JiraAPIError(f"Failed to get issue {issue_key}: {e}")
+    # ---- Meta ----
 
     async def health_check(self) -> Dict[str, Any]:
-        """Perform comprehensive health check."""
-        start_time = time.time()
+        """
+        Check Jira service health and connectivity.
         
+        Returns:
+            Dict containing health status and service info
+            
+        Raises:
+            JiraAPIError: If health check fails
+        """
         try:
-            # Test basic connectivity
-            user_info = await self.get_current_user()
-            
-            # Test project access
-            projects = await self.get_projects(max_results=1)
-            
-            response_time = time.time() - start_time
+            response = await self._make_request('GET', 'serverInfo')
             
             return {
                 'status': 'healthy',
-                'response_time_ms': round(response_time * 1000, 2),
-                'user': user_info.get('displayName', 'Unknown'),
-                'domain': self.domain,
-                'projects_accessible': len(projects),
-                'statistics': {
-                    'total_requests': self._request_count,
-                    'total_errors': self._error_count,
-                    'error_rate': round(self._error_count / max(self._request_count, 1) * 100, 2),
-                    'last_request': self._last_request_time
-                }
+                'server_version': response.get('version'),
+                'server_title': response.get('serverTitle'),
+                'base_url': self.base_url,
             }
-            
         except Exception as e:
-            response_time = time.time() - start_time
-            
+            logger.error(f"Health check failed: {e}")
             return {
                 'status': 'unhealthy',
                 'error': str(e),
-                'response_time_ms': round(response_time * 1000, 2),
-                'domain': self.domain,
-                'statistics': {
-                    'total_requests': self._request_count,
-                    'total_errors': self._error_count
-                }
+                'base_url': self.base_url,
             }
 
     async def close(self) -> None:
         """Close HTTP session and cleanup resources."""
-        try:
-            async with self._session_lock:
-                if self._session and not self._session.closed:
-                    await self._session.close()
-                    self._session = None
-            
-            self.logger.info("✅ Jira service connections closed")
-            
-        except Exception as e:
-            self.logger.error(f"❌ Error closing Jira service: {e}")
-
-    def __del__(self):
-        """Cleanup on deletion."""
         if self._session and not self._session.closed:
-            self.logger.warning("⚠️ Jira service not properly closed, session may leak")
+            await self._session.close()
+        self._closed = True
+
+    def __del__(self) -> None:
+        """Cleanup on deletion."""
+        if not self._closed and self._session:
+            # Log warning as we can't await in __del__
+            logger.warning("JiraService was not properly closed. Call close() explicitly.")
+
+    # ---- Projects ----
+
+    async def list_projects(self, *, limit: int = 100, page: int = 0) -> List[Project]:
+        """
+        List all accessible Jira projects.
+        
+        Args:
+            limit: Maximum number of projects to return
+            page: Page number (0-based)
+            
+        Returns:
+            List of Project instances
+            
+        Raises:
+            TypeError: If parameters have incorrect types
+            JiraAPIError: If API request fails
+        """
+        if not isinstance(limit, int) or limit <= 0:
+            raise TypeError("limit must be positive integer")
+        if not isinstance(page, int) or page < 0:
+            raise TypeError("page must be non-negative integer")
+
+        params = {
+            'maxResults': min(limit, 100),  # Jira API limit
+            'startAt': page * limit,
+            'expand': 'description,lead,url,projectKeys,projectCategory',
+        }
+        
+        response = await self._make_request('GET', 'project/search', params=params)
+        projects = []
+        
+        for project_data in response.get('values', []):
+            try:
+                project = Project.from_jira_response(project_data)
+                projects.append(project)
+            except Exception as e:
+                logger.warning(f"Failed to parse project {project_data.get('key', 'unknown')}: {e}")
+        
+        return projects
+
+    async def get_project(self, project_key: str) -> Project:
+        """
+        Get detailed information about a specific project.
+        
+        Args:
+            project_key: Jira project key
+            
+        Returns:
+            Project instance
+            
+        Raises:
+            TypeError: If project_key is not string
+            JiraNotFoundError: If project doesn't exist
+            JiraAPIError: If API request fails
+        """
+        if not isinstance(project_key, str) or not project_key:
+            raise TypeError("project_key must be non-empty string")
+
+        params = {
+            'expand': 'description,lead,url,projectKeys,projectCategory',
+        }
+        
+        response = await self._make_request('GET', f'project/{project_key}', params=params)
+        return Project.from_jira_response(response)
+
+    # ---- Issues ----
+
+    async def get_issue(self, issue_key: str) -> JiraIssue:
+        """
+        Get detailed information about a specific issue.
+        
+        Args:
+            issue_key: Jira issue key (e.g., 'PROJ-123')
+            
+        Returns:
+            JiraIssue instance
+            
+        Raises:
+            TypeError: If issue_key is not string
+            JiraNotFoundError: If issue doesn't exist
+            JiraAPIError: If API request fails
+        """
+        if not isinstance(issue_key, str) or not issue_key:
+            raise TypeError("issue_key must be non-empty string")
+
+        params = {
+            'expand': 'names,schema,operations,editmeta,changelog,renderedFields',
+        }
+        
+        response = await self._make_request('GET', f'issue/{issue_key}', params=params)
+        return JiraIssue.from_jira_response(response)
+
+    async def search_issues(
+        self,
+        jql: str,
+        *,
+        max_results: int = 20,
+        start_at: int = 0,
+        fields: Optional[List[str]] = None,
+    ) -> IssueSearchResult:
+        """
+        Search for issues using JQL (Jira Query Language).
+        
+        Args:
+            jql: JQL query string
+            max_results: Maximum number of results to return
+            start_at: Starting index for pagination
+            fields: List of fields to include in response
+            
+        Returns:
+            IssueSearchResult containing matching issues
+            
+        Raises:
+            TypeError: If parameters have incorrect types
+            JiraAPIError: If search fails or JQL is invalid
+        """
+        if not isinstance(jql, str) or not jql:
+            raise TypeError("jql must be non-empty string")
+        if not isinstance(max_results, int) or max_results <= 0:
+            raise TypeError("max_results must be positive integer")
+        if not isinstance(start_at, int) or start_at < 0:
+            raise TypeError("start_at must be non-negative integer")
+        if fields is not None and not isinstance(fields, list):
+            raise TypeError("fields must be list or None")
+
+        json_data = {
+            'jql': jql,
+            'maxResults': min(max_results, 100),  # Jira API limit
+            'startAt': start_at,
+            'expand': ['names', 'schema', 'operations'],
+        }
+        
+        if fields:
+            json_data['fields'] = fields
+        else:
+            # Default fields for comprehensive issue data
+            json_data['fields'] = [
+                'summary', 'description', 'issuetype', 'status', 'priority',
+                'assignee', 'reporter', 'project', 'labels', 'components',
+                'created', 'updated'
+            ]
+
+        response = await self._make_request('POST', 'search', json_data=json_data)
+        
+        issues = []
+        for issue_data in response.get('issues', []):
+            try:
+                issue = JiraIssue.from_jira_response(issue_data)
+                issues.append(issue)
+            except Exception as e:
+                logger.warning(f"Failed to parse issue {issue_data.get('key', 'unknown')}: {e}")
+
+        return IssueSearchResult(
+            issues=issues,
+            total_count=response.get('total', 0),
+            search_query=jql,
+            start_at=start_at,
+            max_results=max_results,
+        )
+
+    async def create_issue(
+        self,
+        *,
+        project_key: str,
+        summary: str,
+        issue_type: IssueType,
+        description: str = "",
+        priority: IssuePriority = IssuePriority.MEDIUM,
+        assignee_account_id: Optional[str] = None,
+        labels: Optional[List[str]] = None,
+        components: Optional[List[str]] = None,
+    ) -> JiraIssue:
+        """
+        Create a new Jira issue.
+        
+        Args:
+            project_key: Project key where issue will be created
+            summary: Issue summary/title
+            issue_type: Type of issue to create
+            description: Detailed description
+            priority: Issue priority level
+            assignee_account_id: Account ID of assignee (optional)
+            labels: List of labels to apply
+            components: List of component names
+            
+        Returns:
+            Created JiraIssue instance
+            
+        Raises:
+            TypeError: If parameters have incorrect types
+            JiraAPIError: If issue creation fails
+        """
+        # Parameter validation
+        if not isinstance(project_key, str) or not project_key:
+            raise TypeError("project_key must be non-empty string")
+        if not isinstance(summary, str) or not summary:
+            raise TypeError("summary must be non-empty string")
+        if not isinstance(issue_type, IssueType):
+            raise TypeError(f"issue_type must be IssueType, got {type(issue_type)}")
+        if not isinstance(description, str):
+            raise TypeError(f"description must be string, got {type(description)}")
+        if not isinstance(priority, IssuePriority):
+            raise TypeError(f"priority must be IssuePriority, got {type(priority)}")
+        if assignee_account_id is not None and not isinstance(assignee_account_id, str):
+            raise TypeError("assignee_account_id must be string or None")
+        if labels is not None and not isinstance(labels, list):
+            raise TypeError("labels must be list or None")
+        if components is not None and not isinstance(components, list):
+            raise TypeError("components must be list or None")
+
+        fields = {
+            'project': {'key': project_key},
+            'summary': summary,
+            'description': description,
+            'issuetype': {'name': issue_type.value},
+            'priority': {'name': priority.value},
+        }
+        
+        if assignee_account_id:
+            fields['assignee'] = {'accountId': assignee_account_id}
+            
+        if labels:
+            fields['labels'] = labels
+            
+        if components:
+            fields['components'] = [{'name': comp} for comp in components]
+
+        json_data = {'fields': fields}
+        
+        response = await self._make_request('POST', 'issue', json_data=json_data)
+        
+        # Fetch the created issue with full details
+        issue_key = response['key']
+        return await self.get_issue(issue_key)
+
+    async def assign_issue(self, issue_key: str, assignee_account_id: str) -> None:
+        """
+        Assign an issue to a user.
+        
+        Args:
+            issue_key: Jira issue key
+            assignee_account_id: Account ID of the assignee
+            
+        Raises:
+            TypeError: If parameters have incorrect types
+            JiraNotFoundError: If issue or user doesn't exist
+            JiraAPIError: If assignment fails
+        """
+        if not isinstance(issue_key, str) or not issue_key:
+            raise TypeError("issue_key must be non-empty string")
+        if not isinstance(assignee_account_id, str) or not assignee_account_id:
+            raise TypeError("assignee_account_id must be non-empty string")
+
+        json_data = {
+            'accountId': assignee_account_id
+        }
+        
+        await self._make_request('PUT', f'issue/{issue_key}/assignee', json_data=json_data)
+
+    # ---- Comments ----
+
+    async def add_comment(self, issue_key: str, body: str) -> IssueComment:
+        """
+        Add a comment to an issue.
+        
+        Args:
+            issue_key: Jira issue key
+            body: Comment text content
+            
+        Returns:
+            Created IssueComment instance
+            
+        Raises:
+            TypeError: If parameters have incorrect types
+            JiraNotFoundError: If issue doesn't exist
+            JiraAPIError: If comment creation fails
+        """
+        if not isinstance(issue_key, str) or not issue_key:
+            raise TypeError("issue_key must be non-empty string")
+        if not isinstance(body, str) or not body:
+            raise TypeError("body must be non-empty string")
+
+        json_data = {
+            'body': body
+        }
+        
+        response = await self._make_request('POST', f'issue/{issue_key}/comment', json_data=json_data)
+        return IssueComment.from_jira_response(response)
+
+    async def list_comments(self, issue_key: str) -> List[IssueComment]:
+        """
+        Get all comments for an issue.
+        
+        Args:
+            issue_key: Jira issue key
+            
+        Returns:
+            List of IssueComment instances
+            
+        Raises:
+            TypeError: If issue_key is not string
+            JiraNotFoundError: If issue doesn't exist
+            JiraAPIError: If request fails
+        """
+        if not isinstance(issue_key, str) or not issue_key:
+            raise TypeError("issue_key must be non-empty string")
+
+        response = await self._make_request('GET', f'issue/{issue_key}/comment')
+        
+        comments = []
+        for comment_data in response.get('comments', []):
+            try:
+                comment = IssueComment.from_jira_response(comment_data)
+                comments.append(comment)
+            except Exception as e:
+                logger.warning(f"Failed to parse comment {comment_data.get('id', 'unknown')}: {e}")
+        
+        return comments
+
+    # ---- Transitions ----
+
+    async def list_transitions(self, issue_key: str) -> List[Dict[str, Any]]:
+        """
+        Get available transitions for an issue.
+        
+        Args:
+            issue_key: Jira issue key
+            
+        Returns:
+            List of transition dictionaries with 'id' and 'name' keys
+            
+        Raises:
+            TypeError: If issue_key is not string
+            JiraNotFoundError: If issue doesn't exist
+            JiraAPIError: If request fails
+        """
+        if not isinstance(issue_key, str) or not issue_key:
+            raise TypeError("issue_key must be non-empty string")
+
+        response = await self._make_request('GET', f'issue/{issue_key}/transitions')
+        
+        transitions = []
+        for transition_data in response.get('transitions', []):
+            transitions.append({
+                'id': transition_data['id'],
+                'name': transition_data['name'],
+            })
+        
+        return transitions
+
+    async def transition_issue(self, issue_key: str, transition_id: str) -> None:
+        """
+        Transition an issue to a new status.
+        
+        Args:
+            issue_key: Jira issue key
+            transition_id: ID of the transition to perform
+            
+        Raises:
+            TypeError: If parameters have incorrect types
+            JiraNotFoundError: If issue doesn't exist
+            JiraAPIError: If transition fails
+        """
+        if not isinstance(issue_key, str) or not issue_key:
+            raise TypeError("issue_key must be non-empty string")
+        if not isinstance(transition_id, str) or not transition_id:
+            raise TypeError("transition_id must be non-empty string")
+
+        json_data = {
+            'transition': {'id': transition_id}
+        }
+        
+        await self._make_request('POST', f'issue/{issue_key}/transitions', json_data=json_data)
+
+    async def __aenter__(self):
+        """Async context manager entry."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit."""
+        await self.close()
