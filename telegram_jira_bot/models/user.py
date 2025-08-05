@@ -41,7 +41,7 @@ def parse_iso_datetime(date_str: Optional[str]) -> Optional[datetime]:
 @dataclass
 class User:
     """Telegram user data model with comprehensive validation."""
-    user_id: int
+    user_id: str
     username: Optional[str] = None
     first_name: Optional[str] = None
     last_name: Optional[str] = None
@@ -63,8 +63,8 @@ class User:
 
     def _validate_user_id(self) -> None:
         """Validate user ID."""
-        if not isinstance(self.user_id, int) or self.user_id <= 0:
-            raise ValueError("user_id must be a positive integer")
+        if not isinstance(self.user_id, str) or not self.user_id.strip():
+            raise ValueError("user_id must be a non-empty string")
 
     def _validate_strings(self) -> None:
         """Validate string fields."""
@@ -278,7 +278,7 @@ class User:
 @dataclass
 class UserPreferences:
     """User preferences for the bot with validation."""
-    user_id: int
+    user_id: str
     default_project_key: Optional[str] = None
     default_priority: IssuePriority = IssuePriority.MEDIUM
     default_issue_type: IssueType = IssueType.TASK
@@ -303,8 +303,8 @@ class UserPreferences:
 
     def _validate_user_id(self) -> None:
         """Validate user ID."""
-        if not isinstance(self.user_id, int) or self.user_id <= 0:
-            raise ValueError("user_id must be a positive integer")
+        if not isinstance(self.user_id, str) or not self.user_id.strip():
+            raise ValueError("user_id must be a non-empty string")
 
     def _validate_enums(self) -> None:
         """Validate enum fields with proper defaults."""
@@ -460,7 +460,7 @@ class UserSession:
     
     FIXED: timezone.timedelta -> timedelta import issue resolved.
     """
-    user_id: int
+    user_id: str
     wizard_state: WizardState = WizardState.IDLE
     wizard_data: Dict[str, Any] = field(default_factory=dict)
     last_command: Optional[str] = None
@@ -470,8 +470,8 @@ class UserSession:
 
     def __post_init__(self) -> None:
         """Validate session data after initialization."""
-        if not isinstance(self.user_id, int) or self.user_id <= 0:
-            raise ValueError("user_id must be a positive integer")
+        if not isinstance(self.user_id, str) or not self.user_id.strip():
+            raise ValueError("user_id must be a non-empty string")
         if not isinstance(self.wizard_state, WizardState):
             raise TypeError("wizard_state must be a WizardState instance")
         if not isinstance(self.wizard_data, dict):

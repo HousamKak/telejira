@@ -61,10 +61,11 @@ class BaseHandler(ABC):
             return None
 
         try:
-            user = await self.db.get_user(update.effective_user.id)
+            telegram_user_id = str(update.effective_user.id)  # Convert to string
+            user = await self.db.get_user(telegram_user_id)
             if user:
                 # Update activity
-                await self.db.update_user_activity(update.effective_user.id)
+                await self.db.update_user_activity(telegram_user_id)
                 return user
             else:
                 # Create new user
@@ -77,7 +78,7 @@ class BaseHandler(ABC):
                     new_user.role = UserRole.ADMIN
                 
                 await self.db.save_user(new_user)
-                self.logger.info(f"Created new user: {update.effective_user.id}")
+                self.logger.info(f"Created new user: {telegram_user_id}")
                 return new_user
 
         except DatabaseError as e:
@@ -85,11 +86,11 @@ class BaseHandler(ABC):
             await self.send_error_message(update, "Database error occurred")
             return None
 
-    async def get_user_preferences(self, user_id: int) -> Optional[UserPreferences]:
+    async def get_user_preferences(self, user_id: str) -> Optional[UserPreferences]:
         """Get user preferences.
         
         Args:
-            user_id: User ID
+            user_id: User ID (Telegram user ID as string)
             
         Returns:
             UserPreferences or None if not found
@@ -100,11 +101,11 @@ class BaseHandler(ABC):
             self.logger.error(f"Failed to get user preferences: {e}")
             return None
 
-    async def get_user_session(self, user_id: int) -> Optional[UserSession]:
+    async def get_user_session(self, user_id: str) -> Optional[UserSession]:
         """Get user session.
         
         Args:
-            user_id: User ID
+            user_id: User ID (Telegram user ID as string)
             
         Returns:
             UserSession or None if not found
@@ -122,20 +123,20 @@ class BaseHandler(ABC):
             return None
 
     async def save_user_session(self, session: UserSession) -> bool:
-        """Save user session.
-        
-        Args:
-            session: User session to save
+            """Save user session.
             
-        Returns:
-            True if saved successfully
-        """
-        try:
-            await self.db.save_user_session(session)
-            return True
-        except DatabaseError as e:
-            self.logger.error(f"Failed to save user session: {e}")
-            return False
+            Args:
+                session: User session to save
+                
+            Returns:
+                True if saved successfully
+            """
+            try:
+                await self.db.save_user_session(session)
+                return True
+            except DatabaseError as e:
+                self.logger.error(f"Failed to save user session: {e}")
+                return False
 
     # Permission checking methods
     def check_user_access(self, user_id: int) -> bool:

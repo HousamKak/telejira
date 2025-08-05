@@ -786,7 +786,7 @@ class DatabaseManager:
                 
                 if row:
                     return UserPreferences(
-                        user_id=row['user_id'],
+                        user_id=str(row['user_id']),  # Ensure it's a string
                         default_project_key=row['default_project_key'],
                         default_priority=IssuePriority.from_string(row['default_priority']),
                         default_issue_type=IssueType.from_string(row['default_issue_type']),
