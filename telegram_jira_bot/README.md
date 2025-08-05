@@ -100,9 +100,14 @@ JIRA_API_TOKEN=your_jira_api_token
 
 ### 4. Run the Bot
 
+On Windows, you can use `start.bat` which activates the virtual environment and runs the bot.
+
 ```bash
 # Direct execution
 python main.py
+
+# Windows entry point
+start.bat
 
 # Using the installed package
 telegram-jira-bot
