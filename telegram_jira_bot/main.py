@@ -28,17 +28,16 @@ from telegram.ext import (
     filters,
 )
 
-from telegram_jira_bot.config.settings import load_config, BotConfig
-from telegram_jira_bot.services.database import DatabaseManager
-from telegram_jira_bot.services.jira_service import JiraService, JiraAPIError
-from telegram_jira_bot.services.telegram_service import TelegramService
-from telegram_jira_bot.handlers.admin_handlers import AdminHandlers
-from telegram_jira_bot.handlers.project_handlers import ProjectHandlers
-from telegram_jira_bot.handlers.issue_handlers import IssueHandlers
-from telegram_jira_bot.handlers.wizard_handlers import WizardHandlers
-from telegram_jira_bot.handlers.base_handler import BaseHandler
-from telegram_jira_bot.utils.constants import BOT_INFO
-from telegram_jira_bot.models.enums import UserRole
+from config.settings import load_config_from_env, BotConfig
+from services.database import DatabaseManager
+from services.jira_service import JiraService, JiraAPIError
+from services.telegram_service import TelegramService
+from handlers.admin_handlers import AdminHandlers
+from handlers.project_handlers import ProjectHandlers
+from handlers.issue_handlers import IssueHandlers
+from handlers.wizard_handlers import WizardHandlers
+from handlers.base_handler import BaseHandler
+from utils.constants import BOT_INFO
 
 
 class TelegramJiraBot:
@@ -430,6 +429,10 @@ class TelegramJiraBot:
                 .build()
             )
 
+            # Ensure application is not None before proceeding
+            if not self.application:
+                raise RuntimeError("Failed to initialize the Telegram application")
+
             self._register_handlers()
 
             # Initialize application
@@ -481,7 +484,7 @@ class TelegramJiraBot:
             self.logger.info("👋 Bot stopped")
 
 
-def main() -> NoReturn:
+def main() -> None:
     """Main entry point for the Telegram-Jira bot.
 
     Raises:
@@ -489,7 +492,7 @@ def main() -> NoReturn:
     """
     try:
         # Load configuration
-        config = load_config()
+        config = load_config_from_env()
 
         # Create and run bot
         bot = TelegramJiraBot(config)

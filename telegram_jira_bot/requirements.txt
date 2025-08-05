@@ -1,31 +1,29 @@
-# =============================================================================
-# TELEGRAM-JIRA BOT - COMPLETE REQUIREMENTS
-# =============================================================================
+# TELEGRAM-JIRA BOT – COMPLETE REQUIREMENTS (no version specifiers)
 
 # Core Telegram Bot Framework
-python-telegram-bot>=20.7,<21.0
+python-telegram-bot
 
 # HTTP Client for Jira API
-aiohttp>=3.9.0,<4.0.0
-httpx>=0.25.0,<1.0.0
+aiohttp
+httpx
 
 # Database
-aiosqlite>=0.19.0,<1.0.0
+aiosqlite
 
 # Configuration and Environment
-python-dotenv>=1.0.0,<2.0.0
-pydantic>=2.5.0,<3.0.0
+python-dotenv
+pydantic
 
 # Data Processing and Validation
-typing-extensions>=4.8.0
-python-dateutil>=2.8.0,<3.0.0
+typing-extensions
+python-dateutil
 
 # Async Support
-asyncio-throttle>=1.0.2,<2.0.0
+asyncio-throttle
 
 # Logging and Output
-rich>=13.0.0,<14.0.0
-colorlog>=6.7.0,<7.0.0
+rich
+colorlog
 
 # Security
-cryptography>=41.0.0,<42.0.0
+cryptography

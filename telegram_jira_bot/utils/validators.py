@@ -645,7 +645,8 @@ class InputValidator:
                 # Try common date formats
                 for fmt in ['%Y-%m-%d', '%Y-%m-%d %H:%M', '%Y-%m-%d %H:%M:%S']:
                     try:
-                        due_date = datetime.strptime(due_date, fmt)
+                        if isinstance(due_date, str):
+                            due_date = datetime.strptime(due_date, fmt)
                         if due_date.tzinfo is None:
                             due_date = due_date.replace(tzinfo=timezone.utc)
                         break

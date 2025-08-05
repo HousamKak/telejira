@@ -12,7 +12,7 @@ from typing import Optional, Dict, Any
 
 try:
     from .settings import (
-        BotConfig,
+        load_config_from_env,
         load_config,
         validate_config,
         get_config_warnings
@@ -22,7 +22,11 @@ try:
         "BotConfig",
         "load_config", 
         "validate_config",
-        "get_config_warnings"
+        "get_config_warnings",
+        "load_config_from_env",
+        "DEFAULT_CONFIG",
+        "get_default_config"
+        
     ]
     
 except ImportError as e:

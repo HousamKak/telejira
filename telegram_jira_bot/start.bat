@@ -6,6 +6,5 @@ if not exist venv (
 )
 
 call venv\Scripts\activate
-cd telegram_jira_bot
 python main.py %*
 pause
