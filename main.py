@@ -272,10 +272,12 @@ class TelegramJiraBot:
             self.logger.info("Registering handlers...")
 
             # Register conversation handlers first (they have higher priority)
+            # The wizard ConversationHandler already includes /wizard, /quick, /w, and /q commands
             if self.config.enable_wizards:
                 wizard_conv_handler = self.wizard_handlers.get_conversation_handler()
                 if wizard_conv_handler:
                     self.application.add_handler(wizard_conv_handler)
+                    self.logger.info("✅ Wizard conversation handler registered")
 
             # Register command handlers
             command_handlers = [
@@ -287,42 +289,43 @@ class TelegramJiraBot:
                 CommandHandler("projects", self.project_handlers.list_projects),
                 CommandHandler("setdefault", self.project_handlers.set_default_project),
                 # Issue commands
-                CommandHandler("create", self.issue_handlers.create_issue_wizard),
-                CommandHandler("myissues", self.issue_handlers.list_user_issues),
-                CommandHandler("listissues", self.issue_handlers.list_all_issues),
-                CommandHandler("searchissues", self.issue_handlers.search_issues),
-                # Admin commands
-                CommandHandler("addproject", self.admin_handlers.add_project),
-                CommandHandler("editproject", self.admin_handlers.edit_project),
-                CommandHandler("deleteproject", self.admin_handlers.delete_project),
-                CommandHandler("users", self.admin_handlers.list_users),
-                CommandHandler("syncjira", self.admin_handlers.sync_jira),
-                CommandHandler("config", self.admin_handlers.show_config),
-                CommandHandler("broadcast", self.admin_handlers.broadcast_message),
-                CommandHandler("maintenance", self.admin_handlers.maintenance_menu),
+                CommandHandler("create", self.issue_handlers.create_issue),
+                CommandHandler("issues", self.issue_handlers.list_issues),
+                CommandHandler("myissues", self.issue_handlers.list_my_issues),
+                CommandHandler("search", self.issue_handlers.search_issues),
+                CommandHandler("view", self.issue_handlers.view_issue),
+                CommandHandler("edit", self.issue_handlers.edit_issue),
+                CommandHandler("assign", self.issue_handlers.assign_issue),
+                CommandHandler("comment", self.issue_handlers.comment_issue),
+                CommandHandler("transition", self.issue_handlers.transition_issue),
             ]
 
-            # Add shortcuts if enabled
+            # Add admin commands if enabled
+            if self.config.enable_admin:
+                admin_commands = [
+                    CommandHandler("admin", self.admin_handlers.admin_menu),
+                    CommandHandler("adduser", self.admin_handlers.add_user),
+                    CommandHandler("removeuser", self.admin_handlers.remove_user),
+                    CommandHandler("listusers", self.admin_handlers.list_users),
+                    CommandHandler("setrole", self.admin_handlers.set_user_role),
+                    CommandHandler("refresh", self.admin_handlers.refresh_projects),
+                    CommandHandler("stats", self.admin_handlers.show_stats),
+                ]
+                command_handlers.extend(admin_commands)
+
+            # Add shortcut handlers if enabled
             if self.config.enable_shortcuts:
                 shortcut_handlers = [
+                    CommandHandler("c", self.issue_handlers.create_issue),
+                    CommandHandler("i", self.issue_handlers.list_issues),
+                    CommandHandler("mi", self.issue_handlers.list_my_issues),
+                    CommandHandler("s", self.issue_handlers.search_issues),
                     CommandHandler("p", self.project_handlers.list_projects),
-                    CommandHandler("c", self.issue_handlers.create_issue_wizard),
-                    CommandHandler("mi", self.issue_handlers.list_user_issues),
-                    CommandHandler("s", self.base_handler.status_command),
-                    CommandHandler("ap", self.admin_handlers.add_project),
-                    CommandHandler("u", self.admin_handlers.list_users),
                 ]
                 command_handlers.extend(shortcut_handlers)
 
-            # Add wizard shortcut if enabled
-            if self.config.enable_wizards:
-                command_handlers.append(
-                    CommandHandler("wizard", self.wizard_handlers.start_wizard)
-                )
-                if self.config.enable_shortcuts:
-                    command_handlers.append(
-                        CommandHandler("w", self.wizard_handlers.start_wizard)
-                    )
+                # Note: Wizard shortcuts (/w, /q) are already handled in the ConversationHandler
+                # They are registered as entry_points in wizard_handlers.get_conversation_handler()
 
             # Register all command handlers
             for handler in command_handlers:
@@ -334,12 +337,13 @@ class TelegramJiraBot:
             )
 
             # Register message handler for issue creation from plain text
-            self.application.add_handler(
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    self.issue_handlers.handle_message_issue_creation,
+            if self.config.enable_quick_create:
+                self.application.add_handler(
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        self.issue_handlers.handle_message_issue_creation,
+                    )
                 )
-            )
 
             # Register error handler
             self.application.add_error_handler(self._error_handler)
@@ -349,7 +353,7 @@ class TelegramJiraBot:
         except Exception as e:
             self.logger.error(f"❌ Failed to register handlers: {e}")
             raise RuntimeError(f"Handler registration failed: {e}") from e
-
+    
     async def _error_handler(self, update: Update, context) -> None:
         """Handle errors in bot updates.
 

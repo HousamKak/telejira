@@ -861,11 +861,21 @@ Ready to create this issue?
         Returns:
             ConversationHandler configured for wizard flows
         """
+        # Define entry points including shortcuts
+        entry_points = [
+            CommandHandler("wizard", self.wizard_command),
+            CommandHandler("quick", self.quick_command),
+        ]
+        
+        # Add shortcuts if enabled
+        if self.config.enable_shortcuts:
+            entry_points.extend([
+                CommandHandler("w", self.wizard_command),  # Shortcut for wizard
+                CommandHandler("q", self.quick_command),   # Shortcut for quick
+            ])
+        
         return ConversationHandler(
-            entry_points=[
-                CommandHandler("wizard", self.wizard_command),
-                CommandHandler("quick", self.quick_command),
-            ],
+            entry_points=entry_points,
             states={
                 ConversationState.SETUP_WELCOME.value: [
                     CallbackQueryHandler(self.handle_setup_welcome_callback)
@@ -900,9 +910,10 @@ Ready to create this issue?
                 CallbackQueryHandler(self.cancel_wizard, pattern="^(setup_cancel|issue_cancel)$")
             ],
             per_user=True,
-            per_chat=True
+            per_chat=True,
+            per_message=False  # Set to False to avoid deprecation warnings
         )
-
+    
     async def cleanup_wizard_data(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Clean up wizard data from context."""
         keys_to_remove = ['wizard_data', 'issue_wizard', 'project_wizard']
