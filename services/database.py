@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 import aiosqlite
 from aiosqlite import Connection
 
-from .models import (
+from models import (
     IssuePriority,
     IssueType,
     JiraIssue,

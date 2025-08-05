@@ -28,7 +28,7 @@ from telegram.ext import (
 )
 
 from config.settings import load_config_from_env, BotConfig
-from services.database import DatabaseManager
+from services.database import DatabaseService
 from services.jira_service import JiraService, JiraAPIError
 from services.telegram_service import TelegramService
 from handlers.admin_handlers import AdminHandlers
@@ -58,7 +58,7 @@ class TelegramJiraBot:
 
         self.config: BotConfig = config
         self.application: Optional[Application] = None
-        self.database: Optional[DatabaseManager] = None
+        self.database: Optional[DatabaseService] = None
         self.jira_service: Optional[JiraService] = None
         self.telegram_service: Optional[TelegramService] = None
 
@@ -165,7 +165,7 @@ class TelegramJiraBot:
             self.logger.info("Initializing services...")
 
             # Initialize database
-            self.database = DatabaseManager(
+            self.database = DatabaseService(
                 db_path=self.config.database_path,
                 pool_size=self.config.database_pool_size,
                 timeout=self.config.database_timeout,

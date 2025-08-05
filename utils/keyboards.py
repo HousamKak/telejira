@@ -8,8 +8,7 @@ Contains functions for creating inline keyboards for various bot interactions.
 from typing import List, Dict, Any, Optional, Tuple
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from models.project import Project
-from models.enums import IssuePriority, IssueType
+from models import IssuePriority, IssueType,Project
 from .constants import EMOJI
 
 

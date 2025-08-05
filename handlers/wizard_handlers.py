@@ -22,14 +22,14 @@ from telegram.ext import (
 )
 
 from .base_handler import BaseHandler
-from models.project import Project
-from models.user import User
-from models.enums import IssuePriority, IssueType, UserRole, ErrorType
+
+from models import User, IssuePriority, IssueType, UserRole, ErrorType,Project
+
 from services.database import DatabaseError
 from services.jira_service import JiraAPIError
 from utils.constants import EMOJI, SUCCESS_MESSAGES, ERROR_MESSAGES, INFO_MESSAGES
 from utils.validators import InputValidator, ValidationResult
-from utils.formatters import MessageFormatter, truncate_text
+from utils.formatters import MessageFormatter
 from utils.keyboards import (
     cb, parse_cb, build_project_list_keyboard, build_issue_type_keyboard,
     build_issue_priority_keyboard, build_confirm_keyboard, build_back_cancel_keyboard

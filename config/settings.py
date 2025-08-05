@@ -12,7 +12,8 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 
-from models.enums import IssuePriority, IssueType
+# Updated import - now importing from the main models package
+from models import IssuePriority, IssueType
 
 
 @dataclass(frozen=True)
@@ -258,6 +259,60 @@ class BotConfig:
         return summary
 
 
+def parse_enum(enum_cls, value: str, default):
+    """Parse enum from string value with fallback to default.
+    
+    Args:
+        enum_cls: Enum class to parse into
+        value: String value to parse
+        default: Default enum value if parsing fails
+        
+    Returns:
+        Parsed enum value or default
+    """
+    if not value or not value.strip():
+        return default
+    
+    value = value.strip()
+    
+    # Try exact match by name
+    for item in enum_cls:
+        if item.name.lower() == value.lower():
+            return item
+    
+    # Try exact match by value
+    for item in enum_cls:
+        if str(item.value).lower() == value.lower():
+            return item
+    
+    # Try common aliases for priorities
+    if enum_cls == IssuePriority:
+        aliases = {
+            'critical': IssuePriority.HIGHEST,
+            'urgent': IssuePriority.HIGH,
+            'normal': IssuePriority.MEDIUM,
+            'minor': IssuePriority.LOW,
+            'trivial': IssuePriority.LOWEST,
+        }
+        if value.lower() in aliases:
+            return aliases[value.lower()]
+    
+    # Try common aliases for issue types
+    if enum_cls == IssueType:
+        aliases = {
+            'sub-task': IssueType.SUBTASK,
+            'subtask': IssueType.SUBTASK,
+            'user-story': IssueType.STORY,
+            'userstory': IssueType.STORY,
+        }
+        if value.lower() in aliases:
+            return aliases[value.lower()]
+    
+    # Log warning and return default
+    logging.warning(f"Invalid {enum_cls.__name__} value '{value}', using default {default.value}")
+    return default
+
+
 def load_config_from_env(env_file: Optional[str] = None) -> BotConfig:
     """Load configuration from environment variables.
     
@@ -299,21 +354,9 @@ def load_config_from_env(env_file: Optional[str] = None) -> BotConfig:
     admin_users = parse_user_list('ADMIN_USERS')
     super_admin_users = parse_user_list('SUPER_ADMIN_USERS')
 
-    # Parse default priority with error handling
-    default_priority = IssuePriority.MEDIUM
-    if os.getenv('DEFAULT_PRIORITY'):
-        try:
-            default_priority = IssuePriority.from_string(os.getenv('DEFAULT_PRIORITY', ''))
-        except (ValueError, TypeError):
-            logging.warning(f"Invalid DEFAULT_PRIORITY value, using {IssuePriority.MEDIUM.value}")
-
-    # Parse default issue type with error handling
-    default_issue_type = IssueType.TASK
-    if os.getenv('DEFAULT_ISSUE_TYPE'):
-        try:
-            default_issue_type = IssueType.from_string(os.getenv('DEFAULT_ISSUE_TYPE', ''))
-        except (ValueError, TypeError):
-            logging.warning(f"Invalid DEFAULT_ISSUE_TYPE value, using {IssueType.TASK.value}")
+    # Parse default priority and issue type with proper enum parsing
+    default_priority = parse_enum(IssuePriority, os.getenv('DEFAULT_PRIORITY', ''), IssuePriority.MEDIUM)
+    default_issue_type = parse_enum(IssueType, os.getenv('DEFAULT_ISSUE_TYPE', ''), IssueType.TASK)
 
     # Parse numeric values with validation
     def parse_int(env_var: str, default: int, min_val: int, max_val: int) -> int:

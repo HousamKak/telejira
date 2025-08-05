@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 import aiohttp
 from aiohttp import ClientSession, ClientTimeout
 
-from .models import (
+from models import (
     IssueComment,
     IssuePriority,
     IssueSearchResult,

@@ -15,10 +15,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 from .base_handler import BaseHandler
-from models.project import Project
-from models.issue import JiraIssue, IssueComment
-from models.user import User
-from models.enums import IssuePriority, IssueType, IssueStatus, UserRole, ErrorType
+from models import User,IssuePriority, IssueType, IssueStatus, UserRole, ErrorType, JiraIssue, IssueComment, Project
+
 from services.database import DatabaseError
 from services.jira_service import JiraAPIError
 from utils.constants import EMOJI, SUCCESS_MESSAGES, ERROR_MESSAGES, INFO_MESSAGES

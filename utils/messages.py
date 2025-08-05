@@ -6,9 +6,8 @@ Centralizes all message formatting with consistent HTML styling and proper escap
 """
 
 from typing import Optional
-from models.project import Project
-from models.user import User
-from models.issue import JiraIssue
+from models import Project, JiraIssue, User
+
 from utils.formatters import truncate_text
 
 

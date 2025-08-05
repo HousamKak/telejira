@@ -11,10 +11,8 @@ from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Union, Tuple
 from urllib.parse import quote
 
-from models.project import Project, ProjectSummary
-from models.issue import JiraIssue
-from models.user import User
-from models.enums import IssuePriority, IssueType, IssueStatus, UserRole
+from models import Project,IssuePriority, IssueType, IssueStatus, UserRole,JiraIssue,User
+
 from .constants import EMOJI, MAX_MESSAGE_LENGTH, MAX_SUMMARY_LENGTH
 
 
@@ -230,38 +228,6 @@ class MessageFormatter:
 
         return "\n".join(lines)
 
-    def format_project_list(self, projects: List[Union[Project, ProjectSummary]], title: str = "Projects") -> str:
-        """Format a list of projects for display.
-        
-        Args:
-            projects: List of projects to format
-            title: Title for the list
-            
-        Returns:
-            Formatted project list message
-        """
-        if not isinstance(projects, list):
-            raise TypeError("projects must be a list")
-        
-        if not projects:
-            return f"📋 **{title}**\n\nNo projects found."
-
-        lines = [f"📋 **{title}** ({len(projects)} total)"]
-        lines.append("")
-
-        for i, project in enumerate(projects, 1):
-            if isinstance(project, ProjectSummary):
-                status_emoji = "✅" if project.is_active else "❌"
-                project_line = f"{i}. {status_emoji} **{project.key}**: {project.name} ({project.issue_count} issues)"
-            elif isinstance(project, Project):
-                status_emoji = "✅" if project.is_active else "❌"
-                project_line = f"{i}. {status_emoji} **{project.key}**: {project.name} ({project.issue_count} issues)"
-            else:
-                continue
-            
-            lines.append(project_line)
-
-        return "\n".join(lines)
 
     def format_user(self, user: User, include_stats: bool = True) -> str:
         """Format user information for display.

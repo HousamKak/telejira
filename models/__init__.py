@@ -1,80 +1,34 @@
-#!/usr/bin/env python3
 """
 Models package for the Telegram-Jira Bot.
 
 This package contains all data models, enums, and related utilities for the bot.
 All models include proper type hints, validation, and serialization methods.
 
-Modules:
-    enums: Core enumerations (UserRole, IssueType, IssuePriority, etc.)
-    user: User model and related classes
-    project: Project model and related classes  
-    issue: Issue model and related classes
-    models: Additional domain models and utilities
-
 Usage:
     from models import User, Project, JiraIssue, IssueType, IssuePriority
-    from models.enums import UserRole, IssueStatus
+    from models import UserRole, IssueStatus, WizardState
 """
 
 from __future__ import annotations
 
-# Import core enums
-from .enums import (
+# Import all models and enums from the consolidated models module
+from .models import (
+    # Core enums
     UserRole,
     IssueType,
     IssuePriority,
     IssueStatus,
     ErrorType,
-)
-
-# Import user models
-from .user import (
+    WizardState,
+    
+    # Data classes
     User,
-    UserPreferences,
-    UserSession,
-    UserStats,
-)
-
-# Import project models
-from .project import (
     Project,
-    ProjectSummary,
-    ProjectStats,
-    ProjectSettings,
-)
-
-# Import issue models
-from .issue import (
     JiraIssue,
     IssueComment,
-    IssueTransition,
     IssueSearchResult,
-    IssueHistory,
-    IssueWorklog,
+    SentMessages,
 )
-
-# Import additional models if they exist in models.py
-try:
-    from .models import (
-        WizardState,
-    )
-except ImportError:
-    # If models.py doesn't exist or doesn't have these classes, create minimal versions
-    from enum import Enum
-    
-    class WizardState(Enum):
-        """Wizard conversation states for Telegram bot."""
-        SETUP_WELCOME = "setup_welcome"
-        SETUP_PROJECT_SELECTION = "setup_project_selection"
-        SETUP_PROJECT_CONFIRMATION = "setup_project_confirmation"
-        ISSUE_PROJECT_SELECTION = "issue_project_selection"
-        ISSUE_TYPE_SELECTION = "issue_type_selection"
-        ISSUE_PRIORITY_SELECTION = "issue_priority_selection"
-        ISSUE_SUMMARY_INPUT = "issue_summary_input"
-        ISSUE_DESCRIPTION_INPUT = "issue_description_input"
-        ISSUE_CONFIRMATION = "issue_confirmation"
-
 
 # Version info
 __version__ = "2.1.0"
@@ -91,25 +45,13 @@ __all__ = [
     "ErrorType",
     "WizardState",
     
-    # User models
+    # Data classes
     "User",
-    "UserPreferences",
-    "UserSession", 
-    "UserStats",
-    
-    # Project models
     "Project",
-    "ProjectSummary",
-    "ProjectStats",
-    "ProjectSettings",
-    
-    # Issue models
     "JiraIssue",
     "IssueComment",
-    "IssueTransition",
-    "IssueSearchResult", 
-    "IssueHistory",
-    "IssueWorklog",
+    "IssueSearchResult",
+    "SentMessages",
 ]
 
 
@@ -128,25 +70,13 @@ def get_model_info() -> dict:
             "ErrorType": "Error type enumeration for standardized error handling",
             "WizardState": "Wizard conversation states for Telegram bot"
         },
-        "user_models": {
+        "data_models": {
             "User": "Main user model representing a Telegram user",
-            "UserPreferences": "User preference settings and configuration",
-            "UserSession": "User session tracking and management",
-            "UserStats": "User activity statistics and metrics"
-        },
-        "project_models": {
             "Project": "Main project model representing a Jira project",
-            "ProjectSummary": "Lightweight project summary for listings",
-            "ProjectStats": "Project statistics and metrics",
-            "ProjectSettings": "Project-specific settings and configuration"
-        },
-        "issue_models": {
             "JiraIssue": "Main issue model representing a Jira issue",
             "IssueComment": "Issue comment model",
-            "IssueTransition": "Issue status transition model",
             "IssueSearchResult": "Search results container for issues",
-            "IssueHistory": "Issue change history tracking",
-            "IssueWorklog": "Issue work log entries"
+            "SentMessages": "Container for sent Telegram message information"
         }
     }
 
@@ -162,12 +92,8 @@ def validate_enum_value(enum_class, value: str) -> bool:
         True if value is valid for the enum, False otherwise
     """
     try:
-        if hasattr(enum_class, 'from_string'):
-            enum_class.from_string(value)
-            return True
-        else:
-            # Try direct value comparison
-            return any(item.value.lower() == value.lower() for item in enum_class)
+        # Try direct value comparison
+        return any(item.value.lower() == value.lower() for item in enum_class)
     except (ValueError, AttributeError):
         return False
 
@@ -200,27 +126,6 @@ def get_enum_names(enum_class) -> list:
         return [item.name for item in enum_class]
     except AttributeError:
         return []
-
-
-# Convenience functions for common operations
-def create_user_from_telegram(telegram_user, role: UserRole = UserRole.USER) -> User:
-    """Create a User instance from a Telegram user object.
-    
-    Args:
-        telegram_user: Telegram User object
-        role: User role to assign (default: USER)
-        
-    Returns:
-        User instance
-    """
-    return User(
-        user_id=str(telegram_user.id),
-        username=telegram_user.username or f"user_{telegram_user.id}",
-        first_name=telegram_user.first_name,
-        last_name=telegram_user.last_name,
-        is_active=True,
-        role=role,
-    )
 
 
 def get_priority_emoji(priority: IssuePriority) -> str:
@@ -300,7 +205,6 @@ def get_role_emoji(role: UserRole) -> str:
     return role_emojis.get(role, "👤")
 
 
-# Model validation utilities
 def validate_project_key(key: str) -> bool:
     """Validate project key format.
     
@@ -355,13 +259,12 @@ def validate_telegram_user_id(user_id: str) -> bool:
         return False
 
 
-# Export validation functions too
+# Add utility functions to exports
 __all__.extend([
     "get_model_info",
     "validate_enum_value", 
     "get_enum_values",
     "get_enum_names",
-    "create_user_from_telegram",
     "get_priority_emoji",
     "get_issue_type_emoji", 
     "get_status_emoji",

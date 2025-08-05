@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple, Union
 from urllib.parse import urlparse
 
-from models.enums import IssuePriority, IssueType, IssueStatus, UserRole
+from models import IssuePriority, IssueType, IssueStatus, UserRole
 from .constants import PATTERNS, MAX_PROJECT_KEY_LENGTH, MAX_PROJECT_NAME_LENGTH
 
 

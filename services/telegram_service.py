@@ -14,7 +14,7 @@ from telegram import Bot, InlineKeyboardMarkup, Message
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 
-from .models import SentMessages
+from models import SentMessages
 
 logger = logging.getLogger(__name__)
 

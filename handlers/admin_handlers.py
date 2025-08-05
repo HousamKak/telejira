@@ -14,10 +14,10 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from .base_handler import BaseHandler
-from .database_service import DatabaseService
-from .jira_service import JiraService
-from .models import User, UserRole
-from .telegram_service import TelegramService
+from services.database import DatabaseService
+from services.jira_service import JiraService
+from models import User, UserRole
+from services.telegram_service import TelegramService
 
 logger = logging.getLogger(__name__)
 

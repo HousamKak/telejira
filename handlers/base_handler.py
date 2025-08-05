@@ -13,10 +13,10 @@ from typing import Optional
 from telegram import InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from .database import DatabaseError, DatabaseService
-from .jira_service import JiraAPIError, JiraService
-from .models import ErrorType, SentMessages, User, UserRole
-from .telegram_service import TelegramAPIError, TelegramService
+from services.database import DatabaseError, DatabaseService
+from services.jira_service import JiraAPIError, JiraService
+from models import ErrorType, SentMessages, User, UserRole
+from services.telegram_service import TelegramAPIError, TelegramService
 
 logger = logging.getLogger(__name__)
 
