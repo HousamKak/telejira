@@ -24,6 +24,7 @@ from telegram_jira_bot.models.enums import UserRole, IssuePriority, IssueType, I
 from telegram_jira_bot.models.user import User as BotUser
 from telegram_jira_bot.models.project import Project
 from telegram_jira_bot.models.issue import JiraIssue
+from telegram_jira_bot.services.database import DatabaseError
 
 
 class TestBaseHandler:

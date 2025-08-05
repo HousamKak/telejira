@@ -489,7 +489,7 @@ Format: `[PRIORITY] [TYPE] Description`
 
             # Add admin commands if user is admin
             if self.is_admin(user):
-                help_message += f"""
+                help_message += """
 
 **Admin Commands:**
 • `/addproject <KEY> "<NAME>" [description]` - Add project
@@ -501,7 +501,7 @@ Format: `[PRIORITY] [TYPE] Description`
 
             # Add super admin commands if user is super admin
             if self.is_super_admin(user):
-                help_message += f"""
+                help_message += """
 
 **Super Admin Commands:**
 • `/config` - Bot configuration
@@ -509,7 +509,7 @@ Format: `[PRIORITY] [TYPE] Description`
 • `/maintenance` - System maintenance
                 """
 
-            help_message += f"""
+            help_message += """
 
 **Need More Help?**
 Contact your system administrator or check the project documentation.

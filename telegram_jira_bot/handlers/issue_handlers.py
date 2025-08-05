@@ -134,7 +134,7 @@ class IssueHandlers(BaseHandler):
                 return
 
             # Show issue creation confirmation
-            await self._show_quick_issue_confirmation(update, project, parsed_issue)
+            await self._show_quick_issue_confirmation(update, context, project, parsed_issue)
             self.log_handler_end(update, "handle_quick_issue_text")
 
         except Exception as e:
@@ -172,7 +172,7 @@ You haven't created any issues yet.
                 return
 
             # Format issues list
-            message = self.formatter.format_issue_list(user_issues, f"Your Recent Issues")
+            message = self.formatter.format_issue_list(user_issues, "Your Recent Issues")
             
             # Add action buttons
             keyboard_buttons = []
@@ -488,10 +488,17 @@ No issues found matching: **{search_query}**
             # Add comment via Jira
             try:
                 comment = await self.jira.add_comment(issue_key, comment_text)
-                
+                comment_id = comment.get("id") if isinstance(comment, dict) else getattr(comment, "id", None)
+                details = (
+                    f"Your comment has been posted successfully.\n\n💬 **Comment:** "
+                    f"{comment_text[:100]}{'...' if len(comment_text) > 100 else ''}"
+                )
+                if comment_id:
+                    details += f"\n🆔 Comment ID: {comment_id}"
+                    
                 success_message = self.formatter.format_success_message(
                     f"Comment added to {issue_key}",
-                    f"Your comment has been posted successfully.\n\n💬 **Comment:** {comment_text[:100]}{'...' if len(comment_text) > 100 else ''}"
+                    details
                 )
 
                 await self.send_message(update, success_message)
@@ -750,10 +757,12 @@ No issues found matching: **{search_query}**
     async def _show_quick_issue_confirmation(
         self, 
         update: Update, 
+        context: ContextTypes.DEFAULT_TYPE,
         project: Project, 
         parsed_issue: Dict[str, Any]
     ) -> None:
-        """Show confirmation for quick issue creation."""
+        """Show confirmation for quick issue creation.  This now properly receives the Telegram ``context`` so that we can
+        store the issue data for later use when the user confirms creation."""
         priority_emoji = parsed_issue['priority'].get_emoji()
         type_emoji = parsed_issue['issue_type'].get_emoji()
         
@@ -768,12 +777,14 @@ No issues found matching: **{search_query}**
 Create this issue?
         """
 
-        # Store issue data for creation
-        context = update.callback_query.message if hasattr(update, 'callback_query') else update
-        if hasattr(context, 'bot'):
-            # This is a hack to access context - in real implementation, 
-            # you'd pass context properly through the call chain
-            pass
+        # Store issue data for creation so the confirmation callback can
+        # access it later from ``context.user_data``
+        context.user_data['quick_issue_data'] = {
+            'project_key': project.key,
+            'summary': parsed_issue['summary'],
+            'priority': parsed_issue['priority'],
+            'issue_type': parsed_issue['issue_type'],
+        }
 
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Create Issue", callback_data=f"confirm_create_{project.key}")],
@@ -782,13 +793,6 @@ Create this issue?
 
         await self.send_message(update, message, reply_markup=keyboard, reply_to_message=True)
 
-        # Store in user data (this would need proper context handling)
-        # context.user_data['quick_issue_data'] = {
-        #     'project_key': project.key,
-        #     'summary': parsed_issue['summary'],
-        #     'priority': parsed_issue['priority'],
-        #     'issue_type': parsed_issue['issue_type']
-        # }
 
     def _validate_issue_key(self, issue_key: str) -> bool:
         """Validate issue key format.
@@ -813,7 +817,7 @@ Create this issue?
         """
         try:
             # Build JQL for assignable issues
-            jql_query = f"assignee = currentUser() OR assignee is EMPTY ORDER BY updated DESC"
+            jql_query = "assignee = currentUser() OR assignee is EMPTY ORDER BY updated DESC"
             
             issues = await self.jira.search_issues(jql_query, max_results=limit)
             return issues

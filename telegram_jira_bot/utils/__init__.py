@@ -8,6 +8,8 @@ Utilities package for the Telegram-Jira bot.
 Contains utility functions, validators, formatters, decorators, and constants.
 """
 
+from typing import Dict, Any
+
 try:
     from .constants import (
         EMOJI,

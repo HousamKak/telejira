@@ -986,3 +986,6 @@ class IssueSearchResult:
     def __getitem__(self, index: int) -> JiraIssue:
         """Get issue by index."""
         return self.issues[index]
+    
+    
+    
