@@ -1,23 +1,412 @@
-# Core dependencies
-python-telegram-bot
+# =============================================================================
+# TELEGRAM-JIRA BOT - COMPLETE REQUIREMENTS
+# =============================================================================
+
+# Core Telegram Bot Framework
+python-telegram-bot>=20.7,<21.0
+
+# HTTP Client for Jira API
 aiohttp>=3.9.0,<4.0.0
-python-dotenv>=1.0.0,<2.0.0
+httpx>=0.25.0,<1.0.0
 
 # Database
 aiosqlite>=0.19.0,<1.0.0
 
-# Data validation and parsing
+# Configuration and Environment
+python-dotenv>=1.0.0,<2.0.0
 pydantic>=2.5.0,<3.0.0
+
+# Data Processing and Validation
 typing-extensions>=4.8.0
-
-# Utilities
 python-dateutil>=2.8.0,<3.0.0
-rich>=13.0.0,<14.0.0  # For enhanced console output
 
-# Development dependencies (optional)
+# Async Support
+asyncio-throttle>=1.0.2,<2.0.0
+
+# Logging and Output
+rich>=13.0.0,<14.0.0
+colorlog>=6.7.0,<7.0.0
+
+# Security
+cryptography>=41.0.0,<42.0.0
+
+# Development Dependencies (Optional)
+# Install with: pip install -r requirements.txt -r requirements-dev.txt
+
+# =============================================================================
+# requirements-dev.txt - Development Dependencies
+# =============================================================================
+
+# Testing Framework
 pytest>=7.4.0,<8.0.0
 pytest-asyncio>=0.21.0,<1.0.0
 pytest-cov>=4.1.0,<5.0.0
-black>=23.0.0,<24.0.0
+pytest-mock>=3.11.0,<4.0.0
+pytest-xdist>=3.3.0,<4.0.0
+
+# Code Quality and Linting
+black>=23.9.0,<24.0.0
 mypy>=1.7.0,<2.0.0
-flake8>=6.0.0,<7.0.0
+flake8>=6.1.0,<7.0.0
+isort>=5.12.0,<6.0.0
+pylint>=3.0.0,<4.0.0
+
+# Type Checking
+types-python-dateutil>=2.8.0
+types-requests>=2.31.0
+
+# Security Scanning
+bandit>=1.7.5,<2.0.0
+safety>=2.3.0,<3.0.0
+
+# Documentation
+sphinx>=7.2.0,<8.0.0
+sphinx-rtd-theme>=1.3.0,<2.0.0
+myst-parser>=2.0.0,<3.0.0
+
+# Pre-commit Hooks
+pre-commit>=3.5.0,<4.0.0
+
+# Performance Profiling
+memory-profiler>=0.61.0,<1.0.0
+line-profiler>=4.1.0,<5.0.0
+
+# Database Tools
+sqlite-utils>=3.35.0,<4.0.0
+
+# Debugging
+pdb-attach>=3.2.0,<4.0.0
+ipdb>=0.13.13,<1.0.0
+
+# Build Tools
+build>=1.0.0,<2.0.0
+wheel>=0.41.0,<1.0.0
+setuptools>=68.0.0,<69.0.0
+
+# =============================================================================
+# .env.example - Environment Variables Template
+# =============================================================================
+
+# Required Configuration
+TELEGRAM_TOKEN=your_bot_token_from_botfather
+JIRA_DOMAIN=your-company.atlassian.net
+JIRA_EMAIL=your-jira-email@company.com
+JIRA_API_TOKEN=your_jira_api_token
+
+# Optional Configuration
+DATABASE_PATH=bot_data.db
+LOG_LEVEL=INFO
+LOG_FILE=telegram_jira_bot.log
+
+# User Access Control (comma-separated user IDs or usernames)
+ALLOWED_USERS=user1,user2,user3
+ADMIN_USERS=admin1,admin2
+SUPER_ADMIN_USERS=superadmin1
+
+# Bot Behavior Settings
+MAX_SUMMARY_LENGTH=100
+DEFAULT_PRIORITY=Medium
+DEFAULT_ISSUE_TYPE=Task
+RATE_LIMIT_PER_MINUTE=30
+
+# Feature Toggles
+ENABLE_WIZARDS=true
+ENABLE_SHORTCUTS=true
+COMPACT_MESSAGES=false
+USE_EMOJI=true
+
+# Advanced Settings
+MAX_CONCURRENT_REQUESTS=10
+REQUEST_TIMEOUT=30
+RETRY_ATTEMPTS=3
+RETRY_DELAY=1.0
+
+# Database Settings
+DB_CONNECTION_TIMEOUT=30
+DB_MAX_CONNECTIONS=20
+DB_BACKUP_ENABLED=true
+DB_BACKUP_INTERVAL=3600
+
+# Jira API Settings
+JIRA_API_VERSION=3
+JIRA_PAGE_SIZE=50
+JIRA_MAX_RESULTS=1000
+
+# Telegram Settings
+TELEGRAM_READ_TIMEOUT=30
+TELEGRAM_WRITE_TIMEOUT=30
+TELEGRAM_CONNECT_TIMEOUT=30
+TELEGRAM_POOL_TIMEOUT=30
+
+# Monitoring and Health Checks
+HEALTH_CHECK_INTERVAL=300
+METRICS_ENABLED=false
+METRICS_PORT=8080
+
+# Security Settings
+ENCRYPTION_KEY=your-encryption-key-for-sensitive-data
+SESSION_TIMEOUT=3600
+MAX_LOGIN_ATTEMPTS=5
+
+# =============================================================================
+# requirements-optional.txt - Optional Dependencies
+# =============================================================================
+
+# Redis for caching (if needed)
+redis>=5.0.0,<6.0.0
+aioredis>=2.0.0,<3.0.0
+
+# Metrics and Monitoring
+prometheus-client>=0.19.0,<1.0.0
+statsd>=4.0.0,<5.0.0
+
+# Additional Database Support
+asyncpg>=0.29.0,<1.0.0  # PostgreSQL
+aiomysql>=0.2.0,<1.0.0  # MySQL
+
+# Message Queue Support
+celery>=5.3.0,<6.0.0
+redis>=5.0.0,<6.0.0
+
+# Enhanced Logging
+structlog>=23.2.0,<24.0.0
+python-json-logger>=2.0.0,<3.0.0
+
+# Web Framework (for webhooks)
+fastapi>=0.104.0,<1.0.0
+uvicorn>=0.24.0,<1.0.0
+
+# Image Processing (for issue attachments)
+Pillow>=10.1.0,<11.0.0
+
+# Data Export
+openpyxl>=3.1.0,<4.0.0
+pandas>=2.1.0,<3.0.0
+
+# =============================================================================
+# pyproject.toml - Modern Python Project Configuration
+# =============================================================================
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telegram-jira-bot"
+version = "2.1.0"
+description = "A comprehensive Telegram bot for seamless Jira integration"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "AI Assistant", email = "ai-assistant@example.com"}
+]
+maintainers = [
+    {name = "AI Assistant", email = "ai-assistant@example.com"}
+]
+keywords = [
+    "telegram", "bot", "jira", "atlassian", "issue-tracking",
+    "project-management", "automation", "productivity"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Communications :: Chat",
+    "Topic :: Office/Business :: Groupware",
+    "Topic :: Software Development :: Bug Tracking",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3 :: Only",
+    "Operating System :: OS Independent",
+    "Environment :: Console",
+    "Framework :: AsyncIO",
+    "Natural Language :: English",
+    "Typing :: Typed",
+]
+requires-python = ">=3.9"
+dependencies = [
+    "python-telegram-bot>=20.7,<21.0",
+    "aiohttp>=3.9.0,<4.0.0",
+    "aiosqlite>=0.19.0,<1.0.0",
+    "python-dotenv>=1.0.0,<2.0.0",
+    "pydantic>=2.5.0,<3.0.0",
+    "typing-extensions>=4.8.0",
+    "python-dateutil>=2.8.0,<3.0.0",
+    "rich>=13.0.0,<14.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0,<8.0.0",
+    "pytest-asyncio>=0.21.0,<1.0.0",
+    "pytest-cov>=4.1.0,<5.0.0",
+    "pytest-mock>=3.11.0,<4.0.0",
+    "black>=23.9.0,<24.0.0",
+    "mypy>=1.7.0,<2.0.0",
+    "flake8>=6.1.0,<7.0.0",
+    "isort>=5.12.0,<6.0.0",
+    "pre-commit>=3.5.0,<4.0.0",
+]
+testing = [
+    "pytest>=7.4.0,<8.0.0",
+    "pytest-asyncio>=0.21.0,<1.0.0",
+    "pytest-cov>=4.1.0,<5.0.0",
+    "pytest-mock>=3.11.0,<4.0.0",
+    "pytest-xdist>=3.3.0,<4.0.0",
+]
+linting = [
+    "black>=23.9.0,<24.0.0",
+    "mypy>=1.7.0,<2.0.0",
+    "flake8>=6.1.0,<7.0.0",
+    "isort>=5.12.0,<6.0.0",
+    "pylint>=3.0.0,<4.0.0",
+    "bandit>=1.7.5,<2.0.0",
+]
+docs = [
+    "sphinx>=7.2.0,<8.0.0",
+    "sphinx-rtd-theme>=1.3.0,<2.0.0",
+    "myst-parser>=2.0.0,<3.0.0",
+]
+monitoring = [
+    "prometheus-client>=0.19.0,<1.0.0",
+    "structlog>=23.2.0,<24.0.0",
+]
+cache = [
+    "redis>=5.0.0,<6.0.0",
+    "aioredis>=2.0.0,<3.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/telegram-jira-bot"
+Documentation = "https://github.com/yourusername/telegram-jira-bot/wiki"
+Repository = "https://github.com/yourusername/telegram-jira-bot.git"
+"Bug Tracker" = "https://github.com/yourusername/telegram-jira-bot/issues"
+Changelog = "https://github.com/yourusername/telegram-jira-bot/releases"
+
+[project.scripts]
+telegram-jira-bot = "telegram_jira_bot.main:main"
+tg-jira = "telegram_jira_bot.main:main"
+
+[tool.setuptools]
+packages = ["telegram_jira_bot"]
+
+[tool.setuptools.package-data]
+telegram_jira_bot = ["py.typed", "*.sql", "*.json"]
+
+# Testing Configuration
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q --strict-markers --strict-config"
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "unit: Unit tests",
+    "integration: Integration tests",
+    "database: Database tests",
+    "network: Network-dependent tests",
+    "slow: Slow running tests",
+]
+filterwarnings = [
+    "error",
+    "ignore::UserWarning",
+    "ignore::DeprecationWarning",
+]
+
+# Coverage Configuration
+[tool.coverage.run]
+source = ["telegram_jira_bot"]
+omit = [
+    "*/tests/*",
+    "*/test_*.py",
+    "*/__pycache__/*",
+    "setup.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if settings.DEBUG",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if __name__ == .__main__.:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+]
+
+# Black Configuration
+[tool.black]
+line-length = 100
+target-version = ['py39', 'py310', 'py311', 'py312']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+# isort Configuration
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+line_length = 100
+known_first_party = ["telegram_jira_bot"]
+skip_glob = ["*/migrations/*"]
+
+# MyPy Configuration
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = [
+    "telegram.*",
+    "aiohttp.*",
+    "aiosqlite.*",
+]
+ignore_missing_imports = true
+
+# Pylint Configuration
+[tool.pylint.messages_control]
+disable = [
+    "C0330",  # Wrong hanging indentation
+    "C0326",  # Bad whitespace
+    "R0903",  # Too few public methods
+    "R0913",  # Too many arguments
+    "W0613",  # Unused argument
+]
+
+[tool.pylint.format]
+max-line-length = 100
+
+# Bandit Configuration
+[tool.bandit]
+exclude_dirs = ["tests", "test_*.py"]
+skips = ["B101", "B601"]

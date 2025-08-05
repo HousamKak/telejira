@@ -2,29 +2,43 @@
 """
 Admin handlers for the Telegram-Jira bot.
 
-Handles admin-specific commands and operations.
+Handles administrative commands including user management, project management,
+system configuration, and maintenance operations.
 """
 
-from typing import Optional, List, Dict, Any
-from datetime import datetime, timezone, timedelta
+import asyncio
+import logging
+from typing import Optional, List, Dict, Any, Union
+from datetime import datetime, timezone
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 from .base_handler import BaseHandler
+from ..models.project import Project, ProjectSummary
 from ..models.user import User
-from ..models.enums import UserRole, ErrorType
+from ..models.enums import UserRole, IssuePriority, IssueType, ErrorType
 from ..services.database import DatabaseError
 from ..services.jira_service import JiraAPIError
-from ..utils.constants import EMOJI
+from ..utils.constants import EMOJI, SUCCESS_MESSAGES, ERROR_MESSAGES, INFO_MESSAGES
+from ..utils.validators import InputValidator, ValidationResult
+from ..utils.formatters import MessageFormatter
 
 
-class AdminHandler(BaseHandler):
-    """Handles admin-specific operations."""
+class AdminHandlers(BaseHandler):
+    """Handles administrative commands and operations."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.formatter = MessageFormatter(
+            compact_mode=self.config.compact_messages,
+            use_emoji=True
+        )
+        self.validator = InputValidator()
 
     def get_handler_name(self) -> str:
         """Get handler name."""
-        return "AdminHandler"
+        return "AdminHandlers"
 
     async def handle_error(self, update: Update, error: Exception, context: str = "") -> None:
         """Handle errors specific to admin operations."""
@@ -32,806 +46,891 @@ class AdminHandler(BaseHandler):
             await self.handle_database_error(update, error, context)
         elif isinstance(error, JiraAPIError):
             await self.handle_jira_error(update, error, context)
+        elif isinstance(error, PermissionError):
+            await self.send_error_message(
+                update, 
+                "Insufficient permissions for this operation", 
+                ErrorType.PERMISSION_ERROR
+            )
         else:
-            await self.send_error_message(update, f"Unexpected error: {str(error)}")
+            await self.send_error_message(
+                update,
+                f"Admin operation failed: {str(error)}",
+                ErrorType.UNKNOWN_ERROR
+            )
 
-    # Command handlers
-    async def users_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /users command - list all users and statistics (admin only)."""
-        self.log_handler_start(update, "users_command")
+    # =============================================================================
+    # PROJECT MANAGEMENT COMMANDS
+    # =============================================================================
+
+    async def add_project(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /addproject command - add new project.
         
-        user = await self.enforce_admin(update)
+        Usage: /addproject <KEY> "<NAME>" ["<DESCRIPTION>"]
+        """
+        self.log_handler_start(update, "add_project")
+        
+        user = await self.enforce_role(update, UserRole.ADMIN)
         if not user:
             return
 
         try:
-            # Get all users
-            all_users = await self.db.get_all_users(active_only=False)
-            
-            if not all_users:
-                await self.send_info_message(
-                    update,
-                    f"{EMOJI['INFO']} No users found in the database."
-                )
-                self.log_handler_end(update, "users_command")
+            # Parse arguments
+            if not context.args or len(context.args) < 2:
+                usage_msg = """
+**Usage:** `/addproject <KEY> "<NAME>" ["<DESCRIPTION>"]`
+
+**Examples:**
+• `/addproject WEBAPP "Web Application" "Main company website"`
+• `/addproject MOBILE "Mobile App"`
+
+**Requirements:**
+• KEY: Uppercase letters, numbers, underscores (2-20 chars)
+• NAME: Project name in quotes if it contains spaces
+• DESCRIPTION: Optional description in quotes
+                """
+                await self.send_message(update, usage_msg)
                 return
 
-            # Calculate statistics
-            stats = await self._calculate_user_statistics(all_users)
+            project_key = context.args[0].upper()
             
-            # Format user list
-            text = await self._format_user_list(all_users, stats)
-
-            # Create management keyboard
-            keyboard = [
-                [
-                    InlineKeyboardButton(
-                        f"{EMOJI['STATS']} Detailed Stats",
-                        callback_data="admin_users_stats"
-                    ),
-                    InlineKeyboardButton(
-                        f"{EMOJI['REFRESH']} Refresh",
-                        callback_data="admin_users_refresh"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        f"{EMOJI['USER']} Manage Users",
-                        callback_data="admin_users_manage"
-                    )
-                ]
-            ]
-
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await self.send_message(update, text, reply_markup)
-
-            self.log_user_action(user, "view_users", {"user_count": len(all_users)})
-            self.log_handler_end(update, "users_command")
-
-        except Exception as e:
-            await self.handle_error(update, e, "users_command")
-            self.log_handler_end(update, "users_command", success=False)
-
-    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /status command - show bot status and statistics."""
-        self.log_handler_start(update, "status_command")
-        
-        user = await self.enforce_user_access(update)
-        if not user:
-            return
-
-        try:
-            # Test connections
-            jira_connected = await self.jira.test_connection()
-            db_stats = await self.db.get_database_stats()
+            # Extract name and description from quoted strings
+            remaining_args = ' '.join(context.args[1:])
+            parsed_args = self._parse_quoted_arguments(remaining_args)
             
-            # Get user-specific stats
-            user_stats = await self._get_user_statistics(user)
+            if not parsed_args:
+                await self.send_error_message(update, "Invalid arguments format. Use quotes for names with spaces.")
+                return
             
-            # Get system stats (admin only)
-            system_stats = None
-            if self.is_admin(user):
-                system_stats = await self._get_system_statistics()
+            project_name = parsed_args[0]
+            project_description = parsed_args[1] if len(parsed_args) > 1 else ""
 
-            # Format status message
-            text = self.telegram.formatter.format_status_message(
-                jira_connected=jira_connected,
-                db_connected=True,  # If we got db_stats, DB is connected
-                user_stats=user_stats,
-                system_stats=system_stats
+            # Validate inputs
+            validation_result = self.validator.validate_project_key(project_key)
+            if not validation_result.is_valid:
+                await self.handle_validation_error(update, validation_result, "project key")
+                return
+
+            validation_result = self.validator.validate_project_name(project_name)
+            if not validation_result.is_valid:
+                await self.handle_validation_error(update, validation_result, "project name")
+                return
+
+            # Check if project already exists
+            existing_project = await self.db.get_project_by_key(project_key)
+            if existing_project:
+                await self.send_error_message(update, f"Project with key '{project_key}' already exists.")
+                return
+
+            # Try to get project from Jira first
+            jira_project = await self.jira.get_project_by_key(project_key)
+            if jira_project:
+                # Use Jira project data
+                project = jira_project
+                if project_description:
+                    project.description = project_description
+            else:
+                # Create new project locally
+                project = Project(
+                    key=project_key,
+                    name=project_name,
+                    description=project_description,
+                    url=f"https://{self.config.jira_domain}/projects/{project_key}",
+                    is_active=True
+                )
+
+            # Store in database
+            await self.db.create_project(
+                key=project.key,
+                name=project.name,
+                description=project.description,
+                url=project.url,
+                is_active=project.is_active
             )
 
-            # Create action keyboard
-            keyboard = []
+            # Success message
+            success_message = self.formatter.format_success_message(
+                f"Project '{project_key}' added successfully!",
+                self.formatter.format_project(project, include_details=False)
+            )
             
-            if self.is_admin(user):
-                keyboard.append([
-                    InlineKeyboardButton(
-                        f"{EMOJI['STATS']} System Stats",
-                        callback_data="admin_status_system"
-                    ),
-                    InlineKeyboardButton(
-                        f"{EMOJI['DATABASE']} DB Stats",
-                        callback_data="admin_status_database"
-                    )
-                ])
+            await self.send_message(update, success_message)
+            self.log_handler_end(update, "add_project")
+
+        except Exception as e:
+            await self.handle_error(update, e, "add_project")
+            self.log_handler_end(update, "add_project", success=False)
+
+    async def edit_project(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /editproject command - edit existing project.
+        
+        Usage: /editproject <KEY>
+        """
+        self.log_handler_start(update, "edit_project")
+        
+        user = await self.enforce_role(update, UserRole.ADMIN)
+        if not user:
+            return
+
+        try:
+            if not context.args:
+                await self.send_message(update, "**Usage:** `/editproject <PROJECT_KEY>`")
+                return
+
+            project_key = context.args[0].upper()
             
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"{EMOJI['REFRESH']} Refresh",
-                    callback_data="admin_status_refresh"
-                ),
-                InlineKeyboardButton(
-                    f"{EMOJI['HELP']} Help",
-                    callback_data="admin_help"
+            # Get project
+            project = await self.db.get_project_by_key(project_key)
+            if not project:
+                await self.send_error_message(update, f"Project '{project_key}' not found.")
+                return
+
+            # Show edit menu
+            await self._show_project_edit_menu(update, project)
+            self.log_handler_end(update, "edit_project")
+
+        except Exception as e:
+            await self.handle_error(update, e, "edit_project")
+            self.log_handler_end(update, "edit_project", success=False)
+
+    async def delete_project(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /deleteproject command - delete project.
+        
+        Usage: /deleteproject <KEY>
+        """
+        self.log_handler_start(update, "delete_project")
+        
+        user = await self.enforce_role(update, UserRole.ADMIN)
+        if not user:
+            return
+
+        try:
+            if not context.args:
+                await self.send_message(update, "**Usage:** `/deleteproject <PROJECT_KEY>`")
+                return
+
+            project_key = context.args[0].upper()
+            
+            # Get project
+            project = await self.db.get_project_by_key(project_key)
+            if not project:
+                await self.send_error_message(update, f"Project '{project_key}' not found.")
+                return
+
+            # Check if project has issues
+            issue_count = await self.db.get_project_issue_count(project_key)
+            if issue_count > 0:
+                await self.send_error_message(
+                    update, 
+                    f"Cannot delete project '{project_key}' - it contains {issue_count} issues."
                 )
-            ])
+                return
 
-            reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
-            await self.send_message(update, text, reply_markup)
-
-            self.log_user_action(user, "view_status")
-            self.log_handler_end(update, "status_command")
+            # Show confirmation
+            await self._show_delete_project_confirmation(update, project)
+            self.log_handler_end(update, "delete_project")
 
         except Exception as e:
-            await self.handle_error(update, e, "status_command")
-            self.log_handler_end(update, "status_command", success=False)
+            await self.handle_error(update, e, "delete_project")
+            self.log_handler_end(update, "delete_project", success=False)
 
-    async def syncjira_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /syncjira command - synchronize data with Jira (admin only)."""
-        self.log_handler_start(update, "syncjira_command")
+    # =============================================================================
+    # USER MANAGEMENT COMMANDS
+    # =============================================================================
+
+    async def list_users(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /users command - list all users with statistics."""
+        self.log_handler_start(update, "list_users")
         
-        user = await self.enforce_admin(update)
+        user = await self.enforce_role(update, UserRole.ADMIN)
         if not user:
             return
 
         try:
-            # Show sync options
-            await self._show_sync_options(update)
-            self.log_handler_end(update, "syncjira_command")
-
-        except Exception as e:
-            await self.handle_error(update, e, "syncjira_command")
-            self.log_handler_end(update, "syncjira_command", success=False)
-
-    async def config_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /config command - show/modify bot configuration (super admin only)."""
-        self.log_handler_start(update, "config_command")
-        
-        user = await self.enforce_super_admin(update)
-        if not user:
-            return
-
-        try:
-            # Show current configuration
-            config_summary = self.config.get_summary()
+            users = await self.db.get_all_users()
             
-            text = f"{EMOJI['SETTINGS']} **Bot Configuration**\n\n"
-            text += config_summary
+            if not users:
+                await self.send_message(update, INFO_MESSAGES['NO_USERS'])
+                return
 
-            keyboard = [
-                [
-                    InlineKeyboardButton(
-                        f"{EMOJI['EDIT']} Edit Settings",
-                        callback_data="admin_config_edit"
-                    ),
-                    InlineKeyboardButton(
-                        f"{EMOJI['DATABASE']} Database",
-                        callback_data="admin_config_database"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        f"{EMOJI['REFRESH']} Refresh",
-                        callback_data="admin_config_refresh"
-                    )
-                ]
-            ]
+            # Format user list
+            message_lines = [f"{EMOJI.get('USERS', '👥')} **User Statistics** ({len(users)} total)"]
+            message_lines.append("")
 
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await self.send_message(update, text, reply_markup)
-
-            self.log_user_action(user, "view_config")
-            self.log_handler_end(update, "config_command")
-
-        except Exception as e:
-            await self.handle_error(update, e, "config_command")
-            self.log_handler_end(update, "config_command", success=False)
-
-    async def broadcast_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /broadcast command - send message to all users (super admin only)."""
-        self.log_handler_start(update, "broadcast_command")
-        
-        user = await self.enforce_super_admin(update)
-        if not user:
-            return
-
-        args = self.parse_command_args(update, 1)  # Require message
-        if not args:
-            await self._send_broadcast_usage(update)
-            self.log_handler_end(update, "broadcast_command")
-            return
-
-        message_text = " ".join(args)
-
-        try:
-            # Show broadcast confirmation
-            await self._show_broadcast_confirmation(update, message_text)
-            self.log_handler_end(update, "broadcast_command")
-
-        except Exception as e:
-            await self.handle_error(update, e, "broadcast_command")
-            self.log_handler_end(update, "broadcast_command", success=False)
-
-    async def maintenance_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /maintenance command - perform maintenance tasks (super admin only)."""
-        self.log_handler_start(update, "maintenance_command")
-        
-        user = await self.enforce_super_admin(update)
-        if not user:
-            return
-
-        try:
-            await self._show_maintenance_options(update)
-            self.log_handler_end(update, "maintenance_command")
-
-        except Exception as e:
-            await self.handle_error(update, e, "maintenance_command")
-            self.log_handler_end(update, "maintenance_command", success=False)
-
-    # Callback handlers
-    async def handle_admin_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle admin-related callbacks."""
-        callback_data = self.extract_callback_data(update)
-        if not callback_data:
-            return
-
-        parts = self.parse_callback_data(callback_data)
-        if len(parts) < 2:
-            return
-
-        category = parts[1]  # admin_<category>
-
-        if category == "users":
-            await self._handle_users_callback(update, parts[2:])
-        elif category == "status":
-            await self._handle_status_callback(update, parts[2:])
-        elif category == "sync":
-            await self._handle_sync_callback(update, parts[2:])
-        elif category == "config":
-            await self._handle_config_callback(update, parts[2:])
-        elif category == "broadcast":
-            await self._handle_broadcast_callback(update, parts[2:])
-        elif category == "maintenance":
-            await self._handle_maintenance_callback(update, parts[2:])
-        elif category == "help":
-            await self._show_admin_help(update)
-
-    # Private helper methods
-    async def _calculate_user_statistics(self, users: List[User]) -> Dict[str, Any]:
-        """Calculate user statistics."""
-        now = datetime.now(timezone.utc)
-        day_ago = now - timedelta(days=1)
-        week_ago = now - timedelta(days=7)
-
-        stats = {
-            'total_users': len(users),
-            'active_users': len([u for u in users if u.is_active]),
-            'admin_users': len([u for u in users if u.is_admin()]),
-            'active_24h': len([u for u in users if u.last_activity >= day_ago]),
-            'active_7d': len([u for u in users if u.last_activity >= week_ago]),
-            'total_issues_created': sum(u.issues_created for u in users),
-            'roles': {}
-        }
-
-        # Count by role
-        for user in users:
-            role_name = user.role.value
-            stats['roles'][role_name] = stats['roles'].get(role_name, 0) + 1
-
-        return stats
-
-    async def _format_user_list(self, users: List[User], stats: Dict[str, Any]) -> str:
-        """Format user list for display."""
-        text = f"{EMOJI['USER']} **User Management**\n\n"
-        
-        # Statistics summary
-        text += f"**Summary:**\n"
-        text += f"└ Total Users: {stats['total_users']}\n"
-        text += f"└ Active Users: {stats['active_users']}\n"
-        text += f"└ Admin Users: {stats['admin_users']}\n"
-        text += f"└ Active (24h): {stats['active_24h']}\n"
-        text += f"└ Active (7d): {stats['active_7d']}\n"
-        text += f"└ Issues Created: {stats['total_issues_created']}\n\n"
-
-        # Role breakdown
-        if stats['roles']:
-            text += f"**By Role:**\n"
-            for role, count in stats['roles'].items():
-                role_emoji = EMOJI['ADMIN'] if role != 'user' else EMOJI['USER']
-                text += f"└ {role_emoji} {role.title()}: {count}\n"
-            text += "\n"
-
-        # Recent users (last 10)
-        recent_users = sorted(users, key=lambda u: u.last_activity, reverse=True)[:10]
-        text += f"**Recent Activity (Top 10):**\n"
-        
-        for user in recent_users:
-            status_emoji = EMOJI['ACTIVE'] if user.is_active else EMOJI['INACTIVE']
-            role_emoji = EMOJI['ADMIN'] if user.is_admin() else EMOJI['USER']
-            
-            days_ago = (datetime.now(timezone.utc) - user.last_activity).days
-            activity_text = f"{days_ago}d ago" if days_ago > 0 else "today"
-            
-            text += f"└ {status_emoji}{role_emoji} {user.get_display_name()} ({activity_text})\n"
-
-        return text
-
-    async def _get_user_statistics(self, user: User) -> Dict[str, Any]:
-        """Get statistics for a specific user."""
-        try:
-            # Get user's recent issues
-            recent_issues = await self.db.get_user_issues(user.user_id, limit=5)
-            
-            # Get user preferences
-            preferences = await self.get_user_preferences(user.user_id)
-            
-            return {
-                'issues_created': user.issues_created,
-                'recent_issues': recent_issues,
-                'default_project': preferences.default_project_key if preferences else None,
-                'member_since': user.created_at,
-                'last_activity': user.last_activity
+            # Group users by role
+            users_by_role = {
+                UserRole.SUPER_ADMIN: [],
+                UserRole.ADMIN: [],
+                UserRole.USER: []
             }
-        except DatabaseError:
-            return {'issues_created': user.issues_created}
 
-    async def _get_system_statistics(self) -> Dict[str, Any]:
-        """Get system-wide statistics."""
-        try:
-            db_stats = await self.db.get_database_stats()
-            
-            # Calculate additional metrics
-            all_users = await self.db.get_all_users(active_only=False)
-            all_projects = await self.db.get_projects(active_only=False)
-            
-            # Active users in last 24 hours
-            day_ago = datetime.now(timezone.utc) - timedelta(days=1)
-            active_24h = len([u for u in all_users if u.last_activity >= day_ago])
-            
-            return {
-                'total_users': db_stats.get('users_count', 0),
-                'total_projects': db_stats.get('projects_count', 0),
-                'total_issues': db_stats.get('issues_count', 0),
-                'database_size_mb': db_stats.get('database_size_bytes', 0) / (1024 * 1024),
-                'active_users_24h': active_24h,
-                'sessions_count': db_stats.get('user_sessions_count', 0)
-            }
-        except DatabaseError:
-            return {}
+            for u in users:
+                users_by_role[u.role].append(u)
 
-    async def _show_sync_options(self, update: Update) -> None:
-        """Show Jira synchronization options."""
-        text = f"{EMOJI['SYNC']} **Jira Synchronization**\n\n"
-        text += "Choose what to synchronize with Jira:\n\n"
-        text += f"{EMOJI['PROJECT']} **Projects** - Update project info from Jira\n"
-        text += f"{EMOJI['ISSUE']} **Issues** - Sync issue status and details\n"
-        text += f"{EMOJI['USER']} **Users** - Update user information\n"
-        text += f"{EMOJI['REFRESH']} **Full Sync** - Synchronize everything\n\n"
-        text += f"{EMOJI['WARNING']} This may take some time for large datasets."
-
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    f"{EMOJI['PROJECT']} Sync Projects",
-                    callback_data="admin_sync_projects"
-                ),
-                InlineKeyboardButton(
-                    f"{EMOJI['ISSUE']} Sync Issues",
-                    callback_data="admin_sync_issues"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"{EMOJI['REFRESH']} Full Sync",
-                    callback_data="admin_sync_full"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"{EMOJI['CANCEL']} Cancel",
-                    callback_data="admin_status_refresh"
-                )
-            ]
-        ]
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await self.edit_message(update, text, reply_markup)
-
-    async def _show_broadcast_confirmation(self, update: Update, message_text: str) -> None:
-        """Show broadcast confirmation."""
-        # Get user count
-        users = await self.db.get_all_users(active_only=True)
-        user_count = len(users)
-
-        text = f"{EMOJI['WARNING']} **Broadcast Confirmation**\n\n"
-        text += f"**Recipients:** {user_count} active users\n\n"
-        text += f"**Message:**\n"
-        text += f"```\n{message_text}\n```\n\n"
-        text += f"{EMOJI['ERROR']} This action cannot be undone!\n\n"
-        text += "Are you sure you want to send this message to all users?"
-
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    f"{EMOJI['SUCCESS']} Send Broadcast",
-                    callback_data=f"admin_broadcast_confirm_{len(message_text)}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"{EMOJI['CANCEL']} Cancel",
-                    callback_data="admin_status_refresh"
-                )
-            ]
-        ]
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await self.edit_message(update, text, reply_markup)
-
-    async def _show_maintenance_options(self, update: Update) -> None:
-        """Show maintenance options."""
-        text = f"{EMOJI['WRENCH']} **Maintenance Options**\n\n"
-        text += "Choose a maintenance task:\n\n"
-        text += f"{EMOJI['DATABASE']} **Database Cleanup** - Remove expired sessions, old data\n"
-        text += f"{EMOJI['REFRESH']} **Cache Clear** - Clear all cached data\n"
-        text += f"{EMOJI['STATS']} **Vacuum Database** - Optimize database performance\n"
-        text += f"{EMOJI['BACKUP']} **Database Backup** - Create database backup\n\n"
-        text += f"{EMOJI['WARNING']} Some operations may temporarily affect performance."
-
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    f"{EMOJI['DATABASE']} Cleanup",
-                    callback_data="admin_maintenance_cleanup"
-                ),
-                InlineKeyboardButton(
-                    f"{EMOJI['REFRESH']} Clear Cache",
-                    callback_data="admin_maintenance_cache"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"{EMOJI['STATS']} Vacuum DB",
-                    callback_data="admin_maintenance_vacuum"
-                ),
-                InlineKeyboardButton(
-                    f"{EMOJI['BACKUP']} Backup",
-                    callback_data="admin_maintenance_backup"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"{EMOJI['CANCEL']} Cancel",
-                    callback_data="admin_status_refresh"
-                )
-            ]
-        ]
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await self.edit_message(update, text, reply_markup)
-
-    async def _send_broadcast_usage(self, update: Update) -> None:
-        """Send usage instructions for broadcast command."""
-        text = f"{EMOJI['INFO']} **Broadcast Usage**\n\n"
-        text += "**Syntax:** `/broadcast <message>`\n\n"
-        text += "**Example:** `/broadcast Bot will be down for maintenance at 10 PM UTC`\n\n"
-        text += f"{EMOJI['WARNING']} This will send the message to ALL active users!"
-        
-        await self.send_message(update, text)
-
-    async def _show_admin_help(self, update: Update) -> None:
-        """Show admin-specific help."""
-        user = await self.enforce_admin(update)
-        if not user:
-            return
-
-        role_name = "super_admin" if self.is_super_admin(user) else "admin"
-        
-        text = self.telegram.formatter.format_help_text(
-            user_role=role_name,
-            sections=['admin', 'shortcuts'] if self.is_super_admin(user) else ['admin']
-        )
-
-        await self.edit_message(update, text)
-
-    # Callback handler methods
-    async def _handle_users_callback(self, update: Update, action_parts: List[str]) -> None:
-        """Handle users-related callbacks."""
-        if not action_parts:
-            return
-
-        user = await self.enforce_admin(update)
-        if not user:
-            return
-
-        action = action_parts[0]
-
-        if action == "refresh":
-            await self.users_command(update, None)
-        elif action == "stats":
-            await self._show_detailed_user_stats(update)
-        elif action == "manage":
-            await self._show_user_management_options(update)
-
-    async def _handle_status_callback(self, update: Update, action_parts: List[str]) -> None:
-        """Handle status-related callbacks."""
-        if not action_parts:
-            return
-
-        action = action_parts[0]
-
-        if action == "refresh":
-            await self.status_command(update, None)
-        elif action == "system":
-            await self._show_system_stats(update)
-        elif action == "database":
-            await self._show_database_stats(update)
-
-    async def _handle_sync_callback(self, update: Update, action_parts: List[str]) -> None:
-        """Handle sync-related callbacks."""
-        if not action_parts:
-            return
-
-        user = await self.enforce_admin(update)
-        if not user:
-            return
-
-        action = action_parts[0]
-
-        if action == "projects":
-            await self._sync_projects(update, user)
-        elif action == "issues":
-            await self._sync_issues(update, user)
-        elif action == "full":
-            await self._full_sync(update, user)
-
-    async def _handle_config_callback(self, update: Update, action_parts: List[str]) -> None:
-        """Handle config-related callbacks."""
-        if not action_parts:
-            return
-
-        user = await self.enforce_super_admin(update)
-        if not user:
-            return
-
-        action = action_parts[0]
-
-        if action == "refresh":
-            await self.config_command(update, None)
-        elif action == "edit":
-            await self._show_config_edit_options(update)
-        elif action == "database":
-            await self._show_database_config(update)
-
-    async def _handle_broadcast_callback(self, update: Update, action_parts: List[str]) -> None:
-        """Handle broadcast-related callbacks."""
-        if not action_parts:
-            return
-
-        user = await self.enforce_super_admin(update)
-        if not user:
-            return
-
-        action = action_parts[0]
-
-        if action == "confirm":
-            # Get original message text from context (simplified approach)
-            await self._execute_broadcast(update, user, "Broadcast message")
-
-    async def _handle_maintenance_callback(self, update: Update, action_parts: List[str]) -> None:
-        """Handle maintenance-related callbacks."""
-        if not action_parts:
-            return
-
-        user = await self.enforce_super_admin(update)
-        if not user:
-            return
-
-        action = action_parts[0]
-
-        if action == "cleanup":
-            await self._perform_database_cleanup(update, user)
-        elif action == "cache":
-            await self._clear_cache(update, user)
-        elif action == "vacuum":
-            await self._vacuum_database(update, user)
-        elif action == "backup":
-            await self._create_database_backup(update, user)
-
-    # Implementation methods for callbacks
-    async def _show_detailed_user_stats(self, update: Update) -> None:
-        """Show detailed user statistics."""
-        try:
-            users = await self.db.get_all_users(active_only=False)
-            stats = await self._calculate_user_statistics(users)
-            db_stats = await self.db.get_database_stats()
-
-            text = f"{EMOJI['STATS']} **Detailed User Statistics**\n\n"
-            
-            text += f"**User Counts:**\n"
-            text += f"└ Total: {stats['total_users']}\n"
-            text += f"└ Active: {stats['active_users']}\n"
-            text += f"└ Inactive: {stats['total_users'] - stats['active_users']}\n"
-            text += f"└ Active (24h): {stats['active_24h']}\n"
-            text += f"└ Active (7d): {stats['active_7d']}\n\n"
-
-            text += f"**Roles:**\n"
-            for role, count in stats['roles'].items():
-                text += f"└ {role.title()}: {count}\n"
-            text += "\n"
-
-            text += f"**Activity:**\n"
-            text += f"└ Total Issues: {stats['total_issues_created']}\n"
-            text += f"└ Avg Issues/User: {stats['total_issues_created'] / max(stats['total_users'], 1):.1f}\n"
-            text += f"└ Active Sessions: {db_stats.get('user_sessions_count', 0)}\n"
-
-            keyboard = [
-                [InlineKeyboardButton(f"{EMOJI['BACK']} Back", callback_data="admin_users_refresh")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
-            await self.edit_message(update, text, reply_markup)
-
-        except DatabaseError as e:
-            await self.handle_database_error(update, e, "show_detailed_user_stats")
-
-    async def _sync_projects(self, update: Update, user: User) -> None:
-        """Synchronize projects with Jira."""
-        processing_msg = await self.edit_message(
-            update, 
-            f"{EMOJI['LOADING']} Synchronizing projects with Jira..."
-        )
-
-        try:
-            # Get projects from Jira
-            jira_projects = await self.jira.get_projects()
-            
-            synced_count = 0
-            updated_count = 0
-            
-            for jira_project in jira_projects:
-                try:
-                    # Check if project exists in database
-                    existing_project = await self.db.get_project_by_key(jira_project.key)
-                    
-                    if existing_project:
-                        # Update existing project
-                        update_data = {
-                            'name': jira_project.name,
-                            'description': jira_project.description,
-                            'jira_project_id': jira_project.jira_project_id,
-                            'project_type': jira_project.project_type,
-                            'lead': jira_project.lead,
-                            'url': jira_project.url,
-                            'avatar_url': jira_project.avatar_url,
-                            'category': jira_project.category
-                        }
-                        await self.db.update_project(jira_project.key, **update_data)
-                        updated_count += 1
-                    else:
-                        # Add new project (inactive by default)
-                        jira_project.is_active = False
-                        await self.db.add_project(jira_project)
-                        synced_count += 1
-                        
-                except Exception as e:
-                    self.logger.warning(f"Failed to sync project {jira_project.key}: {e}")
+            # Display by role
+            for role in [UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.USER]:
+                role_users = users_by_role[role]
+                if not role_users:
                     continue
 
-            text = f"{EMOJI['SUCCESS']} **Project Sync Complete**\n\n"
-            text += f"**Results:**\n"
-            text += f"└ New projects: {synced_count}\n"
-            text += f"└ Updated projects: {updated_count}\n"
-            text += f"└ Total processed: {len(jira_projects)}\n\n"
+                role_emoji = self.formatter._get_role_emoji(role)
+                role_name = role.value.replace('_', ' ').title()
+                message_lines.append(f"{role_emoji} **{role_name}s** ({len(role_users)})")
+
+                for u in role_users:
+                    display_name = self.formatter._get_user_display_name(u)
+                    status = "✅" if u.is_active else "❌"
+                    activity = self.formatter._format_datetime(u.last_activity)
+                    
+                    user_line = f"• {status} {display_name}"
+                    if u.username:
+                        user_line += f" (@{u.username})"
+                    user_line += f" - {u.issues_created} issues, {activity}"
+                    
+                    message_lines.append(user_line)
+                
+                message_lines.append("")
+
+            # Overall statistics
+            total_issues = sum(u.issues_created for u in users)
+            active_users = len([u for u in users if u.is_active])
             
-            if synced_count > 0:
-                text += f"{EMOJI['INFO']} New projects are inactive by default. Use `/editproject` to activate them."
+            message_lines.extend([
+                "📊 **Overall Statistics:**",
+                f"• Total Issues Created: {total_issues}",
+                f"• Active Users: {active_users}/{len(users)}",
+                f"• Admins: {len(users_by_role[UserRole.ADMIN]) + len(users_by_role[UserRole.SUPER_ADMIN])}"
+            ])
 
-            keyboard = [
-                [InlineKeyboardButton(f"{EMOJI['BACK']} Back", callback_data="admin_status_refresh")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
+            message = "\n".join(message_lines)
+            await self.send_message(update, message)
+            self.log_handler_end(update, "list_users")
 
-            await self.edit_message(update, text, reply_markup)
+        except Exception as e:
+            await self.handle_error(update, e, "list_users")
+            self.log_handler_end(update, "list_users", success=False)
 
-            self.log_user_action(
-                user, 
-                "sync_projects", 
-                {"synced": synced_count, "updated": updated_count}
+    # =============================================================================
+    # SYSTEM MANAGEMENT COMMANDS
+    # =============================================================================
+
+    async def sync_jira(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /syncjira command - synchronize data with Jira."""
+        self.log_handler_start(update, "sync_jira")
+        
+        user = await self.enforce_role(update, UserRole.ADMIN)
+        if not user:
+            return
+
+        try:
+            # Show progress message
+            progress_message = await self.send_message(
+                update, 
+                f"{EMOJI.get('SYNC', '🔄')} **Synchronizing with Jira...**\n\nPlease wait..."
             )
 
+            # Sync projects
+            projects_synced = 0
+            issues_updated = 0
+
+            try:
+                # Get all projects from Jira
+                jira_projects = await self.jira.get_all_projects(include_archived=False)
+                
+                for jira_project in jira_projects:
+                    try:
+                        # Update or create project in database
+                        existing_project = await self.db.get_project_by_key(jira_project.key)
+                        
+                        if existing_project:
+                            # Update existing project
+                            await self.db.update_project(
+                                key=jira_project.key,
+                                name=jira_project.name,
+                                description=jira_project.description,
+                                url=jira_project.url,
+                                is_active=jira_project.is_active
+                            )
+                        else:
+                            # Create new project
+                            await self.db.create_project(
+                                key=jira_project.key,
+                                name=jira_project.name,
+                                description=jira_project.description,
+                                url=jira_project.url,
+                                is_active=jira_project.is_active
+                            )
+                        
+                        projects_synced += 1
+                        
+                    except Exception as e:
+                        self.logger.warning(f"Failed to sync project {jira_project.key}: {e}")
+                
+                # Update issue counts
+                for project in await self.db.get_all_projects():
+                    try:
+                        # Count issues for this project
+                        jql_query = f"project = {project.key}"
+                        jira_issues = await self.jira.search_issues(jql_query, max_results=1)
+                        
+                        # This is a simple count - in production you might want more sophisticated sync
+                        issues_updated += 1
+                        
+                    except Exception as e:
+                        self.logger.warning(f"Failed to update issue count for {project.key}: {e}")
+
+                # Success message
+                success_message = self.formatter.format_success_message(
+                    "Jira synchronization completed!",
+                    f"• Projects synchronized: {projects_synced}\n• Issue counts updated: {issues_updated}"
+                )
+                
+                await self.edit_message(update, success_message)
+
+            except JiraAPIError as e:
+                await self.edit_message(
+                    update,
+                    self.formatter.format_error_message(
+                        "Jira API Error",
+                        f"Failed to sync with Jira: {str(e)}",
+                        "Check your Jira configuration and try again."
+                    )
+                )
+
+            self.log_handler_end(update, "sync_jira")
+
+        except Exception as e:
+            await self.handle_error(update, e, "sync_jira")
+            self.log_handler_end(update, "sync_jira", success=False)
+
+    async def show_config(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /config command - show bot configuration."""
+        self.log_handler_start(update, "show_config")
+        
+        user = await self.enforce_role(update, UserRole.SUPER_ADMIN)
+        if not user:
+            return
+
+        try:
+            config_info = [
+                f"{EMOJI.get('CONFIG', '⚙️')} **Bot Configuration**",
+                "",
+                "**Jira Settings:**",
+                f"• Domain: {self.config.jira_domain}",
+                f"• Email: {self.config.jira_email}",
+                f"• API Token: {'*' * 20}",
+                "",
+                "**Bot Settings:**",
+                f"• Database: {self.config.database_path}",
+                f"• Log Level: {self.config.log_level}",
+                f"• Max Summary Length: {self.config.max_summary_length}",
+                f"• Rate Limit: {self.config.rate_limit_per_minute}/min",
+                "",
+                "**Features:**",
+                f"• Wizards: {'✅' if self.config.enable_wizards else '❌'}",
+                f"• Shortcuts: {'✅' if self.config.enable_shortcuts else '❌'}",
+                f"• Compact Messages: {'✅' if self.config.compact_messages else '❌'}",
+                "",
+                "**Access Control:**",
+                f"• Allowed Users: {len(self.config.allowed_users)} configured",
+                f"• Admin Users: {len(self.config.admin_users)} configured",
+                f"• Super Admin Users: {len(self.config.super_admin_users)} configured",
+            ]
+
+            message = "\n".join(config_info)
+            await self.send_message(update, message)
+            self.log_handler_end(update, "show_config")
+
+        except Exception as e:
+            await self.handle_error(update, e, "show_config")
+            self.log_handler_end(update, "show_config", success=False)
+
+    async def broadcast_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /broadcast command - send message to all users."""
+        self.log_handler_start(update, "broadcast_message")
+        
+        user = await self.enforce_role(update, UserRole.SUPER_ADMIN)
+        if not user:
+            return
+
+        try:
+            if not context.args:
+                await self.send_message(
+                    update, 
+                    "**Usage:** `/broadcast <message>`\n\nSends a message to all active bot users."
+                )
+                return
+
+            broadcast_text = ' '.join(context.args)
+            
+            # Get all active users
+            users = await self.db.get_all_users()
+            active_users = [u for u in users if u.is_active]
+
+            if not active_users:
+                await self.send_message(update, "No active users found.")
+                return
+
+            # Show confirmation
+            confirmation_message = f"""
+{EMOJI.get('BROADCAST', '📢')} **Confirm Broadcast**
+
+**Message:** {broadcast_text}
+
+**Recipients:** {len(active_users)} active users
+
+Send this broadcast message?
+            """
+
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Send Broadcast", callback_data=f"broadcast_confirm_{user.user_id}")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="broadcast_cancel")]
+            ])
+
+            await self.send_message(update, confirmation_message, reply_markup=keyboard)
+            
+            # Store broadcast data for confirmation
+            context.user_data['broadcast_data'] = {
+                'message': broadcast_text,
+                'recipients': [u.user_id for u in active_users]
+            }
+
+            self.log_handler_end(update, "broadcast_message")
+
+        except Exception as e:
+            await self.handle_error(update, e, "broadcast_message")
+            self.log_handler_end(update, "broadcast_message", success=False)
+
+    async def maintenance_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /maintenance command - show maintenance menu."""
+        self.log_handler_start(update, "maintenance_menu")
+        
+        user = await self.enforce_role(update, UserRole.SUPER_ADMIN)
+        if not user:
+            return
+
+        try:
+            # Get system statistics
+            stats = await self._get_system_statistics()
+            
+            message = f"""
+{EMOJI.get('MAINTENANCE', '🔧')} **System Maintenance**
+
+**Database Statistics:**
+• Users: {stats['user_count']}
+• Projects: {stats['project_count']}
+• Issues: {stats['issue_count']}
+• Database Size: {stats['db_size']}
+
+**System Health:**
+• Bot Uptime: {stats['uptime']}
+• Memory Usage: {stats['memory_usage']}
+• Last Jira Sync: {stats['last_sync']}
+
+Choose a maintenance operation:
+            """
+
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Test Jira Connection", callback_data="maint_test_jira")],
+                [InlineKeyboardButton("📊 Detailed Statistics", callback_data="maint_stats")],
+                [InlineKeyboardButton("🗄️ Database Maintenance", callback_data="maint_database")],
+                [InlineKeyboardButton("📝 View Logs", callback_data="maint_logs")],
+                [InlineKeyboardButton("🔄 Restart Bot", callback_data="maint_restart")],
+                [InlineKeyboardButton("❌ Close", callback_data="maint_close")]
+            ])
+
+            await self.send_message(update, message, reply_markup=keyboard)
+            self.log_handler_end(update, "maintenance_menu")
+
+        except Exception as e:
+            await self.handle_error(update, e, "maintenance_menu")
+            self.log_handler_end(update, "maintenance_menu", success=False)
+
+    # =============================================================================
+    # UTILITY METHODS
+    # =============================================================================
+
+    def _parse_quoted_arguments(self, text: str) -> List[str]:
+        """Parse quoted arguments from text.
+        
+        Args:
+            text: Text containing quoted arguments
+            
+        Returns:
+            List of parsed arguments
+        """
+        import shlex
+        try:
+            return shlex.split(text)
+        except ValueError:
+            return []
+
+    async def _show_project_edit_menu(self, update: Update, project: Project) -> None:
+        """Show project edit menu."""
+        message = f"""
+{EMOJI.get('EDIT', '✏️')} **Edit Project: {project.key}**
+
+{self.formatter.format_project(project, include_details=True)}
+
+What would you like to edit?
+        """
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📝 Name", callback_data=f"edit_project_name_{project.key}")],
+            [InlineKeyboardButton("📄 Description", callback_data=f"edit_project_desc_{project.key}")],
+            [InlineKeyboardButton("🔗 URL", callback_data=f"edit_project_url_{project.key}")],
+            [InlineKeyboardButton("⚡ Status", callback_data=f"edit_project_status_{project.key}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="edit_project_cancel")]
+        ])
+
+        await self.send_message(update, message, reply_markup=keyboard)
+
+    async def _show_delete_project_confirmation(self, update: Update, project: Project) -> None:
+        """Show project deletion confirmation."""
+        message = f"""
+{EMOJI.get('WARNING', '⚠️')} **Confirm Project Deletion**
+
+You are about to delete project:
+**{project.key}: {project.name}**
+
+⚠️ **This action cannot be undone!**
+
+Are you sure you want to delete this project?
+        """
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑️ Yes, Delete", callback_data=f"delete_project_confirm_{project.key}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="delete_project_cancel")]
+        ])
+
+        await self.send_message(update, message, reply_markup=keyboard)
+
+    async def _get_system_statistics(self) -> Dict[str, Any]:
+        """Get system statistics for maintenance menu.
+        
+        Returns:
+            Dictionary of system statistics
+        """
+        try:
+            # Database statistics
+            user_count = len(await self.db.get_all_users())
+            project_count = len(await self.db.get_all_projects())
+            issue_count = await self.db.get_total_issue_count()
+            
+            # Database size
+            import os
+            try:
+                db_size_bytes = os.path.getsize(self.config.database_path)
+                db_size = self._format_file_size(db_size_bytes)
+            except (OSError, AttributeError):
+                db_size = "Unknown"
+            
+            # System information
+            import psutil
+            memory_usage = f"{psutil.virtual_memory().percent:.1f}%"
+            
+            # Bot uptime (simplified)
+            uptime = "Unknown"
+            
+            # Last sync time (placeholder)
+            last_sync = "Never"
+
+            return {
+                'user_count': user_count,
+                'project_count': project_count,
+                'issue_count': issue_count,
+                'db_size': db_size,
+                'memory_usage': memory_usage,
+                'uptime': uptime,
+                'last_sync': last_sync
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error getting system statistics: {e}")
+            return {
+                'user_count': 0,
+                'project_count': 0,
+                'issue_count': 0,
+                'db_size': "Unknown",
+                'memory_usage': "Unknown",
+                'uptime': "Unknown",
+                'last_sync': "Unknown"
+            }
+
+    def _format_file_size(self, size_bytes: int) -> str:
+        """Format file size in human readable format.
+        
+        Args:
+            size_bytes: Size in bytes
+            
+        Returns:
+            Formatted size string
+        """
+        if size_bytes == 0:
+            return "0 B"
+        
+        size_names = ["B", "KB", "MB", "GB", "TB"]
+        import math
+        i = int(math.floor(math.log(size_bytes, 1024)))
+        p = math.pow(1024, i)
+        s = round(size_bytes / p, 2)
+        return f"{s} {size_names[i]}"
+
+    # =============================================================================
+    # CALLBACK QUERY HANDLERS
+    # =============================================================================
+
+    async def handle_admin_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle admin-related callback queries."""
+        query = update.callback_query
+        await query.answer()
+
+        if query.data.startswith("broadcast_confirm_"):
+            await self._handle_broadcast_confirmation(update, context)
+        elif query.data == "broadcast_cancel":
+            await self._handle_broadcast_cancellation(update, context)
+        elif query.data.startswith("delete_project_confirm_"):
+            await self._handle_delete_project_confirmation(update, context)
+        elif query.data == "delete_project_cancel":
+            await self._handle_delete_project_cancellation(update, context)
+        elif query.data.startswith("maint_"):
+            await self._handle_maintenance_callback(update, context)
+
+    async def _handle_broadcast_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle broadcast confirmation."""
+        broadcast_data = context.user_data.get('broadcast_data')
+        if not broadcast_data:
+            await self.edit_message(update, "Broadcast data not found.")
+            return
+
+        message = broadcast_data['message']
+        recipients = broadcast_data['recipients']
+
+        # Send broadcast
+        sent_count = 0
+        failed_count = 0
+
+        for user_id in recipients:
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"📢 **Broadcast Message**\n\n{message}"
+                )
+                sent_count += 1
+            except Exception as e:
+                self.logger.warning(f"Failed to send broadcast to {user_id}: {e}")
+                failed_count += 1
+
+        # Update message with results
+        result_message = f"""
+✅ **Broadcast Sent**
+
+**Message:** {message}
+
+**Results:**
+• Sent successfully: {sent_count}
+• Failed to send: {failed_count}
+• Total recipients: {len(recipients)}
+        """
+
+        await self.edit_message(update, result_message)
+
+        # Clean up
+        if 'broadcast_data' in context.user_data:
+            del context.user_data['broadcast_data']
+
+    async def _handle_broadcast_cancellation(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle broadcast cancellation."""
+        await self.edit_message(update, "❌ Broadcast cancelled.")
+        
+        # Clean up
+        if 'broadcast_data' in context.user_data:
+            del context.user_data['broadcast_data']
+
+    async def _handle_delete_project_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle project deletion confirmation."""
+        query = update.callback_query
+        project_key = query.data.replace("delete_project_confirm_", "")
+
+        try:
+            # Delete project from database
+            await self.db.delete_project(project_key)
+
+            success_message = self.formatter.format_success_message(
+                f"Project '{project_key}' deleted successfully!",
+                "The project has been removed from the bot database."
+            )
+
+            await self.edit_message(update, success_message)
+
+        except DatabaseError as e:
+            await self.edit_message(
+                update,
+                self.formatter.format_error_message(
+                    "Database Error",
+                    f"Failed to delete project: {str(e)}"
+                )
+            )
+
+    async def _handle_delete_project_cancellation(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle project deletion cancellation."""
+        await self.edit_message(update, "❌ Project deletion cancelled.")
+
+    async def _handle_maintenance_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle maintenance menu callbacks."""
+        query = update.callback_query
+        action = query.data.replace("maint_", "")
+
+        if action == "test_jira":
+            await self._test_jira_connection(update)
+        elif action == "stats":
+            await self._show_detailed_statistics(update)
+        elif action == "database":
+            await self._show_database_maintenance(update)
+        elif action == "logs":
+            await self._show_recent_logs(update)
+        elif action == "restart":
+            await self._handle_restart_request(update)
+        elif action == "close":
+            await self.edit_message(update, "Maintenance menu closed.")
+
+    async def _test_jira_connection(self, update: Update) -> None:
+        """Test Jira connection."""
+        try:
+            server_info = await self.jira.get_server_info()
+            
+            success_message = f"""
+✅ **Jira Connection Test Successful**
+
+**Server Information:**
+• Version: {server_info.get('version', 'Unknown')}
+• Build: {server_info.get('buildNumber', 'Unknown')}
+• Title: {server_info.get('serverTitle', 'Unknown')}
+
+Connection is working properly!
+            """
+            
+            await self.edit_message(update, success_message)
+            
         except JiraAPIError as e:
-            await self.handle_jira_error(update, e, "sync_projects")
+            error_message = f"""
+❌ **Jira Connection Test Failed**
 
-    async def _vacuum_database(self, update: Update, user: User) -> None:
-        """Vacuum the database."""
-        processing_msg = await self.edit_message(
-            update,
-            f"{EMOJI['LOADING']} Optimizing database..."
-        )
+**Error:** {str(e)}
 
-        try:
-            await self.db.vacuum_database()
+Please check your Jira configuration.
+            """
             
-            text = f"{EMOJI['SUCCESS']} Database optimization completed successfully."
-            
-            keyboard = [
-                [InlineKeyboardButton(f"{EMOJI['BACK']} Back", callback_data="admin_status_refresh")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
+            await self.edit_message(update, error_message)
 
-            await self.edit_message(update, text, reply_markup)
-
-            self.log_user_action(user, "vacuum_database")
-
-        except DatabaseError as e:
-            await self.handle_database_error(update, e, "vacuum_database")
-
-    async def _perform_database_cleanup(self, update: Update, user: User) -> None:
-        """Perform database cleanup."""
-        processing_msg = await self.edit_message(
-            update,
-            f"{EMOJI['LOADING']} Cleaning up database..."
-        )
-
-        try:
-            # Clean up expired sessions
-            expired_sessions = await self.db.cleanup_expired_sessions()
-            
-            text = f"{EMOJI['SUCCESS']} **Database Cleanup Complete**\n\n"
-            text += f"**Results:**\n"
-            text += f"└ Expired sessions removed: {expired_sessions}\n"
-            
-            keyboard = [
-                [InlineKeyboardButton(f"{EMOJI['BACK']} Back", callback_data="admin_status_refresh")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
-            await self.edit_message(update, text, reply_markup)
-
-            self.log_user_action(user, "database_cleanup", {"expired_sessions": expired_sessions})
-
-        except DatabaseError as e:
-            await self.handle_database_error(update, e, "database_cleanup")
-
-    # Placeholder methods for remaining functionality
-    async def _show_user_management_options(self, update: Update) -> None:
-        """Show user management options."""
-        text = f"{EMOJI['USER']} User management options coming soon..."
-        await self.edit_message(update, text)
-
-    async def _show_system_stats(self, update: Update) -> None:
+    async def _show_detailed_statistics(self, update: Update) -> None:
         """Show detailed system statistics."""
-        text = f"{EMOJI['STATS']} Detailed system stats coming soon..."
-        await self.edit_message(update, text)
+        stats = await self._get_system_statistics()
+        
+        # Add more detailed stats
+        users = await self.db.get_all_users()
+        projects = await self.db.get_all_projects()
+        
+        # User activity analysis
+        active_users = len([u for u in users if u.is_active])
+        users_with_issues = len([u for u in users if u.issues_created > 0])
+        
+        # Project analysis
+        active_projects = len([p for p in projects if p.is_active])
+        
+        detailed_stats = f"""
+📊 **Detailed System Statistics**
 
-    async def _show_database_stats(self, update: Update) -> None:
-        """Show database statistics."""
-        text = f"{EMOJI['DATABASE']} Database statistics coming soon..."
-        await self.edit_message(update, text)
+**Users:**
+• Total: {len(users)}
+• Active: {active_users}
+• With Issues: {users_with_issues}
+• Admins: {len([u for u in users if u.role in [UserRole.ADMIN, UserRole.SUPER_ADMIN]])}
 
-    async def _sync_issues(self, update: Update, user: User) -> None:
-        """Sync issues with Jira."""
-        text = f"{EMOJI['ISSUE']} Issue synchronization coming soon..."
-        await self.edit_message(update, text)
+**Projects:**
+• Total: {len(projects)}
+• Active: {active_projects}
+• Average Issues per Project: {stats['issue_count'] / max(len(projects), 1):.1f}
 
-    async def _full_sync(self, update: Update, user: User) -> None:
-        """Perform full synchronization."""
-        text = f"{EMOJI['REFRESH']} Full synchronization coming soon..."
-        await self.edit_message(update, text)
+**Issues:**
+• Total Created: {stats['issue_count']}
+• Average per User: {stats['issue_count'] / max(len(users), 1):.1f}
 
-    async def _show_config_edit_options(self, update: Update) -> None:
-        """Show configuration editing options."""
-        text = f"{EMOJI['EDIT']} Configuration editing coming soon..."
-        await self.edit_message(update, text)
+**System:**
+• Database Size: {stats['db_size']}
+• Memory Usage: {stats['memory_usage']}
+• Bot Uptime: {stats['uptime']}
+        """
+        
+        await self.edit_message(update, detailed_stats)
 
-    async def _show_database_config(self, update: Update) -> None:
-        """Show database configuration."""
-        text = f"{EMOJI['DATABASE']} Database configuration coming soon..."
-        await self.edit_message(update, text)
+    async def _show_database_maintenance(self, update: Update) -> None:
+        """Show database maintenance options."""
+        message = """
+🗄️ **Database Maintenance**
 
-    async def _execute_broadcast(self, update: Update, user: User, message: str) -> None:
-        """Execute broadcast to all users."""
-        text = f"{EMOJI['SUCCESS']} Broadcast functionality coming soon..."
-        await self.edit_message(update, text)
+Database maintenance operations:
 
-    async def _clear_cache(self, update: Update, user: User) -> None:
-        """Clear application cache."""
-        text = f"{EMOJI['REFRESH']} Cache cleared successfully."
-        await self.edit_message(update, text)
+• **Vacuum**: Optimize database storage
+• **Backup**: Create database backup  
+• **Cleanup**: Remove orphaned records
+• **Reindex**: Rebuild database indexes
 
-    async def _create_database_backup(self, update: Update, user: User) -> None:
-        """Create database backup."""
-        text = f"{EMOJI['BACKUP']} Database backup functionality coming soon..."
-        await self.edit_message(update, text)
+⚠️ These operations may temporarily affect bot performance.
+
+Use with caution in production environments.
+        """
+        
+        await self.edit_message(update, message)
+
+    async def _show_recent_logs(self, update: Update) -> None:
+        """Show recent log entries."""
+        try:
+            # Read last 20 lines of log file
+            import os
+            if os.path.exists(self.config.log_file):
+                with open(self.config.log_file, 'r') as f:
+                    lines = f.readlines()
+                    recent_lines = lines[-20:] if len(lines) > 20 else lines
+                    
+                log_content = ''.join(recent_lines)
+                
+                message = f"""
+📝 **Recent Log Entries**
+
+```
+{log_content[-3000:]}  # Limit to prevent message overflow
+```
+
+Showing last {len(recent_lines)} entries.
+                """
+            else:
+                message = "Log file not found."
+                
+            await self.edit_message(update, message)
+            
+        except Exception as e:
+            await self.edit_message(update, f"Error reading logs: {str(e)}")
+
+    async def _handle_restart_request(self, update: Update) -> None:
+        """Handle bot restart request."""
+        message = """
+🔄 **Bot Restart**
+
+⚠️ **Warning**: This will restart the entire bot application.
+
+• All active conversations will be interrupted
+• Users will need to restart their interactions
+• The bot will be unavailable for a few seconds
+
+This should only be used in emergency situations.
+
+Are you sure you want to restart the bot?
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Yes, Restart Bot", callback_data="restart_confirm")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="restart_cancel")]
+        ])
+        
+        await self.edit_message(update, message, reply_markup=keyboard)

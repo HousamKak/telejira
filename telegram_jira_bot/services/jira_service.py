@@ -969,3 +969,641 @@ class JiraService:
             raise
         except Exception as e:
             raise JiraAPIError(f"Failed to get server info: {e}")
+        
+    class JiraServiceExtensions:
+    """Extension methods for JiraService class."""
+    
+    async def get_project_by_key(self, project_key: str) -> Optional[Project]:
+        """Get project information by key.
+        
+        Args:
+            project_key: Project key to lookup
+            
+        Returns:
+            Project object if found, None otherwise
+            
+        Raises:
+            JiraAPIError: If API request fails
+        """
+        if not isinstance(project_key, str) or not project_key.strip():
+            raise ValueError("project_key must be a non-empty string")
+
+        try:
+            async with self._get_session() as session:
+                url = f"{self.base_url}/project/{quote(project_key)}"
+                
+                async with session.get(url, auth=self.auth) as response:
+                    if response.status == 404:
+                        return None
+                    
+                    await self._handle_response_errors(response)
+                    data = await response.json()
+                    
+                    return Project.from_jira_response(data)
+                    
+        except ClientError as e:
+            self.logger.error(f"Network error getting project {project_key}: {e}")
+            raise JiraAPIError(f"Network error: {e}")
+        except Exception as e:
+            self.logger.error(f"Error getting project {project_key}: {e}")
+            raise JiraAPIError(f"Failed to get project: {e}")
+
+    async def get_all_projects(self, include_archived: bool = False) -> List[Project]:
+        """Get all accessible projects.
+        
+        Args:
+            include_archived: Whether to include archived projects
+            
+        Returns:
+            List of Project objects
+            
+        Raises:
+            JiraAPIError: If API request fails
+        """
+        try:
+            async with self._get_session() as session:
+                url = f"{self.base_url}/project"
+                params = {}
+                
+                if not include_archived:
+                    params['expand'] = 'description,lead,issueTypes,url,projectKeys'
+                
+                if params:
+                    url += f"?{urlencode(params)}"
+                
+                async with session.get(url, auth=self.auth) as response:
+                    await self._handle_response_errors(response)
+                    data = await response.json()
+                    
+                    projects = []
+                    for project_data in data:
+                        try:
+                            if not include_archived and project_data.get('archived', False):
+                                continue
+                            
+                            project = Project.from_jira_response(project_data)
+                            projects.append(project)
+                        except (KeyError, ValueError) as e:
+                            self.logger.warning(f"Skipping invalid project data: {e}")
+                            continue
+                    
+                    return projects
+                    
+        except ClientError as e:
+            self.logger.error(f"Network error getting projects: {e}")
+            raise JiraAPIError(f"Network error: {e}")
+        except Exception as e:
+            self.logger.error(f"Error getting projects: {e}")
+            raise JiraAPIError(f"Failed to get projects: {e}")
+
+    async def search_issues(
+        self, 
+        jql_query: str,
+        max_results: int = 50,
+        start_at: int = 0,
+        fields: Optional[List[str]] = None
+    ) -> List[JiraIssue]:
+        """Search for issues using JQL.
+        
+        Args:
+            jql_query: JQL query string
+            max_results: Maximum number of results to return
+            start_at: Index to start results from
+            fields: Specific fields to retrieve
+            
+        Returns:
+            List of JiraIssue objects
+            
+        Raises:
+            JiraAPIError: If API request fails
+        """
+        if not isinstance(jql_query, str) or not jql_query.strip():
+            raise ValueError("jql_query must be a non-empty string")
+        
+        if not isinstance(max_results, int) or max_results <= 0:
+            raise ValueError("max_results must be a positive integer")
+        
+        if not isinstance(start_at, int) or start_at < 0:
+            raise ValueError("start_at must be a non-negative integer")
+
+        try:
+            async with self._get_session() as session:
+                url = f"{self.base_url}/search"
+                
+                payload = {
+                    'jql': jql_query,
+                    'maxResults': min(max_results, 100),  # Jira API limit
+                    'startAt': start_at,
+                    'fields': fields or [
+                        'summary', 'description', 'status', 'priority', 
+                        'issuetype', 'assignee', 'reporter', 'created', 
+                        'updated', 'labels', 'components', 'fixVersions',
+                        'resolution', 'resolutiondate', 'duedate'
+                    ]
+                }
+                
+                async with session.post(
+                    url, 
+                    json=payload, 
+                    auth=self.auth,
+                    headers={'Content-Type': 'application/json'}
+                ) as response:
+                    await self._handle_response_errors(response)
+                    data = await response.json()
+                    
+                    issues = []
+                    for issue_data in data.get('issues', []):
+                        try:
+                            issue = JiraIssue.from_jira_response(issue_data)
+                            issues.append(issue)
+                        except (KeyError, ValueError) as e:
+                            self.logger.warning(f"Skipping invalid issue data: {e}")
+                            continue
+                    
+                    return issues
+                    
+        except ClientError as e:
+            self.logger.error(f"Network error searching issues: {e}")
+            raise JiraAPIError(f"Network error: {e}")
+        except Exception as e:
+            self.logger.error(f"Error searching issues: {e}")
+            raise JiraAPIError(f"Failed to search issues: {e}")
+
+    async def get_issue_by_key(self, issue_key: str) -> Optional[JiraIssue]:
+        """Get issue by key.
+        
+        Args:
+            issue_key: Issue key (e.g., 'PROJ-123')
+            
+        Returns:
+            JiraIssue object if found, None otherwise
+            
+        Raises:
+            JiraAPIError: If API request fails
+        """
+        if not isinstance(issue_key, str) or not issue_key.strip():
+            raise ValueError("issue_key must be a non-empty string")
+
+        try:
+            async with self._get_session() as session:
+                url = f"{self.base_url}/issue/{quote(issue_key)}"
+                
+                async with session.get(url, auth=self.auth) as response:
+                    if response.status == 404:
+                        return None
+                    
+                    await self._handle_response_errors(response)
+                    data = await response.json()
+                    
+                    return JiraIssue.from_jira_response(data)
+                    
+        except ClientError as e:
+            self.logger.error(f"Network error getting issue {issue_key}: {e}")
+            raise JiraAPIError(f"Network error: {e}")
+        except Exception as e:
+            self.logger.error(f"Error getting issue {issue_key}: {e}")
+            raise JiraAPIError(f"Failed to get issue: {e}")
+
+    async def update_issue(
+        self,
+        issue_key: str,
+        fields: Dict[str, Any],
+        update_history: bool = True
+    ) -> bool:
+        """Update issue fields.
+        
+        Args:
+            issue_key: Issue key to update
+            fields: Dictionary of fields to update
+            update_history: Whether to add to issue history
+            
+        Returns:
+            True if successful
+            
+        Raises:
+            JiraAPIError: If API request fails
+        """
+        if not isinstance(issue_key, str) or not issue_key.strip():
+            raise ValueError("issue_key must be a non-empty string")
+        
+        if not isinstance(fields, dict) or not fields:
+            raise ValueError("fields must be a non-empty dictionary")
+
+        try:
+            async with self._get_session() as session:
+                url = f"{self.base_url}/issue/{quote(issue_key)}"
+                
+                payload = {'fields': {}}
+                
+                # Convert common field updates
+                if 'summary' in fields:
+                    payload['fields']['summary'] = fields['summary']
+                
+                if 'description' in fields:
+                    payload['fields']['description'] = fields['description']
+                
+                if 'priority' in fields:
+                    if isinstance(fields['priority'], IssuePriority):
+                        payload['fields']['priority'] = {'name': fields['priority'].value}
+                    else:
+                        payload['fields']['priority'] = {'name': str(fields['priority'])}
+                
+                if 'assignee' in fields:
+                    if fields['assignee'] is None:
+                        payload['fields']['assignee'] = None
+                    else:
+                        payload['fields']['assignee'] = {'name': fields['assignee']}
+                
+                if 'labels' in fields:
+                    payload['fields']['labels'] = fields['labels']
+                
+                # Add any other custom fields
+                for key, value in fields.items():
+                    if key not in ['summary', 'description', 'priority', 'assignee', 'labels']:
+                        payload['fields'][key] = value
+                
+                async with session.put(
+                    url,
+                    json=payload,
+                    auth=self.auth,
+                    headers={'Content-Type': 'application/json'}
+                ) as response:
+                    await self._handle_response_errors(response)
+                    return True
+                    
+        except ClientError as e:
+            self.logger.error(f"Network error updating issue {issue_key}: {e}")
+            raise JiraAPIError(f"Network error: {e}")
+        except Exception as e:
+            self.logger.error(f"Error updating issue {issue_key}: {e}")
+            raise JiraAPIError(f"Failed to update issue: {e}")
+
+    async def add_comment(self, issue_key: str, comment_text: str) -> Optional[IssueComment]:
+        """Add comment to issue.
+        
+        Args:
+            issue_key: Issue key to comment on
+            comment_text: Comment text
+            
+        Returns:
+            IssueComment object if successful
+            
+        Raises:
+            JiraAPIError: If API request fails
+        """
+        if not isinstance(issue_key, str) or not issue_key.strip():
+            raise ValueError("issue_key must be a non-empty string")
+        
+        if not isinstance(comment_text, str) or not comment_text.strip():
+            raise ValueError("comment_text must be a non-empty string")
+
+        try:
+            async with self._get_session() as session:
+                url = f"{self.base_url}/issue/{quote(issue_key)}/comment"
+                
+                payload = {'body': comment_text}
+                
+                async with session.post(
+                    url,
+                    json=payload,
+                    auth=self.auth,
+                    headers={'Content-Type': 'application/json'}
+                ) as response:
+                    await self._handle_response_errors(response)
+                    data = await response.json()
+                    
+                    return IssueComment.from_jira_response(data)
+                    
+        except ClientError as e:
+            self.logger.error(f"Network error adding comment to {issue_key}: {e}")
+            raise JiraAPIError(f"Network error: {e}")
+        except Exception as e:
+            self.logger.error(f"Error adding comment to {issue_key}: {e}")
+            raise JiraAPIError(f"Failed to add comment: {e}")
+
+    async def get_issue_comments(self, issue_key: str) -> List[IssueComment]:
+        """Get comments for an issue.
+        
+        Args:
+            issue_key: Issue key to get comments for
+            
+        Returns:
+            List of IssueComment objects
+            
+        Raises:
+            JiraAPIError: If API request fails
+        """
+        if not isinstance(issue_key, str) or not issue_key.strip():
+            raise ValueError("issue_key must be a non-empty string")
+
+        try:
+            async with self._get_session() as session:
+                url = f"{self.base_url}/issue/{quote(issue_key)}/comment"
+                
+                async with session.get(url, auth=self.auth) as response:
+                    await self._handle_response_errors(response)
+                    data = await response.json()
+                    
+                    comments = []
+                    for comment_data in data.get('comments', []):
+                        try:
+                            comment = IssueComment.from_jira_response(comment_data)
+                            comments.append(comment)
+                        except (KeyError, ValueError) as e:
+                            self.logger.warning(f"Skipping invalid comment data: {e}")
+                            continue
+                    
+                    return comments
+                    
+        except ClientError as e:
+            self.logger.error(f"Network error getting comments for {issue_key}: {e}")
+            raise JiraAPIError(f"Network error: {e}")
+        except Exception as e:
+            self.logger.error(f"Error getting comments for {issue_key}: {e}")
+            raise JiraAPIError(f"Failed to get comments: {e}")
+
+    async def transition_issue(
+        self, 
+        issue_key: str, 
+        transition_id: str,
+        fields: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """Transition issue to new status.
+        
+        Args:
+            issue_key: Issue key to transition
+            transition_id: ID of transition to execute
+            fields: Optional fields to update during transition
+            
+        Returns:
+            True if successful
+            
+        Raises:
+            JiraAPIError: If API request fails
+        """
+        if not isinstance(issue_key, str) or not issue_key.strip():
+            raise ValueError("issue_key must be a non-empty string")
+        
+        if not isinstance(transition_id, str) or not transition_id.strip():
+            raise ValueError("transition_id must be a non-empty string")
+
+        try:
+            async with self._get_session() as session:
+                url = f"{self.base_url}/issue/{quote(issue_key)}/transitions"
+                
+                payload = {
+                    'transition': {'id': transition_id}
+                }
+                
+                if fields:
+                    payload['fields'] = fields
+                
+                async with session.post(
+                    url,
+                    json=payload,
+                    auth=self.auth,
+                    headers={'Content-Type': 'application/json'}
+                ) as response:
+                    await self._handle_response_errors(response)
+                    return True
+                    
+        except ClientError as e:
+            self.logger.error(f"Network error transitioning issue {issue_key}: {e}")
+            raise JiraAPIError(f"Network error: {e}")
+        except Exception as e:
+            self.logger.error(f"Error transitioning issue {issue_key}: {e}")
+            raise JiraAPIError(f"Failed to transition issue: {e}")
+
+    async def get_available_transitions(self, issue_key: str) -> List[Dict[str, Any]]:
+        """Get available transitions for an issue.
+        
+        Args:
+            issue_key: Issue key to get transitions for
+            
+        Returns:
+            List of transition dictionaries
+            
+        Raises:
+            JiraAPIError: If API request fails
+        """
+        if not isinstance(issue_key, str) or not issue_key.strip():
+            raise ValueError("issue_key must be a non-empty string")
+
+        try:
+            async with self._get_session() as session:
+                url = f"{self.base_url}/issue/{quote(issue_key)}/transitions"
+                
+                async with session.get(url, auth=self.auth) as response:
+                    await self._handle_response_errors(response)
+                    data = await response.json()
+                    
+                    return data.get('transitions', [])
+                    
+        except ClientError as e:
+            self.logger.error(f"Network error getting transitions for {issue_key}: {e}")
+            raise JiraAPIError(f"Network error: {e}")
+        except Exception as e:
+            self.logger.error(f"Error getting transitions for {issue_key}: {e}")
+            raise JiraAPIError(f"Failed to get transitions: {e}")
+
+    async def get_user_info(self, username: str) -> Optional[Dict[str, Any]]:
+        """Get user information by username.
+        
+        Args:
+            username: Username to lookup
+            
+        Returns:
+            User information dictionary if found
+            
+        Raises:
+            JiraAPIError: If API request fails
+        """
+        if not isinstance(username, str) or not username.strip():
+            raise ValueError("username must be a non-empty string")
+
+        try:
+            async with self._get_session() as session:
+                url = f"{self.base_url}/user"
+                params = {'username': username}
+                
+                async with session.get(url, params=params, auth=self.auth) as response:
+                    if response.status == 404:
+                        return None
+                    
+                    await self._handle_response_errors(response)
+                    return await response.json()
+                    
+        except ClientError as e:
+            self.logger.error(f"Network error getting user {username}: {e}")
+            raise JiraAPIError(f"Network error: {e}")
+        except Exception as e:
+            self.logger.error(f"Error getting user {username}: {e}")
+            raise JiraAPIError(f"Failed to get user info: {e}")
+
+    async def get_project_components(self, project_key: str) -> List[Dict[str, Any]]:
+        """Get components for a project.
+        
+        Args:
+            project_key: Project key
+            
+        Returns:
+            List of component dictionaries
+            
+        Raises:
+            JiraAPIError: If API request fails
+        """
+        if not isinstance(project_key, str) or not project_key.strip():
+            raise ValueError("project_key must be a non-empty string")
+
+        try:
+            async with self._get_session() as session:
+                url = f"{self.base_url}/project/{quote(project_key)}/components"
+                
+                async with session.get(url, auth=self.auth) as response:
+                    await self._handle_response_errors(response)
+                    return await response.json()
+                    
+        except ClientError as e:
+            self.logger.error(f"Network error getting components for {project_key}: {e}")
+            raise JiraAPIError(f"Network error: {e}")
+        except Exception as e:
+            self.logger.error(f"Error getting components for {project_key}: {e}")
+            raise JiraAPIError(f"Failed to get components: {e}")
+
+    async def get_project_versions(self, project_key: str) -> List[Dict[str, Any]]:
+        """Get versions for a project.
+        
+        Args:
+            project_key: Project key
+            
+        Returns:
+            List of version dictionaries
+            
+        Raises:
+            JiraAPIError: If API request fails
+        """
+        if not isinstance(project_key, str) or not project_key.strip():
+            raise ValueError("project_key must be a non-empty string")
+
+        try:
+            async with self._get_session() as session:
+                url = f"{self.base_url}/project/{quote(project_key)}/versions"
+                
+                async with session.get(url, auth=self.auth) as response:
+                    await self._handle_response_errors(response)
+                    return await response.json()
+                    
+        except ClientError as e:
+            self.logger.error(f"Network error getting versions for {project_key}: {e}")
+            raise JiraAPIError(f"Network error: {e}")
+        except Exception as e:
+            self.logger.error(f"Error getting versions for {project_key}: {e}")
+            raise JiraAPIError(f"Failed to get versions: {e}")
+
+    async def _handle_response_errors(self, response: aiohttp.ClientResponse) -> None:
+        """Handle HTTP response errors.
+        
+        Args:
+            response: HTTP response object
+            
+        Raises:
+            JiraAPIError: If response indicates an error
+        """
+        if response.status >= 400:
+            try:
+                error_data = await response.json()
+                error_message = error_data.get('errorMessages', [])
+                if error_message:
+                    message = '; '.join(error_message)
+                else:
+                    errors = error_data.get('errors', {})
+                    if errors:
+                        message = '; '.join([f"{k}: {v}" for k, v in errors.items()])
+                    else:
+                        message = f"HTTP {response.status}: {response.reason}"
+            except (ValueError, KeyError):
+                message = f"HTTP {response.status}: {response.reason}"
+            
+            raise JiraAPIError(message, status_code=response.status)
+
+    async def validate_jql(self, jql_query: str) -> Dict[str, Any]:
+        """Validate JQL query syntax.
+        
+        Args:
+            jql_query: JQL query to validate
+            
+        Returns:
+            Validation result dictionary
+            
+        Raises:
+            JiraAPIError: If API request fails
+        """
+        if not isinstance(jql_query, str):
+            raise ValueError("jql_query must be a string")
+
+        try:
+            async with self._get_session() as session:
+                url = f"{self.base_url}/jql/parse"
+                payload = {'queries': [jql_query]}
+                
+                async with session.post(
+                    url,
+                    json=payload,
+                    auth=self.auth,
+                    headers={'Content-Type': 'application/json'}
+                ) as response:
+                    await self._handle_response_errors(response)
+                    data = await response.json()
+                    
+                    if data.get('queries'):
+                        return data['queries'][0]
+                    
+                    return {'valid': False, 'errors': ['Invalid JQL query']}
+                    
+        except ClientError as e:
+            self.logger.error(f"Network error validating JQL: {e}")
+            raise JiraAPIError(f"Network error: {e}")
+        except Exception as e:
+            self.logger.error(f"Error validating JQL: {e}")
+            raise JiraAPIError(f"Failed to validate JQL: {e}")
+
+    async def get_server_info(self) -> Dict[str, Any]:
+        """Get Jira server information.
+        
+        Returns:
+            Server information dictionary
+            
+        Raises:
+            JiraAPIError: If API request fails
+        """
+        try:
+            async with self._get_session() as session:
+                url = f"{self.base_url}/serverInfo"
+                
+                async with session.get(url, auth=self.auth) as response:
+                    await self._handle_response_errors(response)
+                    return await response.json()
+                    
+        except ClientError as e:
+            self.logger.error(f"Network error getting server info: {e}")
+            raise JiraAPIError(f"Network error: {e}")
+        except Exception as e:
+            self.logger.error(f"Error getting server info: {e}")
+            raise JiraAPIError(f"Failed to get server info: {e}")
+
+    async def test_connection(self) -> bool:
+        """Test connection to Jira.
+        
+        Returns:
+            True if connection successful
+            
+        Raises:
+            JiraAPIError: If connection fails
+        """
+        try:
+            await self.get_server_info()
+            return True
+        except JiraAPIError:
+            raise
+        except Exception as e:
+            raise JiraAPIError(f"Connection test failed: {e}")    

@@ -1,744 +1,659 @@
 #!/usr/bin/env python3
 """
-Formatters for the Telegram-Jira bot.
+Message formatters for the Telegram-Jira bot.
 
-Contains utilities for formatting messages, text, and data for Telegram display.
+Contains formatting utilities for Telegram messages including issue formatting,
+project information, user data, and various bot responses.
 """
 
 import re
-from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Dict, Any, Union
+from datetime import datetime, timezone
+from typing import Optional, List, Dict, Any, Union, Tuple
 from urllib.parse import quote
 
-from ..models.project import Project, ProjectStats
-from ..models.issue import JiraIssue, IssueSearchResult
-from ..models.user import User, UserPreferences
-from ..models.enums import IssuePriority, IssueType, IssueStatus
-from .constants import EMOJI, MAX_MESSAGE_LENGTH, DATE_FORMATS
+from ..models.project import Project, ProjectSummary
+from ..models.issue import JiraIssue
+from ..models.user import User
+from ..models.enums import IssuePriority, IssueType, IssueStatus, UserRole
+from .constants import EMOJI, MAX_MESSAGE_LENGTH, MAX_SUMMARY_LENGTH
 
 
 class MessageFormatter:
-    """Formats messages and content for Telegram display."""
+    """Utility class for formatting Telegram messages."""
 
-    def __init__(self, compact_mode: bool = False, max_length: int = MAX_MESSAGE_LENGTH):
-        """Initialize the formatter.
+    def __init__(self, compact_mode: bool = False, use_emoji: bool = True):
+        """Initialize message formatter.
         
         Args:
             compact_mode: Whether to use compact formatting
-            max_length: Maximum message length
+            use_emoji: Whether to include emojis in messages
         """
         self.compact_mode = compact_mode
-        self.max_length = max_length
+        self.use_emoji = use_emoji
 
-    def format_project_summary(
-        self,
-        project: Project,
-        show_details: bool = True,
-        show_stats: bool = False,
-        user_default: Optional[str] = None
-    ) -> str:
-        """Format a single project summary.
+    def format_issue(self, issue: JiraIssue, include_description: bool = True) -> str:
+        """Format a Jira issue for display.
         
         Args:
-            project: Project to format
-            show_details: Whether to show detailed information
-            show_stats: Whether to show statistics
-            user_default: User's default project key for marking
+            issue: Jira issue to format
+            include_description: Whether to include description
             
         Returns:
-            Formatted project summary
+            Formatted issue message
         """
-        default_marker = f" {EMOJI['DEFAULT']}" if project.key == user_default else ""
-        status_emoji = EMOJI['ACTIVE'] if project.is_active else EMOJI['INACTIVE']
-        
-        if self.compact_mode:
-            text = f"{status_emoji} **{project.key}**{default_marker} - {project.name}"
-            if not project.is_active:
-                text += " (inactive)"
-            return text
-        
-        text = f"{status_emoji} **{project.key}**{default_marker}\n"
-        text += f"└ **{project.name}**\n"
-        
-        if show_details:
-            if project.description:
-                desc = self._truncate_text(project.description, 100)
-                text += f"└ _{desc}_\n"
-            
-            if project.lead:
-                text += f"└ {EMOJI['USER']} Lead: {project.lead}\n"
-            
-            if project.category:
-                text += f"└ {EMOJI['TAG']} Category: {project.category}\n"
-            
-            if project.url:
-                text += f"└ {EMOJI['LINK']} [View in Jira]({project.url})\n"
-        
-        if show_stats and project.issue_count > 0:
-            text += f"└ {EMOJI['ISSUE']} Issues: {project.issue_count}\n"
-        
-        return text
+        if not isinstance(issue, JiraIssue):
+            raise TypeError("issue must be a JiraIssue instance")
 
-    def format_project_list(
-        self,
-        projects: List[Project],
-        title: str = "Projects",
-        user_default: Optional[str] = None,
-        show_details: bool = True,
-        page_info: Optional[Dict[str, int]] = None
-    ) -> str:
-        """Format a list of projects.
-        
-        Args:
-            projects: List of projects to format
-            title: Title for the list
-            user_default: User's default project key
-            show_details: Whether to show project details
-            page_info: Optional pagination info (current_page, total_pages, total_items)
-            
-        Returns:
-            Formatted project list
-        """
-        if not projects:
-            return f"{EMOJI['INFO']} No projects found."
-        
-        # Header
-        header = f"{EMOJI['PROJECT']} **{title}"
-        if page_info:
-            header += f" (Page {page_info['current_page'] + 1}/{page_info['total_pages']}, {page_info['total_items']} total)"
-        else:
-            header += f" ({len(projects)})"
-        header += "**\n\n"
-        
-        # Project list
-        project_texts = []
-        for project in projects:
-            project_text = self.format_project_summary(
-                project, show_details=show_details, user_default=user_default
-            )
-            project_texts.append(project_text)
-        
-        content = header + "\n\n".join(project_texts)
-        
-        # Footer
-        if user_default:
-            content += f"\n\n{EMOJI['DEFAULT']} Your default: **{user_default}**"
-        else:
-            content += f"\n\n{EMOJI['INFO']} No default project set. Use `/setdefault` to choose one."
-        
-        return self._truncate_message(content)
+        # Build header with emojis
+        priority_emoji = issue.priority.get_emoji() if self.use_emoji else ""
+        type_emoji = issue.issue_type.get_emoji() if self.use_emoji else ""
+        status_emoji = issue.status.get_emoji() if self.use_emoji and issue.status else ""
 
-    def format_issue_summary(
-        self,
-        issue: JiraIssue,
-        show_project: bool = True,
-        show_description: bool = False,
-        show_details: bool = True,
-        max_description_length: int = 100
-    ) -> str:
-        """Format a single issue summary.
+        header_parts = []
+        if priority_emoji:
+            header_parts.append(f"{priority_emoji} {issue.priority.value}")
+        if type_emoji:
+            header_parts.append(f"{type_emoji} {issue.issue_type.value}")
+        if status_emoji and issue.status:
+            header_parts.append(f"{status_emoji} {issue.status.value}")
+
+        header = " • ".join(header_parts) if header_parts else ""
+
+        # Format main content
+        lines = []
         
-        Args:
-            issue: Issue to format
-            show_project: Whether to show project information
-            show_description: Whether to show description
-            show_details: Whether to show detailed information
-            max_description_length: Maximum description length
+        # Title line
+        title_line = f"**{issue.key}: {self._truncate_text(issue.summary, MAX_SUMMARY_LENGTH)}**"
+        lines.append(title_line)
+        
+        # Header line with priority, type, status
+        if header and not self.compact_mode:
+            lines.append(header)
+        
+        # Project and assignee info
+        info_parts = []
+        if issue.project_key:
+            info_parts.append(f"📋 Project: {issue.project_key}")
+        if issue.assignee:
+            assignee_emoji = EMOJI.get('USER', '👤') if self.use_emoji else ""
+            info_parts.append(f"{assignee_emoji} Assignee: {issue.assignee}")
+        if issue.reporter:
+            reporter_emoji = EMOJI.get('REPORTER', '📝') if self.use_emoji else ""
+            info_parts.append(f"{reporter_emoji} Reporter: {issue.reporter}")
+        
+        if info_parts and not self.compact_mode:
+            lines.append(" • ".join(info_parts))
+
+        # Description
+        if include_description and issue.description and not self.compact_mode:
+            description = self._truncate_text(issue.description, 300)
+            lines.append(f"📄 Description: {description}")
+
+        # Additional details for non-compact mode
+        if not self.compact_mode:
+            details = []
             
-        Returns:
-            Formatted issue summary
-        """
-        priority_emoji = issue.priority.get_emoji()
-        type_emoji = issue.issue_type.get_emoji()
-        status_emoji = issue.status.get_emoji() if issue.status else ""
-        
-        if self.compact_mode:
-            text = f"{priority_emoji}{type_emoji} **{issue.key}**: {self._truncate_text(issue.summary, 50)}"
-            if show_project:
-                text += f" ({issue.project_key})"
-            return text
-        
-        # Main issue line
-        text = f"{priority_emoji} {type_emoji} **{issue.key}**: {issue.summary}\n"
-        
-        if show_project:
-            text += f"└ {EMOJI['PROJECT']} Project: {issue.project_key}\n"
-        
-        if show_details:
-            if issue.status:
-                text += f"└ {status_emoji} Status: {issue.status.value}\n"
-            
-            if issue.assignee:
-                text += f"└ {EMOJI['USER']} Assignee: {issue.assignee}\n"
-            
-            if issue.priority != IssuePriority.MEDIUM:  # Only show if not default
-                text += f"└ {priority_emoji} Priority: {issue.priority.value}\n"
-            
+            # Labels
             if issue.labels:
-                labels_text = ", ".join(issue.labels[:3])
-                if len(issue.labels) > 3:
-                    labels_text += f" (+{len(issue.labels) - 3} more)"
-                text += f"└ {EMOJI['LABEL']} Labels: {labels_text}\n"
+                labels_str = ", ".join(issue.labels[:5])  # Limit to 5 labels
+                if len(issue.labels) > 5:
+                    labels_str += f" (+{len(issue.labels) - 5} more)"
+                details.append(f"🏷️ Labels: {labels_str}")
             
+            # Components
+            if issue.components:
+                components_str = ", ".join(issue.components[:3])
+                if len(issue.components) > 3:
+                    components_str += f" (+{len(issue.components) - 3} more)"
+                details.append(f"🧩 Components: {components_str}")
+            
+            # Story points
+            if issue.story_points:
+                details.append(f"📊 Story Points: {issue.story_points}")
+            
+            # Due date
             if issue.due_date:
-                due_text = self._format_date(issue.due_date, 'SHORT')
-                if issue.is_overdue():
-                    due_text = f"{EMOJI['OVERDUE']} {due_text} (overdue)"
-                text += f"└ {EMOJI['CALENDAR']} Due: {due_text}\n"
+                due_str = self._format_datetime(issue.due_date)
+                is_overdue = issue.due_date < datetime.now(timezone.utc)
+                due_emoji = EMOJI.get('OVERDUE', '🚨') if is_overdue else EMOJI.get('DEADLINE', '📅')
+                details.append(f"{due_emoji} Due: {due_str}")
             
-            # Time tracking
-            time_summary = issue.get_time_estimates_summary()
-            if time_summary:
-                text += f"└ {EMOJI['CLOCK']} Time: {time_summary}\n"
-            
-            # Age
-            age_days = issue.get_age_days()
-            if age_days > 0:
-                text += f"└ {EMOJI['CLOCK']} Age: {age_days} days\n"
-        
-        if show_description and issue.description.strip():
-            desc = self._truncate_text(issue.description, max_description_length)
-            text += f"└ {EMOJI['MESSAGE']} {desc}\n"
-        
-        # Link to Jira
-        text += f"└ {EMOJI['LINK']} [View in Jira]({issue.url})\n"
-        
-        return text
+            if details:
+                lines.append(" • ".join(details))
 
-    def format_issue_list(
-        self,
-        issues: List[JiraIssue],
-        title: str = "Issues",
-        show_project: bool = True,
-        show_description: bool = False,
-        page_info: Optional[Dict[str, int]] = None
-    ) -> str:
-        """Format a list of issues.
+        # Timestamps
+        created_str = self._format_datetime(issue.created_at)
+        time_line = f"⏰ Created: {created_str}"
+        
+        if issue.updated_at and issue.updated_at != issue.created_at:
+            updated_str = self._format_datetime(issue.updated_at)
+            time_line += f" • Updated: {updated_str}"
+        
+        lines.append(time_line)
+
+        # URL
+        if issue.url:
+            lines.append(f"🔗 [View in Jira]({issue.url})")
+
+        return "\n".join(lines)
+
+    def format_issue_list(self, issues: List[JiraIssue], title: str = "Issues") -> str:
+        """Format a list of issues for display.
         
         Args:
             issues: List of issues to format
             title: Title for the list
-            show_project: Whether to show project information
-            show_description: Whether to show descriptions
-            page_info: Optional pagination info
             
         Returns:
-            Formatted issue list
+            Formatted issue list message
         """
+        if not isinstance(issues, list):
+            raise TypeError("issues must be a list")
+        
         if not issues:
-            return f"{EMOJI['INFO']} No issues found."
-        
-        # Header
-        header = f"{EMOJI['ISSUE']} **{title}"
-        if page_info:
-            header += f" (Page {page_info['current_page'] + 1}/{page_info['total_pages']}, {page_info['total_items']} total)"
-        else:
-            header += f" ({len(issues)})"
-        header += "**\n\n"
-        
-        # Issue list
-        issue_texts = []
-        for issue in issues:
-            issue_text = self.format_issue_summary(
-                issue,
-                show_project=show_project,
-                show_description=show_description,
-                show_details=not self.compact_mode
-            )
-            issue_texts.append(issue_text)
-        
-        content = header + "\n".join(issue_texts)
-        return self._truncate_message(content)
+            return f"📋 **{title}**\n\nNo issues found."
 
-    def format_search_results(self, search_result: IssueSearchResult) -> str:
-        """Format issue search results.
+        lines = [f"📋 **{title}** ({len(issues)} total)"]
+        lines.append("")
+
+        for i, issue in enumerate(issues[:20], 1):  # Limit to 20 issues
+            priority_emoji = issue.priority.get_emoji() if self.use_emoji else ""
+            type_emoji = issue.issue_type.get_emoji() if self.use_emoji else ""
+            
+            # Create compact issue line
+            issue_line = f"{i}. {priority_emoji}{type_emoji} **{issue.key}**: {self._truncate_text(issue.summary, 60)}"
+            
+            if issue.assignee and not self.compact_mode:
+                issue_line += f" (👤 {issue.assignee})"
+            
+            lines.append(issue_line)
+
+        if len(issues) > 20:
+            lines.append(f"\n... and {len(issues) - 20} more issues")
+
+        return "\n".join(lines)
+
+    def format_project(self, project: Project, include_details: bool = True) -> str:
+        """Format a project for display.
         
         Args:
-            search_result: Search result object
+            project: Project to format
+            include_details: Whether to include detailed information
             
         Returns:
-            Formatted search results
+            Formatted project message
         """
-        if not search_result.has_results():
-            query_text = f" for '{search_result.search_query}'" if search_result.search_query else ""
-            return f"{EMOJI['SEARCH']} No issues found{query_text}."
-        
-        # Header with search info
-        header = f"{EMOJI['SEARCH']} **Search Results**\n\n"
-        header += f"**Query:** {search_result.search_query or 'All issues'}\n"
-        
-        if search_result.filters_applied:
-            filter_parts = []
-            for key, value in search_result.filters_applied.items():
-                filter_parts.append(f"{key}: {value}")
-            header += f"**Filters:** {', '.join(filter_parts)}\n"
-        
-        header += f"**Found:** {len(search_result.issues)} of {search_result.total_count} issues\n\n"
-        
-        # Issue list
-        issue_texts = []
-        for issue in search_result.issues:
-            issue_text = self.format_issue_summary(
-                issue, show_project=True, show_details=not self.compact_mode
-            )
-            issue_texts.append(issue_text)
-        
-        content = header + "\n".join(issue_texts)
-        return self._truncate_message(content)
+        if not isinstance(project, Project):
+            raise TypeError("project must be a Project instance")
 
-    def format_user_profile(
-        self,
-        user: User,
-        preferences: Optional[UserPreferences] = None,
-        stats: Optional[Dict[str, Any]] = None
-    ) -> str:
-        """Format user profile information.
+        lines = []
+        
+        # Title with status
+        status_emoji = "✅" if project.is_active else "❌"
+        title = f"{status_emoji} **{project.key}: {project.name}**"
+        lines.append(title)
+
+        # Description
+        if project.description:
+            description = self._truncate_text(project.description, 200)
+            lines.append(f"📄 {description}")
+
+        if include_details:
+            # Project details
+            details = []
+            
+            if project.lead:
+                details.append(f"👤 Lead: {project.lead}")
+            
+            details.append(f"📊 Issues: {project.issue_count}")
+            details.append(f"🏷️ Type: {project.project_type.title()}")
+            
+            if details:
+                lines.append("")
+                lines.append(" • ".join(details))
+            
+            # Timestamps
+            created_str = self._format_datetime(project.created_at)
+            time_info = f"⏰ Created: {created_str}"
+            
+            if project.updated_at and project.updated_at != project.created_at:
+                updated_str = self._format_datetime(project.updated_at)
+                time_info += f" • Updated: {updated_str}"
+            
+            lines.append("")
+            lines.append(time_info)
+
+        # URL
+        if project.url:
+            lines.append("")
+            lines.append(f"🔗 [View in Jira]({project.url})")
+
+        return "\n".join(lines)
+
+    def format_project_list(self, projects: List[Union[Project, ProjectSummary]], title: str = "Projects") -> str:
+        """Format a list of projects for display.
+        
+        Args:
+            projects: List of projects to format
+            title: Title for the list
+            
+        Returns:
+            Formatted project list message
+        """
+        if not isinstance(projects, list):
+            raise TypeError("projects must be a list")
+        
+        if not projects:
+            return f"📋 **{title}**\n\nNo projects found."
+
+        lines = [f"📋 **{title}** ({len(projects)} total)"]
+        lines.append("")
+
+        for i, project in enumerate(projects, 1):
+            if isinstance(project, ProjectSummary):
+                status_emoji = "✅" if project.is_active else "❌"
+                project_line = f"{i}. {status_emoji} **{project.key}**: {project.name} ({project.issue_count} issues)"
+            elif isinstance(project, Project):
+                status_emoji = "✅" if project.is_active else "❌"
+                project_line = f"{i}. {status_emoji} **{project.key}**: {project.name} ({project.issue_count} issues)"
+            else:
+                continue
+            
+            lines.append(project_line)
+
+        return "\n".join(lines)
+
+    def format_user(self, user: User, include_stats: bool = True) -> str:
+        """Format user information for display.
         
         Args:
             user: User to format
-            preferences: User preferences
-            stats: Additional statistics
+            include_stats: Whether to include user statistics
             
         Returns:
-            Formatted user profile
+            Formatted user message
         """
-        text = f"{EMOJI['USER']} **User Profile**\n\n"
+        if not isinstance(user, User):
+            raise TypeError("user must be a User instance")
+
+        lines = []
         
-        # Basic info
-        text += f"**Name:** {user.get_display_name()}\n"
-        text += f"**ID:** `{user.user_id}`\n"
-        text += f"**Role:** {user.role.value.title()}\n"
+        # User header
+        display_name = self._get_user_display_name(user)
+        role_emoji = self._get_role_emoji(user.role)
         
+        header = f"{role_emoji} **{display_name}**"
+        if user.role != UserRole.USER:
+            header += f" ({user.role.value.replace('_', ' ').title()})"
+        
+        lines.append(header)
+
+        # User details
+        details = []
         if user.username:
-            text += f"**Username:** @{user.username}\n"
+            details.append(f"📱 @{user.username}")
         
-        # Status
-        status_emoji = EMOJI['ACTIVE'] if user.is_active else EMOJI['INACTIVE']
-        text += f"**Status:** {status_emoji} {'Active' if user.is_active else 'Inactive'}\n"
+        details.append(f"🆔 ID: {user.user_id}")
         
-        # Activity
-        text += f"\n{EMOJI['STATS']} **Activity**\n"
-        text += f"└ Issues Created: {user.issues_created}\n"
-        
-        days_since_joined = (datetime.now(timezone.utc) - user.created_at).days
-        days_since_activity = (datetime.now(timezone.utc) - user.last_activity).days
-        text += f"└ Member Since: {days_since_joined} days ago\n"
-        text += f"└ Last Active: {days_since_activity} days ago\n"
+        if user.preferred_language:
+            details.append(f"🌐 Language: {user.preferred_language}")
         
         if user.timezone:
-            text += f"└ Timezone: {user.timezone}\n"
+            details.append(f"🕐 Timezone: {user.timezone}")
         
-        # Additional stats
-        if stats:
-            if stats.get('recent_issues_count', 0) > 0:
-                text += f"└ Recent Issues: {stats['recent_issues_count']}\n"
-        
-        # Preferences
-        if preferences:
-            text += f"\n{EMOJI['SETTINGS']} **Preferences**\n"
-            text += f"└ Default Project: {preferences.default_project_key or 'None'}\n"
-            text += f"└ Default Priority: {preferences.default_priority.get_emoji()} {preferences.default_priority.value}\n"
-            text += f"└ Default Type: {preferences.default_issue_type.get_emoji()} {preferences.default_issue_type.value}\n"
-            text += f"└ Notifications: {'✅' if preferences.notifications_enabled else '❌'}\n"
-            text += f"└ Quick Create: {'✅' if preferences.quick_create_mode else '❌'}\n"
-        
-        return text
+        if details:
+            lines.append(" • ".join(details))
 
-    def format_project_stats(self, stats: ProjectStats) -> str:
-        """Format project statistics.
-        
-        Args:
-            stats: Project statistics
+        if include_stats:
+            # Statistics
+            stats = []
+            if user.issues_created > 0:
+                stats.append(f"📊 Issues Created: {user.issues_created}")
             
-        Returns:
-            Formatted statistics
-        """
-        text = f"{EMOJI['STATS']} **{stats.project_key} Statistics**\n\n"
-        text += f"**Total Issues:** {stats.total_issues}\n"
-        
-        if stats.issues_by_type:
-            text += f"\n**By Type:**\n"
-            for issue_type, count in stats.issues_by_type.items():
-                try:
-                    emoji = IssueType.from_string(issue_type).get_emoji()
-                except (ValueError, AttributeError):
-                    emoji = EMOJI['ISSUE']
-                text += f"└ {emoji} {issue_type}: {count}\n"
-        
-        if stats.issues_by_priority:
-            text += f"\n**By Priority:**\n"
-            for priority, count in stats.issues_by_priority.items():
-                try:
-                    emoji = IssuePriority.from_string(priority).get_emoji()
-                except (ValueError, AttributeError):
-                    emoji = EMOJI['PRIORITY_MEDIUM']
-                text += f"└ {emoji} {priority}: {count}\n"
-        
-        if stats.issues_by_status:
-            text += f"\n**By Status:**\n"
-            for status, count in stats.issues_by_status.items():
-                try:
-                    emoji = IssueStatus.from_string(status).get_emoji()
-                except (ValueError, AttributeError):
-                    emoji = EMOJI['INFO']
-                text += f"└ {emoji} {status}: {count}\n"
-        
-        text += f"\n**Activity:**\n"
-        text += f"└ {EMOJI['CALENDAR']} This month: {stats.created_this_month}\n"
-        text += f"└ {EMOJI['CALENDAR']} This week: {stats.created_this_week}\n"
-        
-        if stats.last_activity:
-            activity_date = self._format_date(stats.last_activity, 'MEDIUM')
-            text += f"└ {EMOJI['CLOCK']} Last activity: {activity_date}\n"
-        
-        return text
+            # Activity status
+            activity_str = self._format_datetime(user.last_activity)
+            stats.append(f"⏰ Last Active: {activity_str}")
+            
+            # Account status
+            status = "✅ Active" if user.is_active else "❌ Inactive"
+            stats.append(f"🔐 Status: {status}")
+            
+            if stats:
+                lines.append("")
+                lines.append(" • ".join(stats))
 
-    def format_help_text(
-        self,
-        user_role: str = "user",
-        show_shortcuts: bool = True,
-        show_examples: bool = True,
-        sections: Optional[List[str]] = None
-    ) -> str:
-        """Format help text based on user role and preferences.
-        
-        Args:
-            user_role: User's role (user, admin, super_admin)
-            show_shortcuts: Whether to show command shortcuts
-            show_examples: Whether to show usage examples
-            sections: Specific sections to include
-            
-        Returns:
-            Formatted help text
-        """
-        text = f"{EMOJI['HELP']} **Telegram-Jira Bot Help**\n\n"
-        
-        all_sections = ['basic', 'issues', 'examples', 'admin', 'shortcuts', 'tips']
-        if sections:
-            sections_to_show = [s for s in sections if s in all_sections]
-        else:
-            sections_to_show = all_sections
-        
-        if 'basic' in sections_to_show:
-            text += f"{EMOJI['COMMAND']} **Basic Commands**\n"
-            text += "• `/start` - Welcome message and setup\n"
-            text += "• `/help` - Show this help message\n"
-            text += "• `/status` - Bot status and your statistics\n"
-            text += "• `/projects` - List available projects\n"
-            text += "• `/setdefault <KEY>` - Set your default project\n"
-            text += "• `/preferences` - Configure your preferences\n\n"
-        
-        if 'issues' in sections_to_show:
-            text += f"{EMOJI['ISSUE']} **Issue Management**\n"
-            text += "• `/create` - Interactive issue creation\n"
-            text += "• `/myissues` - Your recent issues\n"
-            text += "• `/listissues` - List all issues\n"
-            text += "• `/searchissues <query>` - Search issues\n"
-            text += "• Send any message - Create issue in default project\n\n"
-        
-        if 'examples' in sections_to_show and show_examples:
-            text += f"{EMOJI['MAGIC']} **Quick Create Examples**\n"
-            text += "• `Login button not working` → Medium Task\n"
-            text += "• `HIGH BUG App crashes on startup` → High Bug\n"
-            text += "• `STORY User wants export feature` → Medium Story\n"
-            text += "• `LOWEST IMPROVEMENT Add dark mode` → Lowest Improvement\n\n"
-        
-        if 'admin' in sections_to_show and user_role in ["admin", "super_admin"]:
-            text += f"{EMOJI['ADMIN']} **Admin Commands**\n"
-            text += "• `/addproject <KEY> <Name> [Description]` - Add project\n"
-            text += "• `/editproject <KEY>` - Edit project\n"
-            text += "• `/deleteproject <KEY>` - Delete project\n"
-            text += "• `/users` - List users and statistics\n"
-            text += "• `/syncjira` - Sync data with Jira\n\n"
-        
-        if 'shortcuts' in sections_to_show and show_shortcuts:
-            text += f"{EMOJI['SHORTCUT']} **Command Shortcuts**\n"
-            text += "• `/p` → `/projects`\n"
-            text += "• `/c` → `/create`\n"
-            text += "• `/mi` → `/myissues`\n"
-            text += "• `/s` → `/status`\n"
-            text += "• `/w` → `/wizard`\n"
-            
-            if user_role in ["admin", "super_admin"]:
-                text += "• `/ap` → `/addproject`\n"
-                text += "• `/u` → `/users`\n"
-            text += "\n"
-        
-        if 'tips' in sections_to_show:
-            text += f"{EMOJI['TIP']} **Tips**\n"
-            text += "• Use `/wizard` for step-by-step guidance\n"
-            text += "• Set a default project for quick issue creation\n"
-            text += "• Use priority/type prefixes (HIGH BUG, STORY, etc.)\n"
-            text += "• All issues are linked to your Telegram account\n"
-            text += "• Use inline keyboards for easier navigation\n"
-        
-        return self._truncate_message(text)
+        # Join date
+        joined_str = self._format_datetime(user.created_at)
+        lines.append("")
+        lines.append(f"📅 Joined: {joined_str}")
 
-    def format_status_message(
-        self,
-        jira_connected: bool,
-        db_connected: bool,
-        user_stats: Optional[Dict[str, Any]] = None,
-        system_stats: Optional[Dict[str, Any]] = None
-    ) -> str:
-        """Format bot status message.
-        
-        Args:
-            jira_connected: Whether Jira is connected
-            db_connected: Whether database is connected
-            user_stats: User-specific statistics
-            system_stats: System-wide statistics
-            
-        Returns:
-            Formatted status message
-        """
-        text = f"{EMOJI['ROBOT']} **Bot Status**\n\n"
-        
-        # Connection status
-        text += f"**Connections:**\n"
-        jira_emoji = EMOJI['SUCCESS'] if jira_connected else EMOJI['ERROR']
-        text += f"└ {jira_emoji} Jira API: {'Connected' if jira_connected else 'Failed'}\n"
-        
-        db_emoji = EMOJI['SUCCESS'] if db_connected else EMOJI['ERROR']
-        text += f"└ {db_emoji} Database: {'Connected' if db_connected else 'Failed'}\n"
-        
-        # User stats
-        if user_stats:
-            text += f"\n**Your Statistics:**\n"
-            text += f"└ {EMOJI['ISSUE']} Issues Created: {user_stats.get('issues_created', 0)}\n"
-            text += f"└ {EMOJI['PROJECT']} Default Project: {user_stats.get('default_project', 'None')}\n"
-            
-            if user_stats.get('recent_issues'):
-                text += f"└ {EMOJI['CLOCK']} Recent Issues: {len(user_stats['recent_issues'])}\n"
-        
-        # System stats
-        if system_stats:
-            text += f"\n**System Statistics:**\n"
-            text += f"└ {EMOJI['USER']} Total Users: {system_stats.get('total_users', 0)}\n"
-            text += f"└ {EMOJI['PROJECT']} Total Projects: {system_stats.get('total_projects', 0)}\n"
-            text += f"└ {EMOJI['ISSUE']} Total Issues: {system_stats.get('total_issues', 0)}\n"
-            
-            if system_stats.get('active_users_24h'):
-                text += f"└ {EMOJI['ACTIVE']} Active (24h): {system_stats['active_users_24h']}\n"
-        
-        # Timestamp
-        current_time = self._format_date(datetime.now(timezone.utc), 'MEDIUM')
-        text += f"\n{EMOJI['CLOCK']} Last updated: {current_time}"
-        
-        return text
+        return "\n".join(lines)
 
-    def format_error_message(
-        self,
-        error_type: str,
-        error_message: str,
-        include_help: bool = True,
-        include_support: bool = False
-    ) -> str:
-        """Format error message with consistent styling.
+    def format_error_message(self, error_type: str, message: str, suggestion: Optional[str] = None) -> str:
+        """Format an error message.
         
         Args:
             error_type: Type of error
-            error_message: Error message text
-            include_help: Whether to include help text
-            include_support: Whether to include support information
+            message: Error message
+            suggestion: Optional suggestion for fixing the error
             
         Returns:
             Formatted error message
         """
-        text = f"{EMOJI['ERROR']} **Error**\n\n"
-        text += f"**Type:** {error_type}\n"
-        text += f"**Message:** {error_message}\n"
+        error_emoji = EMOJI.get('ERROR', '❌') if self.use_emoji else ""
         
-        if include_help:
-            text += f"\n{EMOJI['TIP']} Type `/help` for assistance."
+        lines = [f"{error_emoji} **Error**: {message}"]
         
-        if include_support:
-            text += f"\n{EMOJI['USER']} Contact an administrator if the problem persists."
+        if suggestion:
+            lines.append("")
+            lines.append(f"💡 **Suggestion**: {suggestion}")
         
-        return text
+        return "\n".join(lines)
 
-    def format_success_message(
-        self,
-        action: str,
-        details: Optional[str] = None,
-        next_steps: Optional[str] = None
-    ) -> str:
-        """Format success message with consistent styling.
+    def format_success_message(self, message: str, details: Optional[str] = None) -> str:
+        """Format a success message.
         
         Args:
-            action: Action that was successful
-            details: Optional details about the success
-            next_steps: Optional next steps or suggestions
+            message: Success message
+            details: Optional additional details
             
         Returns:
             Formatted success message
         """
-        text = f"{EMOJI['SUCCESS']} **{action}**\n"
+        success_emoji = EMOJI.get('SUCCESS', '✅') if self.use_emoji else ""
+        
+        lines = [f"{success_emoji} **Success**: {message}"]
         
         if details:
-            text += f"\n{details}\n"
+            lines.append("")
+            lines.append(details)
         
-        if next_steps:
-            text += f"\n{EMOJI['TIP']} {next_steps}"
-        
-        return text
+        return "\n".join(lines)
 
-    def format_wizard_step(
-        self,
-        step_title: str,
-        step_description: str,
-        step_number: Optional[int] = None,
-        total_steps: Optional[int] = None,
-        current_data: Optional[Dict[str, Any]] = None
-    ) -> str:
-        """Format wizard step message.
+    def format_warning_message(self, message: str, details: Optional[str] = None) -> str:
+        """Format a warning message.
         
         Args:
-            step_title: Title of the current step
-            step_description: Description of what to do
-            step_number: Current step number
-            total_steps: Total number of steps
-            current_data: Current wizard data
+            message: Warning message
+            details: Optional additional details
             
         Returns:
-            Formatted wizard step message
+            Formatted warning message
         """
-        text = f"{EMOJI['WIZARD']} **Setup Wizard**\n\n"
+        warning_emoji = EMOJI.get('WARNING', '⚠️') if self.use_emoji else ""
         
-        if step_number and total_steps:
-            text += f"**Step {step_number} of {total_steps}**\n\n"
+        lines = [f"{warning_emoji} **Warning**: {message}"]
         
-        text += f"**{step_title}**\n\n"
-        text += f"{step_description}\n"
+        if details:
+            lines.append("")
+            lines.append(details)
         
-        if current_data:
-            text += f"\n**Current Selection:**\n"
-            for key, value in current_data.items():
-                if value:
-                    display_key = key.replace('_', ' ').title()
-                    text += f"└ {display_key}: {value}\n"
-        
-        return text
+        return "\n".join(lines)
 
-    # Private utility methods
-    def _truncate_text(self, text: str, max_length: int, suffix: str = "...") -> str:
-        """Truncate text to specified length."""
+    def format_help_message(self, commands: Dict[str, str], title: str = "Available Commands") -> str:
+        """Format a help message with commands.
+        
+        Args:
+            commands: Dictionary of command -> description
+            title: Title for the help message
+            
+        Returns:
+            Formatted help message
+        """
+        help_emoji = EMOJI.get('HELP', '❓') if self.use_emoji else ""
+        
+        lines = [f"{help_emoji} **{title}**"]
+        lines.append("")
+        
+        for command, description in commands.items():
+            lines.append(f"/{command} - {description}")
+        
+        return "\n".join(lines)
+
+    def format_statistics(self, stats: Dict[str, Any], title: str = "Statistics") -> str:
+        """Format statistics data.
+        
+        Args:
+            stats: Dictionary of statistics
+            title: Title for the statistics
+            
+        Returns:
+            Formatted statistics message
+        """
+        stats_emoji = EMOJI.get('STATS', '📊') if self.use_emoji else ""
+        
+        lines = [f"{stats_emoji} **{title}**"]
+        lines.append("")
+        
+        for key, value in stats.items():
+            # Format the key nicely
+            formatted_key = key.replace('_', ' ').title()
+            lines.append(f"• **{formatted_key}**: {value}")
+        
+        return "\n".join(lines)
+
+    def format_keyboard_options(self, options: List[Tuple[str, str]], title: str = "Options") -> str:
+        """Format options for inline keyboard.
+        
+        Args:
+            options: List of (display_text, callback_data) tuples
+            title: Title for the options
+            
+        Returns:
+            Formatted options message
+        """
+        lines = [f"**{title}**"]
+        lines.append("")
+        lines.append("Please select an option:")
+        
+        return "\n".join(lines)
+
+    def _truncate_text(self, text: str, max_length: int) -> str:
+        """Truncate text to specified length.
+        
+        Args:
+            text: Text to truncate
+            max_length: Maximum length
+            
+        Returns:
+            Truncated text
+        """
+        if not isinstance(text, str):
+            return str(text)
+        
         if len(text) <= max_length:
             return text
-        return text[:max_length - len(suffix)] + suffix
-
-    def _truncate_message(self, text: str) -> str:
-        """Truncate message to maximum allowed length."""
-        if len(text) <= self.max_length:
-            return text
         
-        truncated = text[:self.max_length - 20]  # Leave room for truncation notice
-        truncated += f"\n\n{EMOJI['WARNING']} Message truncated..."
-        return truncated
+        return text[:max_length - 3] + "..."
 
-    def _format_date(
-        self,
-        date: datetime,
-        format_type: str = 'MEDIUM',
-        relative: bool = False
-    ) -> str:
+    def _format_datetime(self, dt: datetime) -> str:
         """Format datetime for display.
         
         Args:
-            date: Datetime to format
-            format_type: Format type (SHORT, MEDIUM, LONG, etc.)
-            relative: Whether to show relative time
+            dt: Datetime to format
             
         Returns:
-            Formatted date string
+            Formatted datetime string
         """
-        if relative:
-            now = datetime.now(timezone.utc)
-            diff = now - date
-            
-            if diff.days == 0:
-                if diff.seconds < 3600:  # Less than 1 hour
-                    minutes = diff.seconds // 60
-                    return f"{minutes} minutes ago" if minutes > 1 else "1 minute ago"
-                else:
-                    hours = diff.seconds // 3600
-                    return f"{hours} hours ago" if hours > 1 else "1 hour ago"
-            elif diff.days == 1:
-                return "yesterday"
-            elif diff.days < 7:
-                return f"{diff.days} days ago"
-            elif diff.days < 30:
-                weeks = diff.days // 7
-                return f"{weeks} weeks ago" if weeks > 1 else "1 week ago"
-            elif diff.days < 365:
-                months = diff.days // 30
-                return f"{months} months ago" if months > 1 else "1 month ago"
-            else:
-                years = diff.days // 365
-                return f"{years} years ago" if years > 1 else "1 year ago"
+        if not isinstance(dt, datetime):
+            return str(dt)
         
-        format_string = DATE_FORMATS.get(format_type, DATE_FORMATS['MEDIUM'])
-        return date.strftime(format_string)
+        # Convert to UTC if timezone-aware
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc)
+        
+        now = datetime.now(timezone.utc)
+        diff = now - dt
+        
+        # Format based on time difference
+        if diff.days == 0:
+            if diff.seconds < 3600:  # Less than 1 hour
+                minutes = diff.seconds // 60
+                return f"{minutes}m ago" if minutes > 0 else "just now"
+            else:  # Less than 1 day
+                hours = diff.seconds // 3600
+                return f"{hours}h ago"
+        elif diff.days == 1:
+            return "yesterday"
+        elif diff.days < 7:
+            return f"{diff.days} days ago"
+        elif diff.days < 30:
+            weeks = diff.days // 7
+            return f"{weeks} week{'s' if weeks > 1 else ''} ago"
+        elif diff.days < 365:
+            months = diff.days // 30
+            return f"{months} month{'s' if months > 1 else ''} ago"
+        else:
+            years = diff.days // 365
+            return f"{years} year{'s' if years > 1 else ''} ago"
 
-    def _escape_markdown(self, text: str) -> str:
-        """Escape special markdown characters for Telegram."""
-        # Characters that need escaping in Telegram MarkdownV2
-        special_chars = r'_*[]()~`>#+-=|{}.!'
+    def _get_user_display_name(self, user: User) -> str:
+        """Get display name for user.
         
-        for char in special_chars:
+        Args:
+            user: User object
+            
+        Returns:
+            Formatted display name
+        """
+        if user.first_name and user.last_name:
+            return f"{user.first_name} {user.last_name}"
+        elif user.first_name:
+            return user.first_name
+        elif user.username:
+            return f"@{user.username}"
+        else:
+            return f"User {user.user_id}"
+
+    def _get_role_emoji(self, role: UserRole) -> str:
+        """Get emoji for user role.
+        
+        Args:
+            role: User role
+            
+        Returns:
+            Role emoji
+        """
+        if not self.use_emoji:
+            return ""
+        
+        role_emojis = {
+            UserRole.USER: EMOJI.get('USER', '👤'),
+            UserRole.ADMIN: EMOJI.get('ADMIN', '🛡️'),
+            UserRole.SUPER_ADMIN: EMOJI.get('SUPER_ADMIN', '👑')
+        }
+        
+        return role_emojis.get(role, EMOJI.get('USER', '👤'))
+
+    def sanitize_markdown(self, text: str) -> str:
+        """Sanitize text for Markdown formatting.
+        
+        Args:
+            text: Text to sanitize
+            
+        Returns:
+            Sanitized text
+        """
+        if not isinstance(text, str):
+            return str(text)
+        
+        # Escape special Markdown characters
+        markdown_chars = ['*', '_', '`', '[', ']', '(', ')', '~', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+        
+        for char in markdown_chars:
             text = text.replace(char, f'\\{char}')
         
         return text
 
-    def _format_duration(self, minutes: int) -> str:
-        """Format duration in minutes to human readable format."""
-        if minutes < 60:
-            return f"{minutes}m"
-        elif minutes < 1440:  # Less than a day
-            hours = minutes // 60
-            remaining_minutes = minutes % 60
-            if remaining_minutes == 0:
-                return f"{hours}h"
+    def create_issue_url(self, base_url: str, issue_key: str) -> str:
+        """Create URL for Jira issue.
+        
+        Args:
+            base_url: Base Jira URL
+            issue_key: Issue key
+            
+        Returns:
+            Full issue URL
+        """
+        if not base_url.endswith('/'):
+            base_url += '/'
+        
+        return f"{base_url}browse/{quote(issue_key)}"
+
+    def create_project_url(self, base_url: str, project_key: str) -> str:
+        """Create URL for Jira project.
+        
+        Args:
+            base_url: Base Jira URL
+            project_key: Project key
+            
+        Returns:
+            Full project URL
+        """
+        if not base_url.endswith('/'):
+            base_url += '/'
+        
+        return f"{base_url}projects/{quote(project_key)}"
+
+    def format_jql_query(self, filters: Dict[str, Any]) -> str:
+        """Format filters into JQL query.
+        
+        Args:
+            filters: Dictionary of filter criteria
+            
+        Returns:
+            JQL query string
+        """
+        jql_parts = []
+        
+        if filters.get('project'):
+            jql_parts.append(f"project = {filters['project']}")
+        
+        if filters.get('assignee'):
+            jql_parts.append(f"assignee = '{filters['assignee']}'")
+        
+        if filters.get('reporter'):
+            jql_parts.append(f"reporter = '{filters['reporter']}'")
+        
+        if filters.get('status'):
+            jql_parts.append(f"status = '{filters['status']}'")
+        
+        if filters.get('priority'):
+            jql_parts.append(f"priority = '{filters['priority']}'")
+        
+        if filters.get('issue_type'):
+            jql_parts.append(f"issuetype = '{filters['issue_type']}'")
+        
+        if filters.get('labels'):
+            labels = filters['labels']
+            if isinstance(labels, list):
+                label_conditions = [f"labels = '{label}'" for label in labels]
+                jql_parts.append(f"({' OR '.join(label_conditions)})")
             else:
-                return f"{hours}h {remaining_minutes}m"
-        else:  # Days
-            days = minutes // 1440
-            remaining_hours = (minutes % 1440) // 60
-            if remaining_hours == 0:
-                return f"{days}d"
-            else:
-                return f"{days}d {remaining_hours}h"
+                jql_parts.append(f"labels = '{labels}'")
+        
+        if filters.get('created_after'):
+            jql_parts.append(f"created >= '{filters['created_after']}'")
+        
+        if filters.get('updated_after'):
+            jql_parts.append(f"updated >= '{filters['updated_after']}'")
+        
+        return ' AND '.join(jql_parts) if jql_parts else ""
 
-    def format_inline_mention(self, user: User) -> str:
-        """Format user mention for inline use."""
-        if user.username:
-            return f"@{user.username}"
-        else:
-            return f"[{user.get_display_name()}](tg://user?id={user.user_id})"
-
-    def format_code_block(self, code: str, language: str = "") -> str:
-        """Format text as code block."""
-        return f"```{language}\n{code}\n```"
-
-    def format_inline_code(self, code: str) -> str:
-        """Format text as inline code."""
-        return f"`{code}`"
-
-    def format_bold(self, text: str) -> str:
-        """Format text as bold."""
-        return f"**{text}**"
-
-    def format_italic(self, text: str) -> str:
-        """Format text as italic."""
-        return f"_{text}_"
-
-    def format_link(self, text: str, url: str) -> str:
-        """Format text as link."""
-        return f"[{text}]({url})"
-
-    def format_list(self, items: List[str], ordered: bool = False) -> str:
-        """Format list of items."""
-        if ordered:
-            return "\n".join([f"{i+1}. {item}" for i, item in enumerate(items)])
-        else:
-            return "\n".join([f"• {item}" for item in items])
+    def validate_message_length(self, message: str) -> str:
+        """Validate and truncate message if needed.
+        
+        Args:
+            message: Message to validate
+            
+        Returns:
+            Validated message
+        """
+        if len(message) <= MAX_MESSAGE_LENGTH:
+            return message
+        
+        # Truncate and add warning
+        truncated = message[:MAX_MESSAGE_LENGTH - 100]
+        truncated += "\n\n⚠️ Message truncated due to length limit."
+        
+        return truncated

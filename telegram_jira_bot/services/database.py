@@ -1041,3 +1041,969 @@ class DatabaseManager:
         except Exception as e:
             self.logger.error(f"Failed to vacuum database: {e}")
             raise DatabaseError(f"Failed to vacuum database: {e}")
+        
+
+
+class DatabaseManagerExtensions:
+    """Extension methods for DatabaseManager class."""
+
+    # =============================================================================
+    # PROJECT MANAGEMENT METHODS
+    # =============================================================================
+
+    async def get_all_active_projects(self) -> List[Project]:
+        """Get all active projects.
+        
+        Returns:
+            List of active Project objects
+            
+        Raises:
+            DatabaseError: If database operation fails
+        """
+        try:
+            async with self._get_connection() as conn:
+                cursor = await conn.execute("""
+                    SELECT key, name, description, url, created_at, updated_at,
+                           is_active, lead, project_type, avatar_url, issue_count
+                    FROM projects 
+                    WHERE is_active = 1
+                    ORDER BY name
+                """)
+                
+                rows = await cursor.fetchall()
+                projects = []
+                
+                for row in rows:
+                    try:
+                        project = Project(
+                            key=row[0],
+                            name=row[1],
+                            description=row[2] or "",
+                            url=row[3],
+                            created_at=datetime.fromisoformat(row[4]),
+                            updated_at=datetime.fromisoformat(row[5]) if row[5] else None,
+                            is_active=bool(row[6]),
+                            lead=row[7],
+                            project_type=row[8] or "software",
+                            avatar_url=row[9],
+                            issue_count=row[10] or 0
+                        )
+                        projects.append(project)
+                    except (ValueError, TypeError) as e:
+                        logging.warning(f"Skipping invalid project data for key {row[0]}: {e}")
+                        continue
+                
+                return projects
+                
+        except sqlite3.Error as e:
+            logging.error(f"Failed to get active projects: {e}")
+            raise DatabaseError(f"Failed to retrieve active projects: {e}")
+
+    async def get_all_projects(self) -> List[Project]:
+        """Get all projects (active and inactive).
+        
+        Returns:
+            List of all Project objects
+            
+        Raises:
+            DatabaseError: If database operation fails
+        """
+        try:
+            async with self._get_connection() as conn:
+                cursor = await conn.execute("""
+                    SELECT key, name, description, url, created_at, updated_at,
+                           is_active, lead, project_type, avatar_url, issue_count
+                    FROM projects 
+                    ORDER BY is_active DESC, name
+                """)
+                
+                rows = await cursor.fetchall()
+                projects = []
+                
+                for row in rows:
+                    try:
+                        project = Project(
+                            key=row[0],
+                            name=row[1],
+                            description=row[2] or "",
+                            url=row[3],
+                            created_at=datetime.fromisoformat(row[4]),
+                            updated_at=datetime.fromisoformat(row[5]) if row[5] else None,
+                            is_active=bool(row[6]),
+                            lead=row[7],
+                            project_type=row[8] or "software",
+                            avatar_url=row[9],
+                            issue_count=row[10] or 0
+                        )
+                        projects.append(project)
+                    except (ValueError, TypeError) as e:
+                        logging.warning(f"Skipping invalid project data for key {row[0]}: {e}")
+                        continue
+                
+                return projects
+                
+        except sqlite3.Error as e:
+            logging.error(f"Failed to get all projects: {e}")
+            raise DatabaseError(f"Failed to retrieve projects: {e}")
+
+    async def update_project(
+        self,
+        key: str,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        url: Optional[str] = None,
+        is_active: Optional[bool] = None,
+        lead: Optional[str] = None,
+        project_type: Optional[str] = None,
+        avatar_url: Optional[str] = None
+    ) -> bool:
+        """Update project information.
+        
+        Args:
+            key: Project key
+            name: New project name
+            description: New description
+            url: New URL
+            is_active: New active status
+            lead: New project lead
+            project_type: New project type
+            avatar_url: New avatar URL
+            
+        Returns:
+            True if project was updated
+            
+        Raises:
+            DatabaseError: If database operation fails
+        """
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("key must be a non-empty string")
+
+        try:
+            # Build dynamic update query
+            update_fields = []
+            values = []
+            
+            if name is not None:
+                update_fields.append("name = ?")
+                values.append(name)
+            
+            if description is not None:
+                update_fields.append("description = ?")
+                values.append(description)
+            
+            if url is not None:
+                update_fields.append("url = ?")
+                values.append(url)
+            
+            if is_active is not None:
+                update_fields.append("is_active = ?")
+                values.append(int(is_active))
+            
+            if lead is not None:
+                update_fields.append("lead = ?")
+                values.append(lead)
+            
+            if project_type is not None:
+                update_fields.append("project_type = ?")
+                values.append(project_type)
+            
+            if avatar_url is not None:
+                update_fields.append("avatar_url = ?")
+                values.append(avatar_url)
+
+            if not update_fields:
+                return False  # Nothing to update
+
+            # Always update the timestamp
+            update_fields.append("updated_at = ?")
+            values.append(datetime.now(timezone.utc).isoformat())
+            
+            # Add key for WHERE clause
+            values.append(key)
+
+            async with self._get_connection() as conn:
+                await conn.execute(f"""
+                    UPDATE projects 
+                    SET {', '.join(update_fields)}
+                    WHERE key = ?
+                """, values)
+                
+                await conn.commit()
+                return True
+                
+        except sqlite3.Error as e:
+            logging.error(f"Failed to update project {key}: {e}")
+            raise DatabaseError(f"Failed to update project: {e}")
+
+    async def delete_project(self, key: str) -> bool:
+        """Delete a project.
+        
+        Args:
+            key: Project key to delete
+            
+        Returns:
+            True if project was deleted
+            
+        Raises:
+            DatabaseError: If database operation fails
+        """
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("key must be a non-empty string")
+
+        try:
+            async with self._get_connection() as conn:
+                # Check if project has issues
+                cursor = await conn.execute(
+                    "SELECT COUNT(*) FROM issues WHERE project_key = ?",
+                    (key,)
+                )
+                issue_count = (await cursor.fetchone())[0]
+                
+                if issue_count > 0:
+                    raise DatabaseError(f"Cannot delete project with {issue_count} issues")
+                
+                # Delete project
+                cursor = await conn.execute(
+                    "DELETE FROM projects WHERE key = ?",
+                    (key,)
+                )
+                
+                await conn.commit()
+                return cursor.rowcount > 0
+                
+        except sqlite3.Error as e:
+            logging.error(f"Failed to delete project {key}: {e}")
+            raise DatabaseError(f"Failed to delete project: {e}")
+
+    async def get_project_issue_count(self, project_key: str) -> int:
+        """Get issue count for a project.
+        
+        Args:
+            project_key: Project key
+            
+        Returns:
+            Number of issues in the project
+            
+        Raises:
+            DatabaseError: If database operation fails
+        """
+        if not isinstance(project_key, str) or not project_key.strip():
+            raise ValueError("project_key must be a non-empty string")
+
+        try:
+            async with self._get_connection() as conn:
+                cursor = await conn.execute(
+                    "SELECT COUNT(*) FROM issues WHERE project_key = ?",
+                    (project_key,)
+                )
+                row = await cursor.fetchone()
+                return row[0] if row else 0
+                
+        except sqlite3.Error as e:
+            logging.error(f"Failed to get issue count for project {project_key}: {e}")
+            raise DatabaseError(f"Failed to get issue count: {e}")
+
+    async def get_project_issue_statistics(self, project_key: str) -> Dict[str, int]:
+        """Get issue statistics by status for a project.
+        
+        Args:
+            project_key: Project key
+            
+        Returns:
+            Dictionary of status -> count
+            
+        Raises:
+            DatabaseError: If database operation fails
+        """
+        if not isinstance(project_key, str) or not project_key.strip():
+            raise ValueError("project_key must be a non-empty string")
+
+        try:
+            async with self._get_connection() as conn:
+                cursor = await conn.execute("""
+                    SELECT status, COUNT(*) as count
+                    FROM issues 
+                    WHERE project_key = ?
+                    GROUP BY status
+                    ORDER BY count DESC
+                """, (project_key,))
+                
+                rows = await cursor.fetchall()
+                stats = {}
+                
+                for row in rows:
+                    status = row[0] or "Unknown"
+                    count = row[1]
+                    stats[status] = count
+                
+                return stats
+                
+        except sqlite3.Error as e:
+            logging.error(f"Failed to get issue statistics for project {project_key}: {e}")
+            raise DatabaseError(f"Failed to get issue statistics: {e}")
+
+    # =============================================================================
+    # USER MANAGEMENT METHODS
+    # =============================================================================
+
+    async def get_all_users(self) -> List[User]:
+        """Get all users.
+        
+        Returns:
+            List of all User objects
+            
+        Raises:
+            DatabaseError: If database operation fails
+        """
+        try:
+            async with self._get_connection() as conn:
+                cursor = await conn.execute("""
+                    SELECT user_id, username, first_name, last_name, role,
+                           is_active, created_at, last_activity, issues_created,
+                           preferred_language, timezone
+                    FROM users 
+                    ORDER BY last_activity DESC
+                """)
+                
+                rows = await cursor.fetchall()
+                users = []
+                
+                for row in rows:
+                    try:
+                        user = User(
+                            user_id=row[0],
+                            username=row[1],
+                            first_name=row[2],
+                            last_name=row[3],
+                            role=UserRole(row[4]) if row[4] else UserRole.USER,
+                            is_active=bool(row[5]),
+                            created_at=datetime.fromisoformat(row[6]),
+                            last_activity=datetime.fromisoformat(row[7]),
+                            issues_created=row[8] or 0,
+                            preferred_language=row[9] or "en",
+                            timezone=row[10]
+                        )
+                        users.append(user)
+                    except (ValueError, TypeError) as e:
+                        logging.warning(f"Skipping invalid user data for ID {row[0]}: {e}")
+                        continue
+                
+                return users
+                
+        except sqlite3.Error as e:
+            logging.error(f"Failed to get all users: {e}")
+            raise DatabaseError(f"Failed to retrieve users: {e}")
+
+    async def update_user_activity(self, user_id: int) -> None:
+        """Update user's last activity timestamp.
+        
+        Args:
+            user_id: User ID to update
+            
+        Raises:
+            DatabaseError: If database operation fails
+        """
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("user_id must be a positive integer")
+
+        try:
+            async with self._get_connection() as conn:
+                await conn.execute("""
+                    UPDATE users 
+                    SET last_activity = ?
+                    WHERE user_id = ?
+                """, (
+                    datetime.now(timezone.utc).isoformat(),
+                    user_id
+                ))
+                
+                await conn.commit()
+                
+        except sqlite3.Error as e:
+            logging.error(f"Failed to update user activity for {user_id}: {e}")
+            raise DatabaseError(f"Failed to update user activity: {e}")
+
+    async def increment_user_issue_count(self, user_id: int) -> None:
+        """Increment user's issue creation count.
+        
+        Args:
+            user_id: User ID to update
+            
+        Raises:
+            DatabaseError: If database operation fails
+        """
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("user_id must be a positive integer")
+
+        try:
+            async with self._get_connection() as conn:
+                await conn.execute("""
+                    UPDATE users 
+                    SET issues_created = issues_created + 1,
+                        last_activity = ?
+                    WHERE user_id = ?
+                """, (
+                    datetime.now(timezone.utc).isoformat(),
+                    user_id
+                ))
+                
+                await conn.commit()
+                
+        except sqlite3.Error as e:
+            logging.error(f"Failed to increment issue count for user {user_id}: {e}")
+            raise DatabaseError(f"Failed to update user issue count: {e}")
+
+    async def set_user_role(self, user_id: int, role: UserRole) -> bool:
+        """Set user's role.
+        
+        Args:
+            user_id: User ID
+            role: New role
+            
+        Returns:
+            True if role was updated
+            
+        Raises:
+            DatabaseError: If database operation fails
+        """
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("user_id must be a positive integer")
+        
+        if not isinstance(role, UserRole):
+            raise TypeError("role must be a UserRole instance")
+
+        try:
+            async with self._get_connection() as conn:
+                cursor = await conn.execute("""
+                    UPDATE users 
+                    SET role = ?, last_activity = ?
+                    WHERE user_id = ?
+                """, (
+                    role.value,
+                    datetime.now(timezone.utc).isoformat(),
+                    user_id
+                ))
+                
+                await conn.commit()
+                return cursor.rowcount > 0
+                
+        except sqlite3.Error as e:
+            logging.error(f"Failed to set role for user {user_id}: {e}")
+            raise DatabaseError(f"Failed to set user role: {e}")
+
+    async def deactivate_user(self, user_id: int) -> bool:
+        """Deactivate a user.
+        
+        Args:
+            user_id: User ID to deactivate
+            
+        Returns:
+            True if user was deactivated
+            
+        Raises:
+            DatabaseError: If database operation fails
+        """
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("user_id must be a positive integer")
+
+        try:
+            async with self._get_connection() as conn:
+                cursor = await conn.execute("""
+                    UPDATE users 
+                    SET is_active = 0, last_activity = ?
+                    WHERE user_id = ?
+                """, (
+                    datetime.now(timezone.utc).isoformat(),
+                    user_id
+                ))
+                
+                await conn.commit()
+                return cursor.rowcount > 0
+                
+        except sqlite3.Error as e:
+            logging.error(f"Failed to deactivate user {user_id}: {e}")
+            raise DatabaseError(f"Failed to deactivate user: {e}")
+
+    # =============================================================================
+    # ISSUE MANAGEMENT METHODS
+    # =============================================================================
+
+    async def get_user_issues(self, user_id: int, limit: int = 20) -> List[JiraIssue]:
+        """Get issues created by a user.
+        
+        Args:
+            user_id: User ID
+            limit: Maximum number of issues to return
+            
+        Returns:
+            List of JiraIssue objects
+            
+        Raises:
+            DatabaseError: If database operation fails
+        """
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("user_id must be a positive integer")
+        
+        if not isinstance(limit, int) or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+
+        try:
+            async with self._get_connection() as conn:
+                cursor = await conn.execute("""
+                    SELECT jira_key, project_key, summary, description, priority,
+                           issue_type, status, assignee, reporter, labels,
+                           components, fix_versions, url, created_at, updated_at
+                    FROM issues 
+                    WHERE telegram_user_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                """, (user_id, limit))
+                
+                rows = await cursor.fetchall()
+                issues = []
+                
+                for row in rows:
+                    try:
+                        # Parse priority and issue type
+                        try:
+                            priority = IssuePriority.from_string(row[4])
+                        except ValueError:
+                            priority = IssuePriority.MEDIUM
+                        
+                        try:
+                            issue_type = IssueType.from_string(row[5])
+                        except ValueError:
+                            issue_type = IssueType.TASK
+                        
+                        # Parse status
+                        status = None
+                        if row[6]:
+                            try:
+                                status = IssueStatus.from_string(row[6])
+                            except ValueError:
+                                pass
+                        
+                        # Parse lists
+                        import json
+                        labels = json.loads(row[9]) if row[9] else []
+                        components = json.loads(row[10]) if row[10] else []
+                        fix_versions = json.loads(row[11]) if row[11] else []
+                        
+                        issue = JiraIssue(
+                            key=row[0],
+                            summary=row[2],
+                            description=row[3] or "",
+                            priority=priority,
+                            issue_type=issue_type,
+                            project_key=row[1],
+                            url=row[12],
+                            created_at=datetime.fromisoformat(row[13]),
+                            updated_at=datetime.fromisoformat(row[14]) if row[14] else None,
+                            status=status,
+                            assignee=row[7],
+                            reporter=row[8],
+                            labels=labels,
+                            components=components,
+                            fix_versions=fix_versions
+                        )
+                        issues.append(issue)
+                        
+                    except (ValueError, TypeError) as e:
+                        logging.warning(f"Skipping invalid issue data for key {row[0]}: {e}")
+                        continue
+                
+                return issues
+                
+        except sqlite3.Error as e:
+            logging.error(f"Failed to get user issues for {user_id}: {e}")
+            raise DatabaseError(f"Failed to retrieve user issues: {e}")
+
+    async def get_total_issue_count(self) -> int:
+        """Get total number of issues in the database.
+        
+        Returns:
+            Total issue count
+            
+        Raises:
+            DatabaseError: If database operation fails
+        """
+        try:
+            async with self._get_connection() as conn:
+                cursor = await conn.execute("SELECT COUNT(*) FROM issues")
+                row = await cursor.fetchone()
+                return row[0] if row else 0
+                
+        except sqlite3.Error as e:
+            logging.error(f"Failed to get total issue count: {e}")
+            raise DatabaseError(f"Failed to get total issue count: {e}")
+
+    async def get_issue_by_key(self, issue_key: str) -> Optional[JiraIssue]:
+        """Get issue by Jira key.
+        
+        Args:
+            issue_key: Jira issue key
+            
+        Returns:
+            JiraIssue object if found, None otherwise
+            
+        Raises:
+            DatabaseError: If database operation fails
+        """
+        if not isinstance(issue_key, str) or not issue_key.strip():
+            raise ValueError("issue_key must be a non-empty string")
+
+        try:
+            async with self._get_connection() as conn:
+                cursor = await conn.execute("""
+                    SELECT jira_key, project_key, summary, description, priority,
+                           issue_type, status, assignee, reporter, labels,
+                           components, fix_versions, url, created_at, updated_at
+                    FROM issues 
+                    WHERE jira_key = ?
+                """, (issue_key,))
+                
+                row = await cursor.fetchone()
+                if not row:
+                    return None
+                
+                # Parse the row similar to get_user_issues
+                try:
+                    priority = IssuePriority.from_string(row[4])
+                except ValueError:
+                    priority = IssuePriority.MEDIUM
+                
+                try:
+                    issue_type = IssueType.from_string(row[5])
+                except ValueError:
+                    issue_type = IssueType.TASK
+                
+                status = None
+                if row[6]:
+                    try:
+                        status = IssueStatus.from_string(row[6])
+                    except ValueError:
+                        pass
+                
+                import json
+                labels = json.loads(row[9]) if row[9] else []
+                components = json.loads(row[10]) if row[10] else []
+                fix_versions = json.loads(row[11]) if row[11] else []
+                
+                return JiraIssue(
+                    key=row[0],
+                    summary=row[2],
+                    description=row[3] or "",
+                    priority=priority,
+                    issue_type=issue_type,
+                    project_key=row[1],
+                    url=row[12],
+                    created_at=datetime.fromisoformat(row[13]),
+                    updated_at=datetime.fromisoformat(row[14]) if row[14] else None,
+                    status=status,
+                    assignee=row[7],
+                    reporter=row[8],
+                    labels=labels,
+                    components=components,
+                    fix_versions=fix_versions
+                )
+                
+        except sqlite3.Error as e:
+            logging.error(f"Failed to get issue {issue_key}: {e}")
+            raise DatabaseError(f"Failed to retrieve issue: {e}")
+
+    async def update_issue(
+        self,
+        issue_key: str,
+        summary: Optional[str] = None,
+        description: Optional[str] = None,
+        status: Optional[str] = None,
+        assignee: Optional[str] = None,
+        priority: Optional[str] = None
+    ) -> bool:
+        """Update issue information.
+        
+        Args:
+            issue_key: Jira issue key
+            summary: New summary
+            description: New description
+            status: New status
+            assignee: New assignee
+            priority: New priority
+            
+        Returns:
+            True if issue was updated
+            
+        Raises:
+            DatabaseError: If database operation fails
+        """
+        if not isinstance(issue_key, str) or not issue_key.strip():
+            raise ValueError("issue_key must be a non-empty string")
+
+        try:
+            # Build dynamic update query
+            update_fields = []
+            values = []
+            
+            if summary is not None:
+                update_fields.append("summary = ?")
+                values.append(summary)
+            
+            if description is not None:
+                update_fields.append("description = ?")
+                values.append(description)
+            
+            if status is not None:
+                update_fields.append("status = ?")
+                values.append(status)
+            
+            if assignee is not None:
+                update_fields.append("assignee = ?")
+                values.append(assignee)
+            
+            if priority is not None:
+                update_fields.append("priority = ?")
+                values.append(priority)
+
+            if not update_fields:
+                return False  # Nothing to update
+
+            # Always update the timestamp
+            update_fields.append("updated_at = ?")
+            values.append(datetime.now(timezone.utc).isoformat())
+            
+            # Add issue key for WHERE clause
+            values.append(issue_key)
+
+            async with self._get_connection() as conn:
+                cursor = await conn.execute(f"""
+                    UPDATE issues 
+                    SET {', '.join(update_fields)}
+                    WHERE jira_key = ?
+                """, values)
+                
+                await conn.commit()
+                return cursor.rowcount > 0
+                
+        except sqlite3.Error as e:
+            logging.error(f"Failed to update issue {issue_key}: {e}")
+            raise DatabaseError(f"Failed to update issue: {e}")
+
+    # =============================================================================
+    # DEFAULT PROJECT METHODS
+    # =============================================================================
+
+    async def clear_user_default_project(self, user_id: int) -> bool:
+        """Clear user's default project.
+        
+        Args:
+            user_id: User ID
+            
+        Returns:
+            True if default was cleared
+            
+        Raises:
+            DatabaseError: If database operation fails
+        """
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("user_id must be a positive integer")
+
+        try:
+            async with self._get_connection() as conn:
+                cursor = await conn.execute("""
+                    DELETE FROM user_preferences 
+                    WHERE user_id = ? AND preference_key = 'default_project'
+                """, (user_id,))
+                
+                await conn.commit()
+                return cursor.rowcount > 0
+                
+        except sqlite3.Error as e:
+            logging.error(f"Failed to clear default project for user {user_id}: {e}")
+            raise DatabaseError(f"Failed to clear default project: {e}")
+
+    # =============================================================================
+    # UTILITY AND MAINTENANCE METHODS  
+    # =============================================================================
+
+    async def cleanup_old_sessions(self, days_old: int = 7) -> int:
+        """Clean up old user sessions.
+        
+        Args:
+            days_old: Number of days after which to clean up sessions
+            
+        Returns:
+            Number of sessions cleaned up
+            
+        Raises:
+            DatabaseError: If database operation fails
+        """
+        if not isinstance(days_old, int) or days_old <= 0:
+            raise ValueError("days_old must be a positive integer")
+
+        try:
+            cutoff_date = datetime.now(timezone.utc).timestamp() - (days_old * 24 * 3600)
+            cutoff_iso = datetime.fromtimestamp(cutoff_date, timezone.utc).isoformat()
+
+            async with self._get_connection() as conn:
+                cursor = await conn.execute("""
+                    DELETE FROM user_sessions 
+                    WHERE last_activity < ?
+                """, (cutoff_iso,))
+                
+                await conn.commit()
+                return cursor.rowcount
+                
+        except sqlite3.Error as e:
+            logging.error(f"Failed to cleanup old sessions: {e}")
+            raise DatabaseError(f"Failed to cleanup sessions: {e}")
+
+    async def vacuum_database(self) -> None:
+        """Vacuum the database to reclaim space and optimize performance.
+        
+        Raises:
+            DatabaseError: If database operation fails
+        """
+        try:
+            async with self._get_connection() as conn:
+                await conn.execute("VACUUM")
+                
+        except sqlite3.Error as e:
+            logging.error(f"Failed to vacuum database: {e}")
+            raise DatabaseError(f"Failed to vacuum database: {e}")
+
+    async def get_database_statistics(self) -> Dict[str, Any]:
+        """Get database statistics.
+        
+        Returns:
+            Dictionary with database statistics
+            
+        Raises:
+            DatabaseError: If database operation fails
+        """
+        try:
+            stats = {}
+            
+            async with self._get_connection() as conn:
+                # Table row counts
+                tables = ['users', 'projects', 'issues', 'user_preferences', 'user_sessions']
+                
+                for table in tables:
+                    cursor = await conn.execute(f"SELECT COUNT(*) FROM {table}")
+                    row = await cursor.fetchone()
+                    stats[f"{table}_count"] = row[0] if row else 0
+                
+                # Database size
+                cursor = await conn.execute("PRAGMA page_count")
+                page_count = (await cursor.fetchone())[0]
+                
+                cursor = await conn.execute("PRAGMA page_size")
+                page_size = (await cursor.fetchone())[0]
+                
+                stats['database_size_bytes'] = page_count * page_size
+                
+                # Additional statistics
+                cursor = await conn.execute("""
+                    SELECT 
+                        COUNT(DISTINCT telegram_user_id) as active_users,
+                        COUNT(*) as total_issues,
+                        MAX(created_at) as latest_issue
+                    FROM issues
+                """)
+                row = await cursor.fetchone()
+                if row:
+                    stats['active_issue_creators'] = row[0]
+                    stats['total_issues'] = row[1]
+                    stats['latest_issue_date'] = row[2]
+            
+            return stats
+            
+        except sqlite3.Error as e:
+            logging.error(f"Failed to get database statistics: {e}")
+            raise DatabaseError(f"Failed to get database statistics: {e}")
+
+    async def backup_database(self, backup_path: str) -> bool:
+        """Create a backup of the database.
+        
+        Args:
+            backup_path: Path where to save the backup
+            
+        Returns:
+            True if backup was successful
+            
+        Raises:
+            DatabaseError: If backup operation fails
+        """
+        if not isinstance(backup_path, str) or not backup_path.strip():
+            raise ValueError("backup_path must be a non-empty string")
+
+        try:
+            backup_path_obj = Path(backup_path)
+            backup_path_obj.parent.mkdir(parents=True, exist_ok=True)
+            
+            async with self._get_connection() as conn:
+                # Use SQLite backup API
+                import shutil
+                await conn.execute("BEGIN IMMEDIATE")
+                
+                try:
+                    # Simple file copy for SQLite (more sophisticated backup could use BACKUP command)
+                    shutil.copy2(self.db_path, backup_path)
+                    await conn.execute("COMMIT")
+                    return True
+                except Exception:
+                    await conn.execute("ROLLBACK")
+                    raise
+                
+        except Exception as e:
+            logging.error(f"Failed to backup database: {e}")
+            raise DatabaseError(f"Failed to backup database: {e}")
+
+    async def check_database_integrity(self) -> Dict[str, Any]:
+        """Check database integrity.
+        
+        Returns:
+            Dictionary with integrity check results
+            
+        Raises:
+            DatabaseError: If integrity check fails
+        """
+        try:
+            results = {'status': 'ok', 'errors': [], 'warnings': []}
+            
+            async with self._get_connection() as conn:
+                # Run PRAGMA integrity_check
+                cursor = await conn.execute("PRAGMA integrity_check")
+                rows = await cursor.fetchall()
+                
+                for row in rows:
+                    result = row[0]
+                    if result != 'ok':
+                        results['errors'].append(result)
+                        results['status'] = 'error'
+                
+                # Check for orphaned records
+                cursor = await conn.execute("""
+                    SELECT COUNT(*) FROM issues 
+                    WHERE project_key NOT IN (SELECT key FROM projects)
+                """)
+                orphaned_issues = (await cursor.fetchone())[0]
+                
+                if orphaned_issues > 0:
+                    results['warnings'].append(f"{orphaned_issues} issues reference non-existent projects")
+                
+                # Check for users without issues
+                cursor = await conn.execute("""
+                    SELECT COUNT(*) FROM users 
+                    WHERE user_id NOT IN (SELECT DISTINCT telegram_user_id FROM issues)
+                    AND issues_created > 0
+                """)
+                inconsistent_users = (await cursor.fetchone())[0]
+                
+                if inconsistent_users > 0:
+                    results['warnings'].append(f"{inconsistent_users} users have inconsistent issue counts")
+            
+            return results
+            
+        except sqlite3.Error as e:
+            logging.error(f"Failed to check database integrity: {e}")
+            raise DatabaseError(f"Failed to check database integrity: {e}")        

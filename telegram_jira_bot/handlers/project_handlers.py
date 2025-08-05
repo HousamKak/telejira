@@ -2,30 +2,41 @@
 """
 Project handlers for the Telegram-Jira bot.
 
-Handles project-related commands and operations.
+Handles project-related commands including listing projects, setting defaults,
+and project information display.
 """
 
-from typing import Optional, List, Dict, Any
+import logging
+from typing import Optional, List, Dict, Any, Union
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 from .base_handler import BaseHandler
-from ..models.project import Project
-from ..models.user import User, UserPreferences
+from ..models.project import Project, ProjectSummary
+from ..models.user import User
 from ..models.enums import UserRole, ErrorType
 from ..services.database import DatabaseError
 from ..services.jira_service import JiraAPIError
-from ..utils.constants import EMOJI
-from ..utils.validators import ValidationResult
+from ..utils.constants import EMOJI, SUCCESS_MESSAGES, ERROR_MESSAGES, INFO_MESSAGES
+from ..utils.validators import InputValidator, ValidationResult
+from ..utils.formatters import MessageFormatter
 
 
-class ProjectHandler(BaseHandler):
-    """Handles project-related operations."""
+class ProjectHandlers(BaseHandler):
+    """Handles project-related commands and operations."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.formatter = MessageFormatter(
+            compact_mode=self.config.compact_messages,
+            use_emoji=True
+        )
+        self.validator = InputValidator()
 
     def get_handler_name(self) -> str:
         """Get handler name."""
-        return "ProjectHandler"
+        return "ProjectHandlers"
 
     async def handle_error(self, update: Update, error: Exception, context: str = "") -> None:
         """Handle errors specific to project operations."""
@@ -33,761 +44,654 @@ class ProjectHandler(BaseHandler):
             await self.handle_database_error(update, error, context)
         elif isinstance(error, JiraAPIError):
             await self.handle_jira_error(update, error, context)
+        elif isinstance(error, ValueError):
+            await self.send_error_message(
+                update, 
+                f"Invalid input: {str(error)}", 
+                ErrorType.VALIDATION_ERROR
+            )
         else:
-            await self.send_error_message(update, f"Unexpected error: {str(error)}")
+            await self.send_error_message(
+                update,
+                f"Project operation failed: {str(error)}",
+                ErrorType.UNKNOWN_ERROR
+            )
 
-    # Command handlers
-    async def projects_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # =============================================================================
+    # PROJECT LISTING AND INFORMATION COMMANDS
+    # =============================================================================
+
+    async def list_projects(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /projects command - list all available projects."""
-        self.log_handler_start(update, "projects_command")
+        self.log_handler_start(update, "list_projects")
         
         user = await self.enforce_user_access(update)
         if not user:
             return
 
         try:
-            # Get projects and user preferences
-            projects = await self.db.get_projects(active_only=True)
-            preferences = await self.get_user_preferences(user.user_id)
-            default_project = preferences.default_project_key if preferences else None
-
+            # Get all active projects
+            projects = await self.db.get_all_active_projects()
+            
             if not projects:
-                await self.send_info_message(
-                    update,
-                    f"{EMOJI['INFO']} No projects available yet.\n"
-                    "Ask an admin to add projects using `/addproject`."
+                message = self.formatter.format_warning_message(
+                    "No projects available",
+                    "Contact an administrator to add projects to the bot."
                 )
-                self.log_handler_end(update, "projects_command")
+                await self.send_message(update, message)
                 return
 
-            # Format project list
-            text = self.telegram.formatter.format_project_list(
-                projects,
-                title="Available Projects",
-                user_default=default_project,
-                show_details=not self.telegram.compact_mode
-            )
+            # Get user's default project
+            default_project_key = await self.db.get_user_default_project(user.user_id)
 
-            # Create keyboard with options
-            keyboard = []
-            if not default_project:
-                keyboard.append([
+            # Format project list with default indication
+            message_lines = [
+                f"{EMOJI.get('PROJECTS', '📋')} **Available Projects** ({len(projects)} total)",
+                ""
+            ]
+
+            for i, project in enumerate(projects, 1):
+                # Project status emoji
+                status_emoji = "✅" if project.is_active else "❌"
+                
+                # Default project indicator
+                default_indicator = " 🌟" if project.key == default_project_key else ""
+                
+                # Project line
+                project_line = f"{i}. {status_emoji} **{project.key}**: {project.name}{default_indicator}"
+                
+                # Add issue count and description
+                if not self.config.compact_messages:
+                    if project.issue_count > 0:
+                        project_line += f" ({project.issue_count} issues)"
+                    
+                    if project.description:
+                        description = self.formatter._truncate_text(project.description, 80)
+                        project_line += f"\n   📄 {description}"
+                
+                message_lines.append(project_line)
+
+            # Add help text
+            message_lines.extend([
+                "",
+                "🌟 = Your default project",
+                "",
+                "**Commands:**",
+                "• `/setdefault <KEY>` - Set default project",
+                "• `/project <KEY>` - View project details",
+                "• `/create` - Create new issue"
+            ])
+
+            message = "\n".join(message_lines)
+            
+            # Add inline keyboard for quick actions
+            if len(projects) <= 10:  # Only show keyboard for reasonable number of projects
+                keyboard_buttons = []
+                
+                # Add set default buttons for top projects
+                for project in projects[:5]:
+                    button_text = f"Set {project.key} as Default"
+                    if project.key == default_project_key:
+                        button_text = f"✅ {project.key} (Current)"
+                    
+                    keyboard_buttons.append([
+                        InlineKeyboardButton(
+                            button_text,
+                            callback_data=f"setdefault_{project.key}"
+                        )
+                    ])
+                
+                keyboard = InlineKeyboardMarkup(keyboard_buttons) if keyboard_buttons else None
+            else:
+                keyboard = None
+
+            await self.send_message(update, message, reply_markup=keyboard)
+            self.log_handler_end(update, "list_projects")
+
+        except Exception as e:
+            await self.handle_error(update, e, "list_projects")
+            self.log_handler_end(update, "list_projects", success=False)
+
+    async def show_project_details(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /project command - show detailed project information.
+        
+        Usage: /project <KEY>
+        """
+        self.log_handler_start(update, "show_project_details")
+        
+        user = await self.enforce_user_access(update)
+        if not user:
+            return
+
+        try:
+            if not context.args:
+                await self.send_message(
+                    update, 
+                    "**Usage:** `/project <PROJECT_KEY>`\n\nExample: `/project WEBAPP`"
+                )
+                return
+
+            project_key = context.args[0].upper()
+            
+            # Get project from database
+            project = await self.db.get_project_by_key(project_key)
+            if not project:
+                await self.send_error_message(update, f"Project '{project_key}' not found.")
+                return
+
+            # Try to get updated info from Jira
+            try:
+                jira_project = await self.jira.get_project_by_key(project_key)
+                if jira_project:
+                    # Update project with latest Jira data
+                    project.update_from_jira(jira_project.to_dict())
+                    
+                    # Update in database
+                    await self.db.update_project(
+                        key=project.key,
+                        name=project.name,
+                        description=project.description,
+                        url=project.url,
+                        is_active=project.is_active
+                    )
+            except JiraAPIError:
+                # Continue with database info if Jira is unavailable
+                pass
+
+            # Format detailed project information
+            message = self.formatter.format_project(project, include_details=True)
+            
+            # Add additional statistics
+            try:
+                # Get issue statistics for this project
+                issue_stats = await self._get_project_issue_statistics(project.key)
+                
+                if issue_stats:
+                    stats_lines = [
+                        "",
+                        "📊 **Issue Statistics:**"
+                    ]
+                    
+                    for status, count in issue_stats.items():
+                        if count > 0:
+                            stats_lines.append(f"• {status}: {count}")
+                    
+                    message += "\n" + "\n".join(stats_lines)
+                    
+            except Exception as e:
+                self.logger.warning(f"Failed to get issue statistics for {project_key}: {e}")
+
+            # Check if this is user's default project
+            default_project_key = await self.db.get_user_default_project(user.user_id)
+            is_default = (project_key == default_project_key)
+
+            # Add action buttons
+            keyboard_buttons = []
+            
+            if not is_default:
+                keyboard_buttons.append([
                     InlineKeyboardButton(
-                        f"{EMOJI['SETTINGS']} Set Default Project",
-                        callback_data="projects_set_default"
+                        "🌟 Set as Default",
+                        callback_data=f"setdefault_{project.key}"
+                    )
+                ])
+            else:
+                keyboard_buttons.append([
+                    InlineKeyboardButton(
+                        "✅ Current Default",
+                        callback_data="noop"
                     )
                 ])
             
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"{EMOJI['REFRESH']} Refresh",
-                    callback_data="projects_refresh"
-                )
+            keyboard_buttons.extend([
+                [InlineKeyboardButton(
+                    "📝 Create Issue",
+                    callback_data=f"create_issue_{project.key}"
+                )],
+                [InlineKeyboardButton(
+                    "📋 View Issues",
+                    callback_data=f"list_issues_{project.key}"
+                )],
+                [InlineKeyboardButton(
+                    "🔄 Refresh from Jira",
+                    callback_data=f"refresh_project_{project.key}"
+                )]
             ])
 
-            reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
-            await self.send_message(update, text, reply_markup)
+            keyboard = InlineKeyboardMarkup(keyboard_buttons)
 
-            self.log_user_action(user, "list_projects", {"project_count": len(projects)})
-            self.log_handler_end(update, "projects_command")
+            await self.send_message(update, message, reply_markup=keyboard)
+            self.log_handler_end(update, "show_project_details")
 
         except Exception as e:
-            await self.handle_error(update, e, "projects_command")
-            self.log_handler_end(update, "projects_command", success=False)
+            await self.handle_error(update, e, "show_project_details")
+            self.log_handler_end(update, "show_project_details", success=False)
 
-    async def addproject_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /addproject command - add a new project (admin only)."""
-        self.log_handler_start(update, "addproject_command")
+    # =============================================================================
+    # DEFAULT PROJECT MANAGEMENT
+    # =============================================================================
+
+    async def set_default_project(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /setdefault command - set user's default project.
         
-        user = await self.enforce_admin(update)
-        if not user:
-            return
-
-        args = self.parse_command_args(update, 2)  # At least key and name
-        if not args:
-            await self._send_addproject_usage(update)
-            self.log_handler_end(update, "addproject_command")
-            return
-
-        project_key = args[0].upper()
-        project_name = args[1]
-        project_description = " ".join(args[2:]) if len(args) > 2 else ""
-
-        try:
-            # Validate inputs
-            key_validation = self.validate_project_key(project_key)
-            if not key_validation.is_valid:
-                await self.handle_validation_error(update, key_validation, "project key")
-                self.log_handler_end(update, "addproject_command", success=False)
-                return
-
-            name_validation = self.validate_project_name(project_name)
-            if not name_validation.is_valid:
-                await self.handle_validation_error(update, name_validation, "project name")
-                self.log_handler_end(update, "addproject_command", success=False)
-                return
-
-            # Check if project already exists
-            existing_project = await self.db.get_project_by_key(project_key)
-            if existing_project:
-                await self.send_error_message(
-                    update,
-                    f"Project `{project_key}` already exists.",
-                    ErrorType.VALIDATION_ERROR
-                )
-                self.log_handler_end(update, "addproject_command", success=False)
-                return
-
-            # Verify project exists in Jira
-            jira_exists = await self.jira.verify_project(project_key)
-            if not jira_exists:
-                await self._handle_jira_project_not_found(update, project_key, project_name, project_description)
-                self.log_handler_end(update, "addproject_command")
-                return
-
-            # Create and add project
-            await self._create_project(update, project_key, project_name, project_description, user)
-            self.log_handler_end(update, "addproject_command")
-
-        except Exception as e:
-            await self.handle_error(update, e, "addproject_command")
-            self.log_handler_end(update, "addproject_command", success=False)
-
-    async def editproject_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /editproject command - edit an existing project (admin only)."""
-        self.log_handler_start(update, "editproject_command")
-        
-        user = await self.enforce_admin(update)
-        if not user:
-            return
-
-        args = self.parse_command_args(update, 1)  # Just project key
-        if not args:
-            await self._send_editproject_usage(update)
-            self.log_handler_end(update, "editproject_command")
-            return
-
-        project_key = args[0].upper()
-
-        try:
-            # Get existing project
-            project = await self.db.get_project_by_key(project_key)
-            if not project:
-                await self.send_error_message(
-                    update,
-                    f"Project `{project_key}` not found.",
-                    ErrorType.NOT_FOUND_ERROR
-                )
-                self.log_handler_end(update, "editproject_command", success=False)
-                return
-
-            # Show edit options
-            await self._show_project_edit_options(update, project)
-            self.log_handler_end(update, "editproject_command")
-
-        except Exception as e:
-            await self.handle_error(update, e, "editproject_command")
-            self.log_handler_end(update, "editproject_command", success=False)
-
-    async def deleteproject_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /deleteproject command - delete a project (admin only)."""
-        self.log_handler_start(update, "deleteproject_command")
-        
-        user = await self.enforce_admin(update)
-        if not user:
-            return
-
-        args = self.parse_command_args(update, 1)  # Just project key
-        if not args:
-            await self._send_deleteproject_usage(update)
-            self.log_handler_end(update, "deleteproject_command")
-            return
-
-        project_key = args[0].upper()
-
-        try:
-            # Get existing project
-            project = await self.db.get_project_by_key(project_key)
-            if not project:
-                await self.send_error_message(
-                    update,
-                    f"Project `{project_key}` not found.",
-                    ErrorType.NOT_FOUND_ERROR
-                )
-                self.log_handler_end(update, "deleteproject_command", success=False)
-                return
-
-            # Check if project can be deleted
-            warning = project.get_deletion_warning()
-            if warning:
-                await self._show_project_delete_confirmation(update, project, warning)
-            else:
-                await self._show_project_delete_confirmation(update, project)
-            
-            self.log_handler_end(update, "deleteproject_command")
-
-        except Exception as e:
-            await self.handle_error(update, e, "deleteproject_command")
-            self.log_handler_end(update, "deleteproject_command", success=False)
-
-    async def setdefault_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /setdefault command - set user's default project."""
-        self.log_handler_start(update, "setdefault_command")
+        Usage: /setdefault <KEY>
+        """
+        self.log_handler_start(update, "set_default_project")
         
         user = await self.enforce_user_access(update)
         if not user:
             return
 
-        args = self.parse_command_args(update, 0)  # Optional project key
-        
         try:
-            if args and len(args) > 0:
-                # Set specific project as default
-                project_key = args[0].upper()
-                await self._set_user_default_project(update, user, project_key)
-            else:
-                # Show project selection
-                await self._show_default_project_selection(update, user)
-            
-            self.log_handler_end(update, "setdefault_command")
+            if not context.args:
+                # Show available projects for selection
+                projects = await self.db.get_all_active_projects()
+                
+                if not projects:
+                    await self.send_message(update, INFO_MESSAGES['NO_PROJECTS'])
+                    return
 
-        except Exception as e:
-            await self.handle_error(update, e, "setdefault_command")
-            self.log_handler_end(update, "setdefault_command", success=False)
+                message = f"""
+{EMOJI.get('DEFAULT', '🌟')} **Set Default Project**
 
-    # Callback handlers
-    async def handle_projects_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle project-related callbacks."""
-        callback_data = self.extract_callback_data(update)
-        if not callback_data:
-            return
+Choose a project to set as your default. This project will be used automatically when creating issues.
 
-        parts = self.parse_callback_data(callback_data)
-        if len(parts) < 2:
-            return
+**Available Projects:**
+                """
 
-        action = parts[1]  # projects_<action>
+                keyboard_buttons = []
+                for project in projects[:10]:  # Limit to 10 projects
+                    keyboard_buttons.append([
+                        InlineKeyboardButton(
+                            f"{project.key}: {project.name[:30]}",
+                            callback_data=f"setdefault_{project.key}"
+                        )
+                    ])
 
-        if action == "refresh":
-            await self.projects_command(update, context)
-        elif action == "set_default":
-            user = await self.enforce_user_access(update)
-            if user:
-                await self._show_default_project_selection(update, user)
-        elif action.startswith("default_"):
-            project_key = action.replace("default_", "")
-            user = await self.enforce_user_access(update)
-            if user:
-                await self._set_user_default_project(update, user, project_key)
-        elif action.startswith("edit_"):
-            project_key = action.replace("edit_", "")
-            await self._handle_project_edit_callback(update, project_key, parts[2:])
-        elif action.startswith("delete_"):
-            project_key = action.replace("delete_", "")
-            await self._handle_project_delete_callback(update, project_key, parts[2:])
-
-    # Private helper methods
-    async def _send_addproject_usage(self, update: Update) -> None:
-        """Send usage instructions for addproject command."""
-        text = f"{EMOJI['INFO']} **Add Project Usage**\n\n"
-        text += "**Syntax:** `/addproject <KEY> <Name> [Description]`\n\n"
-        text += "**Examples:**\n"
-        text += "• `/addproject WEBAPP Web Application Main web app project`\n"
-        text += "• `/addproject API Backend API REST API backend`\n\n"
-        text += "**Notes:**\n"
-        text += "• Project key must be uppercase (2-10 characters)\n"
-        text += "• Project must exist in Jira\n"
-        text += "• Description is optional"
-        
-        await self.send_message(update, text)
-
-    async def _send_editproject_usage(self, update: Update) -> None:
-        """Send usage instructions for editproject command."""
-        text = f"{EMOJI['INFO']} **Edit Project Usage**\n\n"
-        text += "**Syntax:** `/editproject <KEY>`\n\n"
-        text += "**Example:** `/editproject WEBAPP`\n\n"
-        text += "This will show editing options for the specified project."
-        
-        await self.send_message(update, text)
-
-    async def _send_deleteproject_usage(self, update: Update) -> None:
-        """Send usage instructions for deleteproject command."""
-        text = f"{EMOJI['INFO']} **Delete Project Usage**\n\n"
-        text += "**Syntax:** `/deleteproject <KEY>`\n\n"
-        text += "**Example:** `/deleteproject WEBAPP`\n\n"
-        text += f"{EMOJI['WARNING']} **Warning:** This will permanently delete the project!"
-        
-        await self.send_message(update, text)
-
-    async def _handle_jira_project_not_found(
-        self,
-        update: Update,
-        project_key: str,
-        project_name: str,
-        project_description: str
-    ) -> None:
-        """Handle case where project is not found in Jira."""
-        text = f"{EMOJI['WARNING']} **Jira Project Not Found**\n\n"
-        text += f"Project `{project_key}` was not found in Jira.\n\n"
-        text += "This might mean:\n"
-        text += "• Project doesn't exist in Jira\n"
-        text += "• You don't have access to it\n"
-        text += "• Project key is misspelled\n\n"
-        text += "Do you want to add it anyway?"
-
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    f"{EMOJI['SUCCESS']} Add Anyway",
-                    callback_data=f"projects_force_add_{project_key}_{project_name}_{project_description}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"{EMOJI['CANCEL']} Cancel",
-                    callback_data="projects_cancel_add"
-                )
-            ]
-        ]
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await self.send_message(update, text, reply_markup)
-
-    async def _create_project(
-        self,
-        update: Update,
-        project_key: str,
-        project_name: str,
-        project_description: str,
-        user: User
-    ) -> None:
-        """Create a new project."""
-        try:
-            # Try to get additional project info from Jira
-            jira_project = await self.jira.get_project(project_key)
-            
-            if jira_project:
-                # Use Jira project data
-                project = jira_project
-            else:
-                # Create project with provided data
-                project = Project(
-                    key=project_key,
-                    name=project_name,
-                    description=project_description
-                )
-
-            # Add to database
-            await self.db.add_project(project)
-
-            # Send success message
-            text = f"{EMOJI['SUCCESS']} **Project Added Successfully!**\n\n"
-            text += f"**Key:** `{project.key}`\n"
-            text += f"**Name:** {project.name}\n"
-            text += f"**Description:** {project.description or 'None'}\n"
-            
-            if project.url:
-                text += f"**Jira URL:** [View Project]({project.url})\n"
-            
-            text += f"\nUsers can now create issues in this project!"
-
-            keyboard = [
-                [
-                    InlineKeyboardButton(
-                        f"{EMOJI['PROJECTS']} View All Projects",
-                        callback_data="projects_refresh"
-                    )
-                ]
-            ]
-
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await self.send_message(update, text, reply_markup)
-
-            self.log_user_action(
-                user,
-                "create_project",
-                {"project_key": project_key, "project_name": project_name}
-            )
-
-        except DatabaseError as e:
-            if "already exists" in str(e):
-                await self.send_error_message(
-                    update,
-                    f"Project `{project_key}` already exists.",
-                    ErrorType.DATABASE_ERROR
-                )
-            else:
-                await self.handle_database_error(update, e, "create_project")
-        except JiraAPIError as e:
-            await self.handle_jira_error(update, e, "create_project")
-
-    async def _show_project_edit_options(self, update: Update, project: Project) -> None:
-        """Show project editing options."""
-        text = f"{EMOJI['EDIT']} **Edit Project: {project.key}**\n\n"
-        text += f"**Current Settings:**\n"
-        text += f"• Name: {project.name}\n"
-        text += f"• Description: {project.description or 'None'}\n"
-        text += f"• Status: {'Active' if project.is_active else 'Inactive'}\n"
-        text += f"• Issues: {project.issue_count}\n\n"
-        text += "What would you like to edit?"
-
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    f"{EMOJI['EDIT']} Edit Name",
-                    callback_data=f"projects_edit_{project.key}_name"
-                ),
-                InlineKeyboardButton(
-                    f"{EMOJI['EDIT']} Edit Description",
-                    callback_data=f"projects_edit_{project.key}_description"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"{EMOJI['SETTINGS']} Toggle Status",
-                    callback_data=f"projects_edit_{project.key}_status"
-                ),
-                InlineKeyboardButton(
-                    f"{EMOJI['REFRESH']} Sync with Jira",
-                    callback_data=f"projects_edit_{project.key}_sync"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"{EMOJI['STATS']} View Statistics",
-                    callback_data=f"projects_edit_{project.key}_stats"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"{EMOJI['BACK']} Back",
-                    callback_data="projects_refresh"
-                )
-            ]
-        ]
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await self.edit_message(update, text, reply_markup)
-
-    async def _show_project_delete_confirmation(
-        self,
-        update: Update,
-        project: Project,
-        warning: Optional[str] = None
-    ) -> None:
-        """Show project deletion confirmation."""
-        text = f"{EMOJI['WARNING']} **Delete Project Confirmation**\n\n"
-        text += f"**Project:** `{project.key}` - {project.name}\n"
-        text += f"**Issues:** {project.issue_count}\n\n"
-        
-        if warning:
-            text += f"{warning}\n\n"
-        
-        text += f"{EMOJI['ERROR']} **This action cannot be undone!**\n\n"
-        text += "Are you sure you want to delete this project?"
-
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    f"{EMOJI['ERROR']} Delete Project",
-                    callback_data=f"projects_delete_{project.key}_confirm"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"{EMOJI['ERROR']} Force Delete (with issues)",
-                    callback_data=f"projects_delete_{project.key}_force"
-                )
-            ] if project.issue_count > 0 else [],
-            [
-                InlineKeyboardButton(
-                    f"{EMOJI['CANCEL']} Cancel",
-                    callback_data="projects_refresh"
-                )
-            ]
-        ]
-
-        # Remove empty rows
-        keyboard = [row for row in keyboard if row]
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await self.edit_message(update, text, reply_markup)
-
-    async def _show_default_project_selection(self, update: Update, user: User) -> None:
-        """Show default project selection interface."""
-        try:
-            projects = await self.db.get_projects(active_only=True)
-            preferences = await self.get_user_preferences(user.user_id)
-            current_default = preferences.default_project_key if preferences else None
-
-            if not projects:
-                await self.send_info_message(
-                    update,
-                    "No projects available. Ask an admin to add projects first."
-                )
+                keyboard = InlineKeyboardMarkup(keyboard_buttons)
+                
+                await self.send_message(update, message, reply_markup=keyboard)
                 return
 
-            text = f"{EMOJI['SETTINGS']} **Set Default Project**\n\n"
-            text += f"**Current Default:** {current_default or 'None'}\n\n"
-            text += "Select a project to set as your default:"
+            project_key = context.args[0].upper()
+            
+            # Validate project key format
+            validation_result = self.validator.validate_project_key(project_key)
+            if not validation_result.is_valid:
+                await self.handle_validation_error(update, validation_result, "project key")
+                return
 
-            keyboard = self.telegram.create_project_selection_keyboard(
-                projects,
-                callback_prefix="projects_default",
-                show_cancel=True
-            )
-
-            if update.callback_query:
-                await self.edit_message(update, text, keyboard)
-            else:
-                await self.send_message(update, text, keyboard)
-
-        except DatabaseError as e:
-            await self.handle_database_error(update, e, "show_default_project_selection")
-
-    async def _set_user_default_project(self, update: Update, user: User, project_key: str) -> None:
-        """Set user's default project."""
-        try:
-            # Verify project exists and is active
+            # Check if project exists
             project = await self.db.get_project_by_key(project_key)
             if not project:
-                await self.send_error_message(
-                    update,
-                    f"Project `{project_key}` not found.",
-                    ErrorType.NOT_FOUND_ERROR
-                )
+                await self.send_error_message(update, f"Project '{project_key}' not found.")
                 return
 
             if not project.is_active:
-                await self.send_error_message(
-                    update,
-                    f"Project `{project_key}` is not active.",
-                    ErrorType.VALIDATION_ERROR
-                )
+                await self.send_error_message(update, f"Project '{project_key}' is not active.")
                 return
 
-            # Get or create user preferences
-            preferences = await self.get_user_preferences(user.user_id)
-            if not preferences:
-                from ..models.user import UserPreferences
-                preferences = UserPreferences(user_id=user.user_id)
+            # Set default project
+            await self.db.set_user_default_project(user.user_id, project_key)
 
-            # Update default project
-            preferences.default_project_key = project_key
-            await self.db.save_user_preferences(preferences)
-
-            # Send success message
-            text = f"{EMOJI['SUCCESS']} **Default Project Set**\n\n"
-            text += f"**Project:** `{project.key}` - {project.name}\n\n"
-            text += "Now when you send messages, issues will be created in this project by default."
-
-            keyboard = [
-                [
-                    InlineKeyboardButton(
-                        f"{EMOJI['ISSUE']} Create Test Issue",
-                        callback_data=f"issue_create_quick_{project.key}"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        f"{EMOJI['PROJECTS']} View Projects",
-                        callback_data="projects_refresh"
-                    )
-                ]
-            ]
-
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            if update.callback_query:
-                await self.edit_message(update, text, reply_markup)
-            else:
-                await self.send_message(update, text, reply_markup)
-
-            self.log_user_action(
-                user,
-                "set_default_project",
-                {"project_key": project_key}
+            # Success message
+            success_message = self.formatter.format_success_message(
+                f"Default project set to '{project_key}'",
+                f"**{project.key}**: {project.name}\n\nThis project will be used automatically when creating issues."
             )
 
-        except DatabaseError as e:
-            await self.handle_database_error(update, e, "set_user_default_project")
+            await self.send_message(update, success_message)
+            self.log_handler_end(update, "set_default_project")
 
-    async def _handle_project_edit_callback(self, update: Update, project_key: str, action_parts: List[str]) -> None:
-        """Handle project edit callbacks."""
-        if not action_parts:
-            return
+        except Exception as e:
+            await self.handle_error(update, e, "set_default_project")
+            self.log_handler_end(update, "set_default_project", success=False)
 
-        user = await self.enforce_admin(update)
+    async def show_default_project(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /default command - show user's current default project."""
+        self.log_handler_start(update, "show_default_project")
+        
+        user = await self.enforce_user_access(update)
         if not user:
             return
 
-        action = action_parts[0]
+        try:
+            default_project_key = await self.db.get_user_default_project(user.user_id)
+            
+            if not default_project_key:
+                message = self.formatter.format_warning_message(
+                    "No default project set",
+                    "Use `/setdefault <PROJECT_KEY>` to set your default project, or `/projects` to see available projects."
+                )
+                await self.send_message(update, message)
+                return
+
+            # Get project details
+            project = await self.db.get_project_by_key(default_project_key)
+            if not project:
+                # Default project no longer exists, clear it
+                await self.db.clear_user_default_project(user.user_id)
+                await self.send_error_message(update, "Your default project no longer exists. Please set a new one.")
+                return
+
+            # Format current default project info
+            message = f"""
+{EMOJI.get('DEFAULT', '🌟')} **Your Default Project**
+
+{self.formatter.format_project(project, include_details=True)}
+
+This project will be used automatically when creating issues without specifying a project.
+
+**Change Default:**
+Use `/setdefault <KEY>` or click the button below.
+            """
+
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "🔄 Change Default",
+                    callback_data="change_default_project"
+                )],
+                [InlineKeyboardButton(
+                    "📝 Create Issue",
+                    callback_data=f"create_issue_{project.key}"
+                )]
+            ])
+
+            await self.send_message(update, message, reply_markup=keyboard)
+            self.log_handler_end(update, "show_default_project")
+
+        except Exception as e:
+            await self.handle_error(update, e, "show_default_project")
+            self.log_handler_end(update, "show_default_project", success=False)
+
+    # =============================================================================
+    # PROJECT SEARCH AND FILTERING
+    # =============================================================================
+
+    async def search_projects(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /searchprojects command - search projects by name or key.
+        
+        Usage: /searchprojects <query>
+        """
+        self.log_handler_start(update, "search_projects")
+        
+        user = await self.enforce_user_access(update)
+        if not user:
+            return
 
         try:
+            if not context.args:
+                await self.send_message(
+                    update,
+                    "**Usage:** `/searchprojects <query>`\n\nSearch projects by name, key, or description."
+                )
+                return
+
+            query = ' '.join(context.args).lower()
+            
+            # Get all projects and filter
+            all_projects = await self.db.get_all_projects()
+            
+            matching_projects = []
+            for project in all_projects:
+                if (query in project.key.lower() or 
+                    query in project.name.lower() or 
+                    query in project.description.lower()):
+                    matching_projects.append(project)
+
+            if not matching_projects:
+                message = f"""
+{EMOJI.get('SEARCH', '🔍')} **Project Search Results**
+
+No projects found matching: **{query}**
+
+Try a different search term or use `/projects` to see all available projects.
+                """
+                await self.send_message(update, message)
+                return
+
+            # Format search results
+            message_lines = [
+                f"{EMOJI.get('SEARCH', '🔍')} **Project Search Results**",
+                f"Found {len(matching_projects)} project(s) matching: **{query}**",
+                ""
+            ]
+
+            for i, project in enumerate(matching_projects, 1):
+                status_emoji = "✅" if project.is_active else "❌"
+                project_line = f"{i}. {status_emoji} **{project.key}**: {project.name}"
+                
+                if not self.config.compact_messages and project.description:
+                    description = self.formatter._truncate_text(project.description, 100)
+                    project_line += f"\n   📄 {description}"
+                
+                message_lines.append(project_line)
+
+            message = "\n".join(message_lines)
+            await self.send_message(update, message)
+            self.log_handler_end(update, "search_projects")
+
+        except Exception as e:
+            await self.handle_error(update, e, "search_projects")
+            self.log_handler_end(update, "search_projects", success=False)
+
+    # =============================================================================
+    # CALLBACK QUERY HANDLERS
+    # =============================================================================
+
+    async def handle_project_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle project-related callback queries."""
+        query = update.callback_query
+        await query.answer()
+
+        if query.data.startswith("setdefault_"):
+            await self._handle_setdefault_callback(update, context)
+        elif query.data.startswith("create_issue_"):
+            await self._handle_create_issue_callback(update, context)
+        elif query.data.startswith("list_issues_"):
+            await self._handle_list_issues_callback(update, context)
+        elif query.data.startswith("refresh_project_"):
+            await self._handle_refresh_project_callback(update, context)
+        elif query.data == "change_default_project":
+            await self._handle_change_default_callback(update, context)
+        elif query.data == "noop":
+            # No operation - just acknowledge
+            pass
+
+    async def _handle_setdefault_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle set default project callback."""
+        query = update.callback_query
+        project_key = query.data.replace("setdefault_", "")
+
+        user = await self.get_or_create_user(update)
+        if not user:
+            return
+
+        try:
+            # Verify project exists
             project = await self.db.get_project_by_key(project_key)
             if not project:
-                await self.send_error_message(update, f"Project `{project_key}` not found.")
+                await self.edit_message(update, f"Project '{project_key}' not found.")
                 return
 
-            if action == "name":
-                await self._edit_project_name(update, project)
-            elif action == "description":
-                await self._edit_project_description(update, project)
-            elif action == "status":
-                await self._toggle_project_status(update, project, user)
-            elif action == "sync":
-                await self._sync_project_with_jira(update, project, user)
-            elif action == "stats":
-                await self._show_project_statistics(update, project)
+            # Set default project
+            await self.db.set_user_default_project(user.user_id, project_key)
 
-        except DatabaseError as e:
-            await self.handle_database_error(update, e, "handle_project_edit_callback")
-
-    async def _handle_project_delete_callback(self, update: Update, project_key: str, action_parts: List[str]) -> None:
-        """Handle project delete callbacks."""
-        if not action_parts:
-            return
-
-        user = await self.enforce_admin(update)  
-        if not user:
-            return
-
-        action = action_parts[0]
-
-        try:
-            if action == "confirm":
-                await self._delete_project(update, project_key, user, force=False)
-            elif action == "force":
-                await self._delete_project(update, project_key, user, force=True)
-
-        except DatabaseError as e:
-            await self.handle_database_error(update, e, "handle_project_delete_callback")
-
-    async def _edit_project_name(self, update: Update, project: Project) -> None:
-        """Handle project name editing."""
-        # This would typically involve setting up a conversation handler
-        # For now, show instructions
-        text = f"{EMOJI['EDIT']} **Edit Project Name**\n\n"
-        text += f"**Current Name:** {project.name}\n\n"
-        text += f"To edit the project name, use:\n"
-        text += f"`/editproject {project.key} name <new_name>`\n\n"
-        text += f"**Example:** `/editproject {project.key} name New Project Name`"
-        
-        await self.edit_message(update, text)
-
-    async def _edit_project_description(self, update: Update, project: Project) -> None:
-        """Handle project description editing."""
-        text = f"{EMOJI['EDIT']} **Edit Project Description**\n\n"
-        text += f"**Current Description:** {project.description or 'None'}\n\n"
-        text += f"To edit the project description, use:\n"
-        text += f"`/editproject {project.key} description <new_description>`\n\n"
-        text += f"**Example:** `/editproject {project.key} description Updated project description`"
-        
-        await self.edit_message(update, text)
-
-    async def _toggle_project_status(self, update: Update, project: Project, user: User) -> None:
-        """Toggle project active status."""
-        try:
-            new_status = not project.is_active
-            await self.db.update_project(project.key, is_active=new_status)
-            
-            status_text = "activated" if new_status else "deactivated"
-            text = f"{EMOJI['SUCCESS']} Project `{project.key}` has been {status_text}."
-            
-            await self.edit_message(update, text)
-            
-            self.log_user_action(
-                user,
-                "toggle_project_status",
-                {"project_key": project.key, "new_status": new_status}
+            success_message = self.formatter.format_success_message(
+                f"Default project set to '{project_key}'",
+                f"**{project.name}** is now your default project."
             )
 
-        except DatabaseError as e:
-            await self.handle_database_error(update, e, "toggle_project_status")
+            await self.edit_message(update, success_message)
 
-    async def _sync_project_with_jira(self, update: Update, project: Project, user: User) -> None:
-        """Sync project with Jira."""
-        try:
-            jira_project = await self.jira.get_project(project.key)
-            if jira_project:
-                # Update project with Jira data
-                update_data = {
-                    'name': jira_project.name,
-                    'description': jira_project.description,
-                    'jira_project_id': jira_project.jira_project_id,
-                    'project_type': jira_project.project_type,
-                    'lead': jira_project.lead,
-                    'url': jira_project.url,
-                    'avatar_url': jira_project.avatar_url,
-                    'category': jira_project.category
-                }
-                
-                await self.db.update_project(project.key, **update_data)
-                
-                text = f"{EMOJI['SUCCESS']} Project `{project.key}` synchronized with Jira successfully."
-                
-                self.log_user_action(
-                    user,
-                    "sync_project",
-                    {"project_key": project.key}
+        except DatabaseError as e:
+            await self.edit_message(
+                update,
+                self.formatter.format_error_message(
+                    "Database Error",
+                    f"Failed to set default project: {str(e)}"
                 )
-            else:
-                text = f"{EMOJI['WARNING']} Project `{project.key}` not found in Jira."
-            
-            await self.edit_message(update, text)
+            )
 
-        except (DatabaseError, JiraAPIError) as e:
-            await self.handle_error(update, e, "sync_project_with_jira")
+    async def _handle_create_issue_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle create issue callback."""
+        query = update.callback_query
+        project_key = query.data.replace("create_issue_", "")
 
-    async def _show_project_statistics(self, update: Update, project: Project) -> None:
-        """Show project statistics."""
+        # Start issue creation wizard with pre-selected project
+        from .wizard_handlers import WizardHandlers
+        wizard_handler = WizardHandlers(
+            config=self.config,
+            database=self.db,
+            jira_service=self.jira,
+            telegram_service=self.telegram
+        )
+
+        # Store project in context and start wizard
+        context.user_data['selected_project_key'] = project_key
+        await wizard_handler.quick_command(update, context)
+
+    async def _handle_list_issues_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle list issues callback."""
+        query = update.callback_query
+        project_key = query.data.replace("list_issues_", "")
+
+        # Redirect to issue handlers
+        from .issue_handlers import IssueHandlers
+        issue_handler = IssueHandlers(
+            config=self.config,
+            database=self.db,
+            jira_service=self.jira,
+            telegram_service=self.telegram
+        )
+
+        # Simulate command with project filter
+        context.args = ['project=' + project_key]
+        await issue_handler.list_all_issues(update, context)
+
+    async def _handle_refresh_project_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle refresh project from Jira callback."""
+        query = update.callback_query
+        project_key = query.data.replace("refresh_project_", "")
+
         try:
-            stats = await self.db.get_project_stats(project.key)
-            text = self.telegram.formatter.format_project_stats(stats)
-            
-            keyboard = [
-                [
-                    InlineKeyboardButton(
-                        f"{EMOJI['BACK']} Back to Edit",
-                        callback_data=f"projects_edit_{project.key}"
-                    )
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await self.edit_message(update, text, reply_markup)
+            # Get latest data from Jira
+            jira_project = await self.jira.get_project_by_key(project_key)
+            if not jira_project:
+                await self.edit_message(update, f"Project '{project_key}' not found in Jira.")
+                return
 
-        except DatabaseError as e:
-            await self.handle_database_error(update, e, "show_project_statistics")
+            # Update in database
+            await self.db.update_project(
+                key=jira_project.key,
+                name=jira_project.name,
+                description=jira_project.description,
+                url=jira_project.url,
+                is_active=jira_project.is_active
+            )
 
-    async def _delete_project(self, update: Update, project_key: str, user: User, force: bool = False) -> None:
-        """Delete a project."""
-        try:
-            success = await self.db.delete_project(project_key, force=force)
-            
-            if success:
-                text = f"{EMOJI['SUCCESS']} Project `{project_key}` has been deleted successfully."
-                
-                self.log_user_action(
-                    user,
-                    "delete_project",
-                    {"project_key": project_key, "force": force}
+            success_message = self.formatter.format_success_message(
+                f"Project '{project_key}' refreshed from Jira",
+                self.formatter.format_project(jira_project, include_details=True)
+            )
+
+            await self.edit_message(update, success_message)
+
+        except JiraAPIError as e:
+            await self.edit_message(
+                update,
+                self.formatter.format_error_message(
+                    "Jira API Error",
+                    f"Failed to refresh project: {str(e)}"
                 )
-            else:
-                text = f"{EMOJI['ERROR']} Failed to delete project `{project_key}`."
-            
-            # Show projects list
-            keyboard = [
-                [
-                    InlineKeyboardButton(
-                        f"{EMOJI['PROJECTS']} View Projects",
-                        callback_data="projects_refresh"
-                    )
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await self.edit_message(update, text, reply_markup)
+            )
 
-        except DatabaseError as e:
-            await self.handle_database_error(update, e, "delete_project")
+    async def _handle_change_default_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle change default project callback."""
+        # Show project selection for changing default
+        projects = await self.db.get_all_active_projects()
+        
+        if not projects:
+            await self.edit_message(update, INFO_MESSAGES['NO_PROJECTS'])
+            return
+
+        message = f"""
+{EMOJI.get('DEFAULT', '🌟')} **Choose New Default Project**
+
+Select a project to set as your default:
+        """
+
+        keyboard_buttons = []
+        for project in projects[:10]:
+            keyboard_buttons.append([
+                InlineKeyboardButton(
+                    f"{project.key}: {project.name[:30]}",
+                    callback_data=f"setdefault_{project.key}"
+                )
+            ])
+
+        keyboard = InlineKeyboardMarkup(keyboard_buttons)
+        await self.edit_message(update, message, reply_markup=keyboard)
+
+    # =============================================================================
+    # UTILITY METHODS
+    # =============================================================================
+
+    async def _get_project_issue_statistics(self, project_key: str) -> Dict[str, int]:
+        """Get issue statistics for a project.
+        
+        Args:
+            project_key: Project key
+            
+        Returns:
+            Dictionary of status -> count
+        """
+        try:
+            # This would ideally query Jira for real-time stats
+            # For now, return database stats
+            stats = await self.db.get_project_issue_statistics(project_key)
+            return stats
+        except Exception as e:
+            self.logger.warning(f"Failed to get issue statistics for {project_key}: {e}")
+            return {}
+
+    def _format_project_summary(self, project: Project, is_default: bool = False) -> str:
+        """Format a single project for summary display.
+        
+        Args:
+            project: Project to format
+            is_default: Whether this is the user's default project
+            
+        Returns:
+            Formatted project summary string
+        """
+        status_emoji = "✅" if project.is_active else "❌"
+        default_indicator = " 🌟" if is_default else ""
+        
+        summary = f"{status_emoji} **{project.key}**: {project.name}{default_indicator}"
+        
+        if not self.config.compact_messages:
+            if project.issue_count > 0:
+                summary += f" ({project.issue_count} issues)"
+            
+            if project.description:
+                description = self.formatter._truncate_text(project.description, 60)
+                summary += f"\n   📄 {description}"
+        
+        return summary
+
+    async def _validate_project_access(self, user: User, project: Project) -> bool:
+        """Validate if user can access a project.
+        
+        Args:
+            user: User requesting access
+            project: Project to access
+            
+        Returns:
+            True if access is allowed
+        """
+        # Basic validation - can be extended with more complex logic
+        if not project.is_active and user.role == UserRole.USER:
+            return False
+        
+        return True
