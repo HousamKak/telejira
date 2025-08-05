@@ -13,14 +13,14 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 from .base_handler import BaseHandler
-from ..models.project import Project, ProjectSummary
-from ..models.user import User
-from ..models.enums import UserRole, ErrorType
-from ..services.database import DatabaseError
-from ..services.jira_service import JiraAPIError
-from ..utils.constants import EMOJI, SUCCESS_MESSAGES, ERROR_MESSAGES, INFO_MESSAGES
-from ..utils.validators import InputValidator, ValidationResult
-from ..utils.formatters import MessageFormatter
+from models.project import Project, ProjectSummary
+from models.user import User
+from models.enums import UserRole, ErrorType
+from services.database import DatabaseError
+from services.jira_service import JiraAPIError
+from utils.constants import EMOJI, SUCCESS_MESSAGES, ERROR_MESSAGES, INFO_MESSAGES
+from utils.validators import InputValidator, ValidationResult
+from utils.formatters import MessageFormatter
 
 
 class ProjectHandlers(BaseHandler):

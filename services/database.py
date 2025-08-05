@@ -14,10 +14,10 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any, Union, Callable
 import aiosqlite
 
-from ..models.user import User, UserPreferences, UserSession
-from ..models.project import Project, ProjectStats
-from ..models.issue import JiraIssue, IssueComment
-from ..models.enums import UserRole, IssuePriority, IssueType, IssueStatus
+from models.user import User, UserPreferences, UserSession
+from models.project import Project, ProjectStats
+from models.issue import JiraIssue, IssueComment
+from models.enums import UserRole, IssuePriority, IssueType, IssueStatus
 
 
 class DatabaseError(Exception):

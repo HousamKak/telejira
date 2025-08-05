@@ -15,10 +15,10 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError, BadRequest, NetworkError, TimedOut, RetryAfter
 from telegram.constants import ParseMode, MessageLimit
 
-from ..models.project import Project
-from ..models.issue import JiraIssue
-from ..models.user import User
-from ..models.enums import IssuePriority, IssueType, IssueStatus
+from models.project import Project
+from models.issue import JiraIssue
+from models.user import User
+from models.enums import IssuePriority, IssueType, IssueStatus
 
 
 class TelegramServiceError(Exception):

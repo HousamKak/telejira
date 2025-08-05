@@ -13,14 +13,14 @@ from telegram import Update, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.error import TelegramError
 
-from ..config.settings import BotConfig
-from ..services.database import DatabaseManager, DatabaseError
-from ..services.jira_service import JiraService, JiraAPIError
-from ..services.telegram_service import TelegramService
-from ..models.user import User, UserPreferences, UserSession
-from ..models.enums import UserRole, WizardState, ErrorType
-from ..utils.constants import EMOJI, ERROR_MESSAGES, SUCCESS_MESSAGES
-from ..utils.validators import InputValidator, ValidationResult
+from config.settings import BotConfig
+from services.database import DatabaseManager, DatabaseError
+from services.jira_service import JiraService, JiraAPIError
+from services.telegram_service import TelegramService
+from models.user import User, UserPreferences, UserSession
+from models.enums import UserRole, WizardState, ErrorType
+from utils.constants import EMOJI, ERROR_MESSAGES, SUCCESS_MESSAGES
+from utils.validators import InputValidator, ValidationResult
 
 
 class BaseHandler(ABC):

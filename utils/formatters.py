@@ -11,10 +11,10 @@ from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Union, Tuple
 from urllib.parse import quote
 
-from ..models.project import Project, ProjectSummary
-from ..models.issue import JiraIssue
-from ..models.user import User
-from ..models.enums import IssuePriority, IssueType, IssueStatus, UserRole
+from models.project import Project, ProjectSummary
+from models.issue import JiraIssue
+from models.user import User
+from models.enums import IssuePriority, IssueType, IssueStatus, UserRole
 from .constants import EMOJI, MAX_MESSAGE_LENGTH, MAX_SUMMARY_LENGTH
 
 

@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 
-from ..models.enums import IssuePriority, IssueType
+from models.enums import IssuePriority, IssueType
 
 
 @dataclass(frozen=True)
@@ -349,15 +349,16 @@ def load_config_from_env(env_file: Optional[str] = None) -> BotConfig:
         else:
             return default
 
+    # Create and return the configuration
     return BotConfig(
         # Required fields
-        telegram_token=os.getenv('TELEGRAM_TOKEN', ''),
-        jira_domain=os.getenv('JIRA_DOMAIN', ''),
-        jira_email=os.getenv('JIRA_EMAIL', ''),
-        jira_api_token=os.getenv('JIRA_API_TOKEN', ''),
+        telegram_token=os.getenv('TELEGRAM_TOKEN', '').strip(),
+        jira_domain=os.getenv('JIRA_DOMAIN', '').strip(),
+        jira_email=os.getenv('JIRA_EMAIL', '').strip(),
+        jira_api_token=os.getenv('JIRA_API_TOKEN', '').strip(),
         
         # Database configuration
-        database_path=os.getenv('DATABASE_PATH', 'bot_data.db'),
+        database_path=os.getenv('DATABASE_PATH', 'bot_data.db').strip(),
         database_pool_size=parse_int('DATABASE_POOL_SIZE', 10, 1, 100),
         database_timeout=parse_int('DATABASE_TIMEOUT', 30, 5, 300),
         
@@ -381,7 +382,7 @@ def load_config_from_env(env_file: Optional[str] = None) -> BotConfig:
         
         # Logging settings
         log_level=os.getenv('LOG_LEVEL', 'INFO').upper(),
-        log_file=os.getenv('LOG_FILE', 'telegram_jira_bot.log'),
+        log_file=os.getenv('LOG_FILE', 'telegram_jira_bot.log').strip(),
         log_max_size=parse_int('LOG_MAX_SIZE', 10 * 1024 * 1024, 1024 * 1024, 100 * 1024 * 1024),
         log_backup_count=parse_int('LOG_BACKUP_COUNT', 5, 1, 20),
         
@@ -393,7 +394,7 @@ def load_config_from_env(env_file: Optional[str] = None) -> BotConfig:
         
         # Telegram settings
         telegram_timeout=parse_int('TELEGRAM_TIMEOUT', 30, 5, 300),
-        telegram_pool_timeout=parse_float('TELEGRAM_POOL_TIMEOUT', 1.0, 0.0),
+        telegram_pool_timeout=parse_int('TELEGRAM_POOL_TIMEOUT', 1, 0, 100),
         telegram_connection_pool_size=parse_int('TELEGRAM_CONNECTION_POOL_SIZE', 8, 1, 100),
         
         # Feature flags
@@ -415,6 +416,31 @@ def load_config_from_env(env_file: Optional[str] = None) -> BotConfig:
         show_user_avatars=parse_bool('SHOW_USER_AVATARS', False),
         compact_mode=parse_bool('COMPACT_MODE', False)
     )
+
+
+# Alias function for backward compatibility
+def load_config(env_file: Optional[str] = None) -> BotConfig:
+    """Load configuration from environment variables (alias for load_config_from_env).
+    
+    Args:
+        env_file: Optional path to .env file
+        
+    Returns:
+        Loaded and validated bot configuration
+    """
+    return load_config_from_env(env_file)
+
+
+def get_config_warnings(config: BotConfig) -> List[str]:
+    """Get configuration warnings (alias for validate_config).
+    
+    Args:
+        config: Configuration to validate
+        
+    Returns:
+        List of warning messages
+    """
+    return validate_config(config)
 
 
 def setup_logging(config: BotConfig) -> None:
