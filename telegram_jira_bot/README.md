@@ -80,6 +80,14 @@ pip install -r requirements.txt -r requirements-dev.txt
 pip install -e .
 ```
 
+On Windows, you can run the setup script to automate these steps:
+
+```bat
+setup.bat
+```
+
+This will create a virtual environment, install dependencies (including `requirements-dev.txt` if present), install pre-commit hooks, and copy `.env.example` to `.env` if it doesn't exist.
+
 ### 3. Configure the Bot
 
 ```bash
@@ -89,6 +97,8 @@ cp .env.example .env
 # Edit .env with your configuration
 nano .env  # or use your preferred editor
 ```
+
+If you ran `setup.bat`, the `.env` file was created automatically. Open it and update the credentials as needed.
 
 **Required configuration:**
 ```env
