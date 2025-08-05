@@ -73,27 +73,90 @@ class TelegramJiraBot:
         self._setup_logging()
         self.logger = logging.getLogger(__name__)
 
+        # Shutdown flag
+        self._shutdown_requested = False
+
     def _setup_logging(self) -> None:
         """Setup logging configuration with rotation and formatting."""
-        log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        
-        # Configure root logger
-        logging.basicConfig(
-            level=getattr(logging, self.config.log_level.upper(), logging.INFO),
-            format=log_format,
-            handlers=[
-                logging.StreamHandler(sys.stdout),
-                logging.FileHandler("bot.log", encoding='utf-8')
-            ]
-        )
+        try:
+            from logging.handlers import RotatingFileHandler
+            
+            # Create formatters
+            console_formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            
+            file_formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
 
-        # Set specific logger levels
-        logging.getLogger("telegram").setLevel(logging.WARNING)
-        logging.getLogger("httpx").setLevel(logging.WARNING)
-        logging.getLogger("urllib3").setLevel(logging.WARNING)
+            # Setup root logger
+            root_logger = logging.getLogger()
+            root_logger.setLevel(getattr(logging, self.config.log_level.upper()))
 
-    async def initialize_services(self) -> None:
-        """Initialize all required services.
+            # Clear existing handlers
+            root_logger.handlers.clear()
+
+            # Console handler
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setFormatter(console_formatter)
+            console_handler.setLevel(logging.INFO)
+            root_logger.addHandler(console_handler)
+
+            # File handler with rotation
+            if self.config.log_file:
+                file_handler = RotatingFileHandler(
+                    self.config.log_file,
+                    maxBytes=self.config.log_max_size,
+                    backupCount=self.config.log_backup_count,
+                    encoding='utf-8'
+                )
+                file_handler.setFormatter(file_formatter)
+                file_handler.setLevel(getattr(logging, self.config.log_level.upper()))
+                root_logger.addHandler(file_handler)
+
+            # Reduce noise from some third-party libraries
+            logging.getLogger('httpx').setLevel(logging.WARNING)
+            logging.getLogger('telegram').setLevel(logging.WARNING)
+            logging.getLogger('urllib3').setLevel(logging.WARNING)
+
+        except Exception as e:
+            print(f"Failed to setup logging: {e}")
+            logging.basicConfig(level=logging.INFO)
+
+    async def initialize(self) -> None:
+        """Initialize all bot components.
+
+        Raises:
+            RuntimeError: If initialization fails
+        """
+        try:
+            self.logger.info("🤖 Initializing Telegram-Jira Bot...")
+            self.logger.info(f"📝 Config: {self.config.jira_domain}, DB: {self.config.database_path}")
+
+            # Initialize services
+            await self._initialize_services()
+            await self._test_connections()
+            
+            # Initialize handlers
+            self._initialize_handlers()
+
+            # Initialize Telegram application
+            self._initialize_telegram_app()
+            
+            # Register handlers with the application
+            self._register_handlers()
+
+            self.logger.info("✅ Bot initialization completed successfully")
+
+        except Exception as e:
+            self.logger.error(f"❌ Bot initialization failed: {e}")
+            raise RuntimeError(f"Bot initialization failed: {e}") from e
+
+    async def _initialize_services(self) -> None:
+        """Initialize core services (database, Jira, Telegram).
 
         Raises:
             RuntimeError: If service initialization fails
@@ -104,66 +167,63 @@ class TelegramJiraBot:
             # Initialize database
             self.database = DatabaseManager(
                 db_path=self.config.database_path,
-                backup_enabled=self.config.backup_enabled,
-                backup_interval_hours=self.config.backup_interval_hours
+                pool_size=self.config.database_pool_size,
+                timeout=self.config.database_timeout,
             )
             await self.database.initialize()
-            self.logger.info("✅ Database initialized successfully")
+            self.logger.info("✅ Database service initialized")
 
             # Initialize Jira service
             self.jira_service = JiraService(
                 domain=self.config.jira_domain,
                 email=self.config.jira_email,
                 api_token=self.config.jira_api_token,
-                timeout=self.config.request_timeout,
-                max_retries=self.config.max_retries
+                timeout=self.config.jira_timeout,
+                max_retries=self.config.jira_max_retries,
             )
-            self.logger.info("✅ Jira service initialized successfully")
+            self.logger.info("✅ Jira service initialized")
 
             # Initialize Telegram service
             self.telegram_service = TelegramService(
-                bot_token=self.config.telegram_bot_token,
-                timeout=self.config.request_timeout,
-                max_retries=self.config.max_retries
+                token=self.config.telegram_token,
+                timeout=self.config.telegram_timeout,
             )
-            await self.telegram_service.initialize()
-            self.logger.info("✅ Telegram service initialized successfully")
-
-            self.logger.info("✅ Services initialized successfully")
+            self.logger.info("✅ Telegram service initialized")
 
         except Exception as e:
             self.logger.error(f"❌ Failed to initialize services: {e}")
             raise RuntimeError(f"Service initialization failed: {e}") from e
 
-    async def test_connections(self) -> None:
+    async def _test_connections(self) -> None:
         """Test connections to external services.
 
         Raises:
-            JiraAPIError: If Jira connection fails
-            RuntimeError: If other connections fail
+            RuntimeError: If connection tests fail
         """
-        self.logger.info("Testing connections...")
-
         try:
+            self.logger.info("Testing service connections...")
+
+            # Test database connection
+            if self.database:
+                user_count = await self.database.get_user_count()
+                self.logger.info(f"✅ Database connection OK ({user_count} users)")
+
             # Test Jira connection
-            self.logger.info("Testing Jira connection...")
-            user_info = await self.jira_service.get_current_user()
-            projects = await self.jira_service.get_all_projects()
-            
-            self.logger.info(
-                f"✅ Jira connection successful - User: {user_info.get('displayName', 'Unknown')}, "
-                f"Projects accessible: {len(projects)}"
-            )
+            if self.jira_service:
+                current_user = await self.jira_service.get_current_user()
+                self.logger.info(f"✅ Jira connection OK (user: {current_user.get('displayName', 'Unknown')})")
+
+            # Telegram connection will be tested when the bot starts
 
         except JiraAPIError as e:
             if e.status_code == 401:
-                raise JiraAPIError(
-                    "Jira authentication failed. Please check your email and API token.",
-                    status_code=e.status_code,
+                raise RuntimeError(
+                    "Jira authentication failed. Please check your API token and email. "
+                    "Visit https://id.atlassian.com/manage-profile/security/api-tokens to create a new token."
                 ) from e
             elif e.status_code == 403:
-                raise JiraAPIError(
-                    "Jira access denied. Please check your account permissions.",
+                raise RuntimeError(
+                    "Jira access forbidden. Please check your account permissions.",
                     status_code=e.status_code,
                 ) from e
             else:
@@ -227,6 +287,31 @@ class TelegramJiraBot:
             self.logger.error(f"❌ Failed to initialize handlers: {e}")
             raise RuntimeError(f"Handler initialization failed: {e}") from e
 
+    def _initialize_telegram_app(self) -> None:
+        """Initialize the Telegram application.
+
+        Raises:
+            RuntimeError: If Telegram app initialization fails
+        """
+        try:
+            self.logger.info("Initializing Telegram application...")
+            
+            self.application = (
+                Application.builder()
+                .token(self.config.telegram_token)
+                .pool_timeout(self.config.telegram_pool_timeout)
+                .connection_pool_size(self.config.telegram_connection_pool_size)
+                .read_timeout(self.config.telegram_timeout)
+                .write_timeout(self.config.telegram_timeout)
+                .build()
+            )
+
+            self.logger.info("✅ Telegram application initialized")
+
+        except Exception as e:
+            self.logger.error(f"❌ Failed to initialize Telegram app: {e}")
+            raise RuntimeError(f"Telegram app initialization failed: {e}") from e
+
     def _register_handlers(self) -> None:
         """Register all handlers with the Telegram application.
 
@@ -282,52 +367,59 @@ class TelegramJiraBot:
             ]
 
             # Add admin commands if enabled
-            if self.config.enable_admin:
-                admin_commands = [
-                    CommandHandler("admin", self.admin_handlers.admin_menu),
-                    CommandHandler("adduser", self.admin_handlers.add_user),
-                    CommandHandler("removeuser", self.admin_handlers.remove_user),
-                    CommandHandler("listusers", self.admin_handlers.list_users),
-                    CommandHandler("setrole", self.admin_handlers.set_user_role),
-                    CommandHandler("addproject", self.admin_handlers.add_project),
-                    CommandHandler("refresh", self.admin_handlers.refresh_projects),
-                    CommandHandler("stats", self.admin_handlers.show_stats),
-                ]
-                command_handlers.extend(admin_commands)
+            admin_commands = [
+                CommandHandler("admin", self.admin_handlers.admin_menu),
+                CommandHandler("adduser", self.admin_handlers.add_user),
+                CommandHandler("removeuser", self.admin_handlers.remove_user),
+                CommandHandler("listusers", self.admin_handlers.list_users),
+                CommandHandler("setrole", self.admin_handlers.set_user_role),
+                CommandHandler("addproject", self.admin_handlers.add_project),
+                CommandHandler("refresh", self.admin_handlers.refresh_projects),
+                CommandHandler("stats", self.admin_handlers.show_stats),
+            ]
+            command_handlers.extend(admin_commands)
 
             # Add shortcut handlers if enabled
             if self.config.enable_shortcuts:
                 shortcut_handlers = [
                     CommandHandler("c", self.issue_handlers.create_issue),
-                    CommandHandler("mi", self.issue_handlers.list_my_issues),
-                    CommandHandler("li", self.issue_handlers.list_issues),
-                    CommandHandler("s", self.issue_handlers.search_issues),
+                    CommandHandler("l", self.issue_handlers.list_issues),
+                    CommandHandler("m", self.issue_handlers.list_my_issues),
                     CommandHandler("p", self.project_handlers.list_projects),
                 ]
                 command_handlers.extend(shortcut_handlers)
-
-                # Note: Wizard shortcuts (/w, /q) are already handled in the ConversationHandler
-                # They are registered as entry_points in wizard_handlers.get_conversation_handler()
 
             # Register all command handlers
             for handler in command_handlers:
                 self.application.add_handler(handler)
 
-            # Register callback query handler for inline keyboards
+            # Register callback query handlers (for inline keyboards)
             self.application.add_handler(
-                CallbackQueryHandler(self.base_handler.handle_callback_query)
+                CallbackQueryHandler(self.project_handlers.handle_callback, pattern=r'^project_.*')
+            )
+            self.application.add_handler(
+                CallbackQueryHandler(self.issue_handlers.handle_callback, pattern=r'^issue_.*')
+            )
+            self.application.add_handler(
+                CallbackQueryHandler(self.admin_handlers.handle_callback, pattern=r'^admin_.*')
             )
 
-            # Register message handler for issue creation from plain text
-            if self.config.enable_quick_create:
+            # Register message handlers for shortcuts and natural language
+            if self.config.enable_shortcuts:
+                # Natural language issue creation (e.g., "HIGH BUG Login broken")
                 self.application.add_handler(
                     MessageHandler(
-                        filters.TEXT & ~filters.COMMAND,
-                        self.issue_handlers.handle_message_issue_creation,
+                        filters.TEXT & ~filters.COMMAND & filters.Regex(r'^(LOW|MEDIUM|HIGH|CRITICAL|HIGHEST)\s+(BUG|TASK|STORY|EPIC)\s+.+'),
+                        self.issue_handlers.create_issue_from_text
                     )
                 )
 
-            # Register error handler
+            # General message handler (for fallback)
+            self.application.add_handler(
+                MessageHandler(filters.TEXT & ~filters.COMMAND, self.base_handler.handle_unknown)
+            )
+
+            # Error handler
             self.application.add_error_handler(self._error_handler)
 
             self.logger.info("✅ All handlers registered successfully")
@@ -335,218 +427,162 @@ class TelegramJiraBot:
         except Exception as e:
             self.logger.error(f"❌ Failed to register handlers: {e}")
             raise RuntimeError(f"Handler registration failed: {e}") from e
-    
+
     async def _error_handler(self, update: Update, context) -> None:
-        """Handle errors in bot updates.
+        """Handle errors that occur during message processing."""
+        try:
+            error = context.error
+            self.logger.error(f"Update {update} caused error {error}")
 
-        Args:
-            update: Telegram update object
-            context: Telegram context object
-        """
-        self.logger.error(f"Exception while handling an update: {context.error}")
-
-        # Send error message to user if possible
-        if update and update.effective_chat:
-            try:
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text="❌ An error occurred while processing your request. Please try again later.",
+            # Try to send a user-friendly error message
+            if update and update.effective_chat:
+                error_message = (
+                    "❌ <b>Something went wrong</b>\n\n"
+                    "An unexpected error occurred. Please try again.\n\n"
+                    "If the problem persists, contact your administrator."
                 )
-            except Exception as send_error:
-                self.logger.error(f"Failed to send error message to user: {send_error}")
+                
+                try:
+                    if update.callback_query:
+                        await update.callback_query.edit_message_text(
+                            error_message, parse_mode="HTML"
+                        )
+                    elif update.message:
+                        await update.message.reply_text(
+                            error_message, parse_mode="HTML"
+                        )
+                except Exception as send_error:
+                    self.logger.error(f"Failed to send error message: {send_error}")
 
-    def create_application(self) -> Application:
-        """Create and configure the Telegram application.
+        except Exception as handler_error:
+            self.logger.error(f"Error in error handler: {handler_error}")
 
-        Returns:
-            Configured Application instance
-
-        Raises:
-            RuntimeError: If application creation fails
-        """
-        try:
-            self.logger.info("Creating Telegram application...")
-
-            # Create application
-            self.application = (
-                Application.builder()
-                .token(self.config.telegram_bot_token)
-                .read_timeout(self.config.request_timeout)
-                .write_timeout(self.config.request_timeout)
-                .connect_timeout(self.config.request_timeout)
-                .pool_timeout(self.config.request_timeout)
-                .build()
-            )
-
-            # Initialize handlers
-            self._initialize_handlers()
-
-            self.logger.info("✅ Telegram application created successfully")
-            return self.application
-
-        except Exception as e:
-            self.logger.error(f"❌ Failed to create application: {e}")
-            raise RuntimeError(f"Application creation failed: {e}") from e
-
-    async def _graceful_shutdown(self) -> None:
-        """Perform graceful shutdown of all services."""
-        self.logger.info("Starting graceful shutdown...")
-
-        try:
-            # Close database connections
-            if self.database:
-                await self.database.close()
-                self.logger.info("✅ Database connections closed")
-
-            # Close Jira service connections  
-            if self.jira_service:
-                await self.jira_service.close()
-                self.logger.info("✅ Jira service closed")
-
-            # Close Telegram service connections
-            if self.telegram_service:
-                await self.telegram_service.close()
-                self.logger.info("✅ Telegram service closed")
-
-        except Exception as e:
-            self.logger.error(f"❌ Error during shutdown: {e}")
-
-        self.logger.info("✅ Graceful shutdown completed")
-
-    async def run(self) -> None:
-        """Run the bot with proper lifecycle management.
+    async def start(self) -> None:
+        """Start the bot and begin polling for updates.
 
         Raises:
-            RuntimeError: If bot execution fails
+            RuntimeError: If the bot fails to start
         """
+        if not self.application:
+            raise RuntimeError("Application must be initialized before starting")
+
         try:
-            # Initialize services
-            await self.initialize_services()
-
-            # Test connections
-            await self.test_connections()
-
-            # Create and configure application
-            self.create_application()
-
-            # Register handlers
-            self._register_handlers()
-
-            self.logger.info("✅ Bot initialized successfully!")
+            self.logger.info("🚀 Starting Telegram-Jira Bot...")
 
             # Start the application
             await self.application.initialize()
             await self.application.start()
-
-            self.logger.info("🔄 Bot is now running... Press Ctrl+C to stop.")
-
+            
+            # Get bot info
+            bot_info = await self.application.bot.get_me()
+            self.logger.info(f"✅ Bot started successfully: @{bot_info.username}")
+            self.logger.info(f"📊 Bot ID: {bot_info.id}")
+            
             # Start polling
+            self.logger.info("📡 Starting polling for updates...")
             await self.application.updater.start_polling(
                 drop_pending_updates=True,
-                allowed_updates=Update.ALL_TYPES,
+                allowed_updates=['message', 'callback_query', 'inline_query']
             )
 
-            # Wait for stop signal
-            await self.application.updater.wait()
+            self.logger.info("🎉 Bot is now running and ready to receive messages!")
+
+        except Exception as e:
+            self.logger.error(f"❌ Failed to start bot: {e}")
+            raise RuntimeError(f"Bot startup failed: {e}") from e
+
+    async def stop(self) -> None:
+        """Gracefully stop the bot and cleanup resources."""
+        try:
+            self.logger.info("🛑 Stopping Telegram-Jira Bot...")
+            self._shutdown_requested = True
+
+            if self.application:
+                # Stop polling
+                if self.application.updater.running:
+                    await self.application.updater.stop()
+                    self.logger.info("✅ Stopped polling for updates")
+
+                # Stop the application
+                await self.application.stop()
+                await self.application.shutdown()
+                self.logger.info("✅ Telegram application stopped")
+
+            # Close services
+            if self.jira_service:
+                await self.jira_service.close()
+                self.logger.info("✅ Jira service closed")
+
+            if self.database:
+                await self.database.close()
+                self.logger.info("✅ Database connections closed")
+
+            self.logger.info("👋 Bot stopped gracefully")
+
+        except Exception as e:
+            self.logger.error(f"❌ Error during shutdown: {e}")
+
+    def _setup_signal_handlers(self) -> None:
+        """Setup signal handlers for graceful shutdown."""
+        def signal_handler(signum, frame):
+            self.logger.info(f"🔔 Received signal {signum}, initiating shutdown...")
+            asyncio.create_task(self.stop())
+
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
+    async def run(self) -> None:
+        """Run the bot with proper initialization and cleanup."""
+        try:
+            # Setup signal handlers
+            self._setup_signal_handlers()
+            
+            # Initialize and start the bot
+            await self.initialize()
+            await self.start()
+
+            # Keep the bot running
+            self.logger.info("🎯 Bot is running. Press Ctrl+C to stop.")
+            
+            # Wait until shutdown is requested
+            while not self._shutdown_requested:
+                await asyncio.sleep(1)
 
         except KeyboardInterrupt:
-            self.logger.info("👋 Received shutdown signal")
+            self.logger.info("🔔 Keyboard interrupt received")
         except Exception as e:
-            self.logger.error(f"❌ Error in runner: {e}")
-            raise RuntimeError(f"Bot execution failed: {e}") from e
+            self.logger.error(f"❌ Unexpected error in main loop: {e}")
         finally:
-            # Stop the application
-            if self.application:
-                try:
-                    await self.application.stop()
-                    await self.application.shutdown()
-                    self.logger.info("✅ Telegram application stopped")
-                except Exception as e:
-                    self.logger.error(f"❌ Error stopping application: {e}")
-
-            # Perform graceful shutdown
-            await self._graceful_shutdown()
+            await self.stop()
 
 
-async def run_bot(bot: TelegramJiraBot) -> None:
-    """Run the bot with proper error handling.
-
-    Args:
-        bot: The TelegramJiraBot instance
-
-    Raises:
-        RuntimeError: If bot execution fails
-    """
-    logger = logging.getLogger(__name__)
-    
+async def main() -> None:
+    """Main entry point for the application."""
     try:
-        await bot.run()
-    except Exception as e:
-        logger.error(f"❌ Error in runner: {e}")
-        raise
-
-
-def main() -> None:
-    """Main entry point that uses a single event loop for the entire bot lifecycle."""
-    # Basic logging setup
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=[logging.StreamHandler()]
-    )
-    logger = logging.getLogger(__name__)
-
-    # Windows event loop policy
-    if sys.platform.startswith("win"):
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-    # Load configuration
-    try:
-        config = load_config_from_env(env_file=str(Path(__file__).parent / ".env"))
-        logging.getLogger().setLevel(getattr(logging, config.log_level.upper(), logging.INFO))
-    except Exception as e:
-        logger.error(f"❌ Failed to load configuration: {e}")
-        sys.exit(1)
-
-    # Create bot instance
-    try:
+        # Load configuration from environment
+        config = load_config_from_env()
+        
+        # Create and run the bot
         bot = TelegramJiraBot(config)
-        logger.info(f"🚀 Starting {BOT_INFO['NAME']} v{BOT_INFO['VERSION']}")
-        logger.info(f"📍 Jira Domain: {config.jira_domain}")
-        logger.info(f"👤 Jira User: {config.jira_email}")
+        await bot.run()
+
     except Exception as e:
-        logger.error(f"❌ Failed to initialize bot: {e}")
-        sys.exit(1)
-
-    # Run the bot with proper error handling
-    async def bootstrap_and_run():
-        """Bootstrap the bot and run it."""
-        try:
-            await run_bot(bot)
-        except Exception as e:
-            logger.error(f"❌ Error in bootstrap: {e}")
-            raise
-        finally:
-            logger.info("👋 Bot stopped")
-
-    # Signal handlers for graceful shutdown
-    def signal_handler(signum, frame):
-        logger.info(f"Received signal {signum}, shutting down gracefully...")
-        # The asyncio loop will handle the shutdown via KeyboardInterrupt
-        raise KeyboardInterrupt()
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    # Run the bot
-    try:
-        asyncio.run(bootstrap_and_run())
-    except KeyboardInterrupt:
-        logger.info("👋 Shutdown completed")
-    except Exception as e:
-        logger.error(f"❌ Bot crashed: {e}")
+        print(f"❌ Fatal error: {e}")
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        # Check Python version
+        if sys.version_info < (3, 8):
+            print("❌ Python 3.8+ is required")
+            sys.exit(1)
+
+        # Run the bot
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+        print("\n👋 Bot stopped by user")
+    except Exception as e:
+        print(f"❌ Failed to start bot: {e}")
+        sys.exit(1)

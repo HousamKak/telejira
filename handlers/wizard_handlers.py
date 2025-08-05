@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Wizard handlers for the Telegram-Jira bot.
+Refactored Wizard handlers for the Telegram-Jira bot.
 
 Handles interactive wizard functionality for guided setup and operations.
 Provides step-by-step guidance for project setup, issue creation, and configuration.
@@ -9,8 +9,9 @@ Provides step-by-step guidance for project setup, issue creation, and configurat
 import logging
 from typing import Optional, List, Dict, Any, Union, Tuple
 from enum import Enum
+from dataclasses import dataclass
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
@@ -21,15 +22,22 @@ from telegram.ext import (
 )
 
 from .base_handler import BaseHandler
-from models.project import Project, ProjectSummary
-from models.issue import JiraIssue
-from models.user import User, UserPreferences
-from models.enums import IssuePriority, IssueType, IssueStatus, UserRole, ErrorType
+from models.project import Project
+from models.user import User
+from models.enums import IssuePriority, IssueType, UserRole, ErrorType
 from services.database import DatabaseError
 from services.jira_service import JiraAPIError
 from utils.constants import EMOJI, SUCCESS_MESSAGES, ERROR_MESSAGES, INFO_MESSAGES
 from utils.validators import InputValidator, ValidationResult
-from utils.formatters import MessageFormatter
+from utils.formatters import MessageFormatter, truncate_text
+from utils.keyboards import (
+    cb, parse_cb, build_project_list_keyboard, build_issue_type_keyboard,
+    build_issue_priority_keyboard, build_confirm_keyboard, build_back_cancel_keyboard
+)
+from utils.messages import (
+    setup_welcome_message, confirm_project_message, quick_issue_summary_message,
+    no_projects_message, issue_created_success_message
+)
 
 
 # Conversation states for ConversationHandler
@@ -39,8 +47,7 @@ class ConversationState(Enum):
     SETUP_WELCOME = 0
     SETUP_SELECT_PROJECT = 1
     SETUP_CONFIRM_PROJECT = 2
-    SETUP_PREFERENCES = 3
-    SETUP_COMPLETE = 4
+    SETUP_COMPLETE = 3
     
     # Issue creation wizard states
     ISSUE_SELECT_PROJECT = 10
@@ -50,21 +57,101 @@ class ConversationState(Enum):
     ISSUE_ENTER_DESCRIPTION = 14
     ISSUE_CONFIRM_CREATE = 15
     ISSUE_COMPLETE = 16
+
+
+@dataclass
+class IssueWizardData:
+    """Strongly-typed wizard context for issue creation."""
+    project_key: Optional[str] = None
+    issue_type: Optional[str] = None  # enum name
+    priority: Optional[str] = None    # enum name
+    summary: Optional[str] = None
+    description: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for storage."""
+        return {
+            'project_key': self.project_key,
+            'issue_type': self.issue_type,
+            'priority': self.priority,
+            'summary': self.summary,
+            'description': self.description,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'IssueWizardData':
+        """Create from dictionary."""
+        return cls(
+            project_key=data.get('project_key'),
+            issue_type=data.get('issue_type'),
+            priority=data.get('priority'),
+            summary=data.get('summary'),
+            description=data.get('description', ''),
+        )
+
+
+def wizard_try(context_label: str):
+    """Decorator for wizard error handling."""
+    def decorator(func):
+        async def wrapper(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+            try:
+                return await func(self, update, context)
+            except DatabaseError as e:
+                await self.handle_error(update, e, f"{context_label} - Database error")
+                return ConversationHandler.END
+            except JiraAPIError as e:
+                await self.handle_error(update, e, f"{context_label} - Jira API error")
+                return ConversationHandler.END
+            except ValueError as e:
+                await self.handle_error(update, e, f"{context_label} - Validation error")
+                return ConversationHandler.END
+            except Exception as e:
+                await self.handle_error(update, e, f"{context_label} - Unexpected error")
+                return ConversationHandler.END
+        return wrapper
+    return decorator
+
+
+def get_issue_ctx(context: ContextTypes.DEFAULT_TYPE) -> IssueWizardData:
+    """Get issue wizard context data."""
+    if context.user_data is None:
+        context.user_data = {}
     
-    # Project wizard states  
-    PROJECT_SELECT_ACTION = 20
-    PROJECT_ENTER_KEY = 21
-    PROJECT_ENTER_NAME = 22
-    PROJECT_ENTER_DESCRIPTION = 23
-    PROJECT_CONFIRM_CREATE = 24
-    PROJECT_COMPLETE = 25
+    data = context.user_data.get('issue_wizard', {})
+    return IssueWizardData.from_dict(data)
+
+
+def set_issue_ctx(context: ContextTypes.DEFAULT_TYPE, data: IssueWizardData) -> None:
+    """Set issue wizard context data."""
+    if context.user_data is None:
+        context.user_data = {}
     
-    # Edit wizard states
-    EDIT_SELECT_ISSUE = 30
-    EDIT_SELECT_FIELD = 31
-    EDIT_ENTER_VALUE = 32
-    EDIT_CONFIRM_CHANGE = 33
-    EDIT_COMPLETE = 34
+    context.user_data['issue_wizard'] = data.to_dict()
+
+
+def require(ctx: IssueWizardData, *fields) -> None:
+    """Guard helper to ensure required fields are present."""
+    missing = [f for f in fields if getattr(ctx, f) in (None, "")]
+    if missing:
+        raise ValueError(f"Missing required fields: {', '.join(missing)}")
+
+
+async def reply_or_edit(update: Update, text: str, reply_markup=None, parse_mode="HTML") -> None:
+    """Reply or edit message based on update type."""
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text, reply_markup=reply_markup, parse_mode=parse_mode
+        )
+    else:
+        await update.message.reply_text(
+            text, reply_markup=reply_markup, parse_mode=parse_mode
+        )
+
+
+async def answer_cb(query) -> None:
+    """Answer callback query to remove loading state."""
+    if query:
+        await query.answer()
 
 
 class WizardHandlers(BaseHandler):
@@ -84,734 +171,571 @@ class WizardHandlers(BaseHandler):
 
     async def handle_error(self, update: Update, error: Exception, context: str = "") -> None:
         """Handle errors specific to wizard operations."""
+        error_message = f"❌ <b>Wizard Error</b>\n\n"
+        
         if isinstance(error, DatabaseError):
-            await self.handle_database_error(update, error, context)
+            error_message += "Database operation failed. Please try again later."
         elif isinstance(error, JiraAPIError):
-            await self.handle_jira_error(update, error, context)
+            error_message += "Jira API error. Please check your permissions and try again."
         elif isinstance(error, ValueError):
-            await self.send_error_message(
-                update, 
-                f"Invalid input: {str(error)}", 
-                ErrorType.VALIDATION_ERROR
-            )
+            error_message += f"Invalid input: {str(error)}"
         else:
-            await self.send_error_message(
-                update,
-                f"Wizard error: {str(error)}",
-                ErrorType.UNKNOWN_ERROR
-            )
+            error_message += "An unexpected error occurred. Please try again."
+        
+        # Add helpful navigation
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏠 Return to Start", callback_data="wizard_restart")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="wizard_cancel")]
+        ])
+        
+        await reply_or_edit(update, error_message, reply_markup=keyboard)
+        
+        # Log the error
+        self.logger.error(f"Wizard error in {context}: {error}")
 
     # =============================================================================
     # COMMAND HANDLERS
     # =============================================================================
 
+    @wizard_try("Wizard Command")
     async def wizard_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Handle /wizard command - start setup wizard."""
-        self.log_handler_start(update, "wizard_command")
-        
+        """Handle /wizard command - show main wizard menu."""
         user = await self.enforce_user_access(update)
         if not user:
             return ConversationHandler.END
 
-        try:
-            await self._show_setup_wizard_welcome(update, context, user)
-            self.log_handler_end(update, "wizard_command")
-            return ConversationState.SETUP_WELCOME.value
+        # Clean up any existing wizard data
+        await self.cleanup_wizard_data(context)
 
-        except Exception as e:
-            await self.handle_error(update, e, "wizard_command")
-            self.log_handler_end(update, "wizard_command", success=False)
-            return ConversationHandler.END
+        # Get user's default project
+        default_project = None
+        if user.default_project_key:
+            try:
+                default_project = await self.db.get_project_by_key(user.default_project_key)
+            except Exception:
+                pass  # Default project might not exist anymore
 
-    async def quick_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Handle /quick command - quick issue creation wizard."""
-        self.log_handler_start(update, "quick_command")
+        # Show wizard welcome
+        welcome_text = setup_welcome_message(user, default_project)
         
-        user = await self.enforce_user_access(update)
-        if not user:
-            return ConversationHandler.END
-
-        try:
-            await self._show_quick_issue_wizard(update, context, user)
-            self.log_handler_end(update, "quick_command")
-            return ConversationState.ISSUE_SELECT_PROJECT.value
-
-        except Exception as e:
-            await self.handle_error(update, e, "quick_command")
-            self.log_handler_end(update, "quick_command", success=False)
-            return ConversationHandler.END
-
-    async def cancel_wizard(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Handle wizard cancellation."""
-        self.log_handler_start(update, "cancel_wizard")
-        
-        try:
-            # Clean up wizard data
-            await self.cleanup_wizard_data(context)
-            
-            message = f"""
-{EMOJI.get('CANCEL', '❌')} **Wizard Cancelled**
-
-No changes were made. You can start again anytime:
-• `/wizard` - Setup wizard
-• `/quick` - Quick issue creation
-• `/help` - Show help
-            """
-            
-            if update.callback_query:
-                await update.callback_query.answer()
-                await update.callback_query.edit_message_text(message)
-            else:
-                await self.send_message(update, message)
-            
-            self.log_handler_end(update, "cancel_wizard")
-            return ConversationHandler.END
-
-        except Exception as e:
-            await self.handle_error(update, e, "cancel_wizard")
-            self.log_handler_end(update, "cancel_wizard", success=False)
-            return ConversationHandler.END
-
-    # =============================================================================
-    # SETUP WIZARD HANDLERS
-    # =============================================================================
-
-    async def _show_setup_wizard_welcome(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user: User) -> None:
-        """Show setup wizard welcome screen."""
-        # Get user's current status
-        default_project = await self.db.get_user_default_project(user.user_id)
-        projects_count = len(await self.db.get_user_projects(user.user_id))
-
-        message = f"""
-{EMOJI.get('WIZARD', '🧙‍♂️')} **Welcome to Setup Wizard**
-
-Hi **{user.username}**! Let me help you get started.
-
-**Current Status:**
-• Role: {user.role.value.replace('_', ' ').title()}
-• Default Project: {default_project.key if default_project else 'None'}
-• Available Projects: {projects_count}
-
-**What would you like to do?**
-        """
-
-        keyboard_buttons = [
-            [InlineKeyboardButton("⭐ Set Default Project", callback_data="setup_default_project")],
-            [InlineKeyboardButton("⚙️ Configure Preferences", callback_data="setup_preferences")],
-            [InlineKeyboardButton("📖 Learn Quick Commands", callback_data="setup_tutorial")]
-        ]
-
-        if self.is_admin(user):
-            keyboard_buttons.append([
-                InlineKeyboardButton("🔧 Admin Setup", callback_data="setup_admin")
-            ])
-
-        keyboard_buttons.append([
-            InlineKeyboardButton("✅ I'm All Set", callback_data="setup_complete"),
-            InlineKeyboardButton("❌ Cancel", callback_data="setup_cancel")
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("⚡ Quick Issue", callback_data="wizard_quick_issue"),
+                InlineKeyboardButton("🔧 Setup", callback_data="wizard_setup")
+            ],
+            [InlineKeyboardButton("❌ Cancel", callback_data="wizard_cancel")]
         ])
 
-        keyboard = InlineKeyboardMarkup(keyboard_buttons)
-        await self.send_message(update, message, reply_markup=keyboard)
+        await reply_or_edit(update, welcome_text, reply_markup=keyboard)
+        return ConversationState.SETUP_WELCOME.value
 
-    async def handle_setup_welcome_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Handle setup welcome callbacks."""
+    @wizard_try("Quick Issue Command")
+    async def quick_issue_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Handle /quick command - start quick issue creation."""
+        user = await self.enforce_user_access(update)
+        if not user:
+            return ConversationHandler.END
+
+        # Initialize wizard context
+        wizard_data = IssueWizardData()
+        set_issue_ctx(context, wizard_data)
+
+        # If user has a default project, use it
+        if user.default_project_key:
+            try:
+                default_project = await self.db.get_project_by_key(user.default_project_key)
+                if default_project:
+                    wizard_data.project_key = default_project.key
+                    set_issue_ctx(context, wizard_data)
+                    return await self._show_issue_type_selection(update, context)
+            except Exception:
+                pass  # Fall through to project selection
+
+        return await self._show_project_selection(update, context, "issue")
+
+    # =============================================================================
+    # CALLBACK HANDLERS
+    # =============================================================================
+
+    @wizard_try("Wizard Callback")
+    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Handle all wizard callback queries."""
         query = update.callback_query
-        await query.answer()
+        await answer_cb(query)
+        
+        if not query or not query.data:
+            return ConversationHandler.END
 
-        if query.data == "setup_default_project":
-            return await self._show_project_selection(update, context)
-        elif query.data == "setup_preferences":
-            return await self._show_preferences_setup(update, context)
-        elif query.data == "setup_tutorial":
-            return await self._show_tutorial(update, context)
-        elif query.data == "setup_admin":
-            return await self._show_admin_setup(update, context)
-        elif query.data == "setup_complete":
-            return await self._complete_setup(update, context)
-        elif query.data == "setup_cancel":
-            return await self.cancel_wizard(update, context)
+        scope, action, payload = parse_cb(query.data)
 
+        # Route callbacks
+        if scope == "wizard":
+            return await self._handle_wizard_callback(update, context, action, payload)
+        elif scope == "setup":
+            return await self._handle_setup_callback(update, context, action, payload)
+        elif scope == "issue":
+            return await self._handle_issue_callback(update, context, action, payload)
+        elif scope == "nav":
+            return await self._handle_navigation_callback(update, context, action, payload)
+        else:
+            return ConversationHandler.END
+
+    async def _handle_wizard_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                                    action: str, payload: str) -> int:
+        """Handle wizard-scope callbacks."""
+        if action == "quick_issue":
+            return await self.quick_issue_command(update, context)
+        elif action == "setup":
+            return await self._start_setup_wizard(update, context)
+        elif action == "restart":
+            return await self.wizard_command(update, context)
+        elif action == "cancel":
+            return await self._cancel_wizard(update, context)
+        
         return ConversationHandler.END
 
-    async def _show_project_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Show project selection for default project."""
-        user = await self.get_or_create_user(update)
-        if not user:
-            return ConversationHandler.END
-
-        projects = await self.db.get_user_projects(user.user_id)
+    async def _handle_setup_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                   action: str, payload: str) -> int:
+        """Handle setup-scope callbacks."""
+        if action == "select_project":
+            return await self._confirm_project_selection(update, context, payload)
+        elif action == "confirm_project":
+            return await self._complete_setup(update, context, payload)
+        elif action == "cancel":
+            return await self._cancel_wizard(update, context)
         
-        if not projects:
-            message = f"""
-{EMOJI.get('ERROR', '❌')} **No Projects Available**
-
-You don't have access to any projects yet. Contact your admin to add projects.
-
-**Available Actions:**
-            """
-            
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back to Setup", callback_data="back_to_setup")],
-                [InlineKeyboardButton("❌ Cancel", callback_data="setup_cancel")]
-            ])
-            
-            await query.edit_message_text(message, reply_markup=keyboard)
-            return ConversationState.SETUP_WELCOME.value
-
-        message = f"""
-{EMOJI.get('PROJECT', '📁')} **Choose Default Project**
-
-Select a project for quick issue creation:
-        """
-
-        keyboard_buttons = []
-        for project in projects:
-            status_emoji = "✅" if project.is_active else "❌"
-            keyboard_buttons.append([
-                InlineKeyboardButton(
-                    f"{status_emoji} {project.key}: {project.name}",
-                    callback_data=f"select_project_{project.key}"
-                )
-            ])
-
-        keyboard_buttons.extend([
-            [InlineKeyboardButton("🔙 Back", callback_data="back_to_setup")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="setup_cancel")]
-        ])
-
-        keyboard = InlineKeyboardMarkup(keyboard_buttons)
-        await update.callback_query.edit_message_text(message, reply_markup=keyboard)
         return ConversationState.SETUP_SELECT_PROJECT.value
 
-    async def handle_project_selection_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Handle project selection callback."""
-        query = update.callback_query
-        await query.answer()
+    async def _handle_issue_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                   action: str, payload: str) -> int:
+        """Handle issue-scope callbacks."""
+        wizard_data = get_issue_ctx(context)
+        
+        if action == "select_project":
+            wizard_data.project_key = payload
+            set_issue_ctx(context, wizard_data)
+            return await self._show_issue_type_selection(update, context)
+        elif action == "set_type":
+            wizard_data.issue_type = payload
+            set_issue_ctx(context, wizard_data)
+            return await self._show_issue_priority_selection(update, context)
+        elif action == "set_priority":
+            wizard_data.priority = payload
+            set_issue_ctx(context, wizard_data)
+            return await self._request_summary(update, context)
+        elif action == "confirm_create":
+            return await self._create_issue(update, context)
+        elif action == "back_to_project":
+            return await self._show_project_selection(update, context, "issue")
+        elif action == "back_to_type":
+            return await self._show_issue_type_selection(update, context)
+        elif action == "back_to_priority":
+            return await self._show_issue_priority_selection(update, context)
+        elif action == "back_to_summary":
+            return await self._request_summary(update, context)
+        elif action == "back_to_description":
+            return await self._request_description(update, context)
+        elif action == "cancel":
+            return await self._cancel_wizard(update, context)
+        
+        return ConversationState.ISSUE_SELECT_PROJECT.value
 
-        if query.data == "back_to_setup":
-            user = await self.get_or_create_user(update)
-            await self._show_setup_wizard_welcome(update, context, user)
-            return ConversationState.SETUP_WELCOME.value
-        elif query.data == "setup_cancel":
-            return await self.cancel_wizard(update, context)
-        elif query.data.startswith("select_project_"):
-            project_key = query.data.replace("select_project_", "")
-            return await self._confirm_project_selection(update, context, project_key)
-
+    async def _handle_navigation_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                        action: str, payload: str) -> int:
+        """Handle navigation callbacks."""
+        if action == "back":
+            # Handle back navigation based on payload
+            if payload == "setup_welcome":
+                return await self.wizard_command(update, context)
+            elif payload == "issue_project":
+                return await self._show_project_selection(update, context, "issue")
+            # Add more back navigation cases as needed
+        
         return ConversationHandler.END
 
-    async def _confirm_project_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE, project_key: str) -> int:
-        """Confirm project selection."""
-        project = await self.db.get_project_by_key(project_key)
-        if not project:
-            await update.callback_query.edit_message_text("❌ Project not found.")
-            return ConversationHandler.END
+    # =============================================================================
+    # MESSAGE HANDLERS
+    # =============================================================================
 
-        # Store selected project in context
-        context.user_data['selected_project'] = project_key
+    @wizard_try("Summary Input")
+    async def handle_summary_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Handle summary text input."""
+        if not update.message or not update.message.text:
+            await reply_or_edit(update, "❌ Please provide a valid summary text.")
+            return ConversationState.ISSUE_ENTER_SUMMARY.value
 
-        message = f"""
-{EMOJI.get('CONFIRM', '✅')} **Confirm Default Project**
+        wizard_data = get_issue_ctx(context)
+        summary = update.message.text.strip()
 
-**Selected Project:**
-• **{project.key}**: {project.name}
-• Status: {'✅ Active' if project.is_active else '❌ Inactive'}
+        # Validate summary
+        validation_result = self.validator.validate_summary(summary)
+        if not validation_result.is_valid:
+            error_text = f"❌ <b>Invalid Summary</b>\n\n{validation_result.error_message}"
+            keyboard = build_back_cancel_keyboard(
+                cb("issue", "back_to_priority"),
+                cb("issue", "cancel")
+            )
+            await reply_or_edit(update, error_text, reply_markup=keyboard)
+            return ConversationState.ISSUE_ENTER_SUMMARY.value
 
-With this as your default project, you can create issues quickly by typing:
-`HIGH BUG Login button not working`
+        wizard_data.summary = summary
+        set_issue_ctx(context, wizard_data)
 
-**Confirm this selection?**
-        """
+        return await self._request_description(update, context)
 
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Confirm", callback_data="confirm_project")],
-            [InlineKeyboardButton("🔙 Choose Different", callback_data="back_to_project_selection")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="setup_cancel")]
-        ])
+    @wizard_try("Description Input")
+    async def handle_description_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Handle description text input."""
+        wizard_data = get_issue_ctx(context)
+        
+        description = ""
+        if update.message and update.message.text:
+            description = update.message.text.strip()
 
-        await update.callback_query.edit_message_text(message, reply_markup=keyboard)
-        return ConversationState.SETUP_CONFIRM_PROJECT.value
+            # Validate description if provided
+            if description:
+                validation_result = self.validator.validate_description(description)
+                if not validation_result.is_valid:
+                    error_text = f"❌ <b>Invalid Description</b>\n\n{validation_result.error_message}"
+                    keyboard = build_back_cancel_keyboard(
+                        cb("issue", "back_to_summary"),
+                        cb("issue", "cancel")
+                    )
+                    await reply_or_edit(update, error_text, reply_markup=keyboard)
+                    return ConversationState.ISSUE_ENTER_DESCRIPTION.value
 
-    async def handle_project_confirmation_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Handle project confirmation callback."""
-        query = update.callback_query
-        await query.answer()
+        wizard_data.description = description
+        set_issue_ctx(context, wizard_data)
 
-        if query.data == "confirm_project":
-            return await self._apply_project_selection(update, context)
-        elif query.data == "back_to_project_selection":
-            return await self._show_project_selection(update, context)
-        elif query.data == "setup_cancel":
-            return await self.cancel_wizard(update, context)
+        return await self._show_confirmation(update, context)
 
-        return ConversationHandler.END
+    # =============================================================================
+    # SETUP WIZARD FLOW
+    # =============================================================================
 
-    async def _apply_project_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Apply the selected project as default."""
-        user = await self.get_or_create_user(update)
+    @wizard_try("Setup Wizard Start")
+    async def _start_setup_wizard(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Start the setup wizard."""
+        return await self._show_project_selection(update, context, "setup")
+
+    @wizard_try("Project Selection")
+    async def _show_project_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                                    wizard_type: str) -> int:
+        """Show project selection screen."""
+        user = await self.enforce_user_access(update)
         if not user:
             return ConversationHandler.END
 
-        project_key = context.user_data.get('selected_project')
-        if not project_key:
-            await update.callback_query.edit_message_text("❌ No project selected.")
-            return ConversationHandler.END
+        # Get user's accessible projects - FIXED: Use correct method name
+        projects = await self.db.list_user_projects(user.user_id)
 
-        try:
-            # Set default project
-            await self.db.set_user_default_project(user.user_id, project_key)
-            
-            project = await self.db.get_project_by_key(project_key)
-            
-            success_message = self.formatter.format_success_message(
-                "Default project set successfully!",
-                f"**{project.name}** is now your default project.\n\n"
-                f"**Quick Issue Creation:**\n"
-                f"Just type: `HIGH BUG Your issue description`\n\n"
-                f"**Continue setup or finish?**"
-            )
-
+        if not projects:
+            # FIXED: Proper no projects handling
+            message = no_projects_message()
             keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("⚙️ Configure Preferences", callback_data="setup_preferences")],
-                [InlineKeyboardButton("✅ Finish Setup", callback_data="setup_complete")]
+                [InlineKeyboardButton("🔙 Back to Setup", callback_data="nav:back:setup_welcome")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="wizard:cancel")]
             ])
-
-            await update.callback_query.edit_message_text(success_message, reply_markup=keyboard)
+            await reply_or_edit(update, message, reply_markup=keyboard)
             return ConversationState.SETUP_WELCOME.value
 
+        # Show project list
+        message = f"📁 <b>Select Project</b>\n\nChoose a project for your {wizard_type}:"
+        
+        cancel_cb = "wizard:cancel" if wizard_type == "setup" else "issue:cancel"
+        back_to = "setup" if wizard_type == "setup" else "wizard"
+        
+        keyboard = build_project_list_keyboard(projects, back_to, cancel_cb)
+        
+        await reply_or_edit(update, message, reply_markup=keyboard)
+        
+        return (ConversationState.SETUP_SELECT_PROJECT.value if wizard_type == "setup" 
+                else ConversationState.ISSUE_SELECT_PROJECT.value)
+
+    @wizard_try("Project Confirmation")
+    async def _confirm_project_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                                       project_key: str) -> int:
+        """Confirm project selection."""
+        try:
+            project = await self.db.get_project_by_key(project_key)
+            if not project:
+                await reply_or_edit(update, f"❌ Project '{project_key}' not found.")
+                return ConversationState.SETUP_SELECT_PROJECT.value
+
+            message = confirm_project_message(project)
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Confirm", callback_data=cb("setup", "confirm_project", project_key))],
+                [
+                    InlineKeyboardButton("🔙 Back", callback_data="nav:back:setup_project"),
+                    InlineKeyboardButton("❌ Cancel", callback_data="setup:cancel")
+                ]
+            ])
+
+            await reply_or_edit(update, message, reply_markup=keyboard)
+            return ConversationState.SETUP_CONFIRM_PROJECT.value
+
         except Exception as e:
-            await update.callback_query.edit_message_text(f"❌ Failed to set default project: {str(e)}")
+            self.logger.error(f"Error confirming project selection: {e}")
+            await reply_or_edit(update, "❌ Error retrieving project information.")
+            return ConversationState.SETUP_SELECT_PROJECT.value
+
+    @wizard_try("Setup Complete")
+    async def _complete_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                            project_key: str) -> int:
+        """Complete the setup wizard."""
+        user = await self.enforce_user_access(update)
+        if not user:
+            return ConversationHandler.END
+
+        try:
+            # Set as default project
+            await self.db.set_user_default_project(user.user_id, project_key)
+            
+            # Log the action
+            await self.db.log_user_action(user.user_id, "wizard.setup.complete", {
+                "project_key": project_key,
+            })
+
+            project = await self.db.get_project_by_key(project_key)
+            project_name = project.name if project else project_key
+
+            success_text = f"""
+✅ <b>Setup Complete!</b>
+
+<b>{project_name}</b> is now your default project.
+
+🚀 <b>Ready to go! Try these:</b>
+• Use <code>/quick</code> for fast issue creation
+• Type: <code>HIGH BUG Something is broken</code>
+• Use <code>/help</code> to see all commands
+
+<b>Need help?</b> Use <code>/help</code> anytime!
+            """.strip()
+
+            await reply_or_edit(update, success_text)
+            await self.cleanup_wizard_data(context)
+            
+            return ConversationHandler.END
+
+        except Exception as e:
+            self.logger.error(f"Error completing setup: {e}")
+            await reply_or_edit(update, "❌ Failed to complete setup.")
             return ConversationHandler.END
 
     # =============================================================================
-    # QUICK ISSUE WIZARD HANDLERS
+    # ISSUE CREATION WIZARD FLOW
     # =============================================================================
 
-    async def _show_quick_issue_wizard(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user: User) -> None:
-        """Show quick issue creation wizard."""
-        projects = await self.db.get_user_projects(user.user_id)
-        
-        if not projects:
-            message = f"""
-{EMOJI.get('ERROR', '❌')} **No Projects Available**
-
-You need access to projects before creating issues.
-Contact your admin to add projects.
-            """
-            await self.send_message(update, message)
-            return
-
-        # Check if user has a default project
-        default_project = await self.db.get_user_default_project(user.user_id)
-        
-        if default_project:
-            # Skip project selection, go to issue type
-            context.user_data['issue_wizard'] = {'project_key': default_project.key}
-            await self._show_issue_type_selection(update, context)
-        else:
-            # Show project selection
-            await self._show_issue_project_selection(update, context, projects)
-
-    async def _show_issue_project_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE, projects: List[Project]) -> None:
-        """Show project selection for issue creation."""
-        message = f"""
-{EMOJI.get('CREATE', '📝')} **Quick Issue Creation**
-
-**Step 1:** Choose a project for your issue:
-        """
-
-        keyboard_buttons = []
-        for project in projects:
-            status_emoji = "✅" if project.is_active else "❌"
-            keyboard_buttons.append([
-                InlineKeyboardButton(
-                    f"{status_emoji} {project.key}: {project.name}",
-                    callback_data=f"issue_project_{project.key}"
-                )
-            ])
-
-        keyboard_buttons.append([
-            InlineKeyboardButton("❌ Cancel", callback_data="issue_cancel")
-        ])
-
-        keyboard = InlineKeyboardMarkup(keyboard_buttons)
-        await self.send_message(update, message, reply_markup=keyboard)
-
-    async def handle_issue_project_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Handle issue project selection callback."""
-        query = update.callback_query
-        await query.answer()
-
-        if query.data == "issue_cancel":
-            return await self.cancel_wizard(update, context)
-        elif query.data.startswith("issue_project_"):
-            project_key = query.data.replace("issue_project_", "")
-            context.user_data['issue_wizard'] = {'project_key': project_key}
-            await self._show_issue_type_selection(update, context)
-            return ConversationState.ISSUE_SELECT_TYPE.value
-
-        return ConversationHandler.END
-
-    async def _show_issue_type_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    @wizard_try("Issue Type Selection")
+    async def _show_issue_type_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Show issue type selection."""
-        message = f"""
-{EMOJI.get('CREATE', '📝')} **Quick Issue Creation**
+        wizard_data = get_issue_ctx(context)
+        require(wizard_data, 'project_key')
 
-**Step 2:** Choose issue type:
-        """
+        # Get project details for context
+        try:
+            project = await self.db.get_project_by_key(wizard_data.project_key)
+            project_name = project.name if project else wizard_data.project_key
+        except Exception:
+            project_name = wizard_data.project_key
 
-        keyboard_buttons = []
-        for issue_type in IssueType:
-            emoji = issue_type.get_emoji()
-            keyboard_buttons.append([
-                InlineKeyboardButton(
-                    f"{emoji} {issue_type.value}",
-                    callback_data=f"issue_type_{issue_type.name}"
-                )
-            ])
+        message = f"🎯 <b>Issue Type</b>\n\nProject: <b>{project_name}</b>\n\nSelect the type of issue:"
 
-        keyboard_buttons.append([
-            InlineKeyboardButton("🔙 Back", callback_data="back_to_project"),
-            InlineKeyboardButton("❌ Cancel", callback_data="issue_cancel")
-        ])
+        # Available issue types
+        issue_types = [IssueType.TASK, IssueType.BUG, IssueType.STORY, IssueType.EPIC]
+        keyboard = build_issue_type_keyboard(
+            issue_types,
+            cb("issue", "back_to_project"),
+            cb("issue", "cancel")
+        )
 
-        keyboard = InlineKeyboardMarkup(keyboard_buttons)
-        
-        if update.callback_query:
-            await update.callback_query.edit_message_text(message, reply_markup=keyboard)
-        else:
-            await self.send_message(update, message, reply_markup=keyboard)
+        await reply_or_edit(update, message, reply_markup=keyboard)
+        return ConversationState.ISSUE_SELECT_TYPE.value
 
-    async def handle_issue_type_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Handle issue type selection callback."""
-        query = update.callback_query
-        await query.answer()
-
-        if query.data == "issue_cancel":
-            return await self.cancel_wizard(update, context)
-        elif query.data == "back_to_project":
-            user = await self.get_or_create_user(update)
-            projects = await self.db.get_user_projects(user.user_id)
-            await self._show_issue_project_selection(update, context, projects)
-            return ConversationState.ISSUE_SELECT_PROJECT.value
-        elif query.data.startswith("issue_type_"):
-            issue_type_name = query.data.replace("issue_type_", "")
-            context.user_data['issue_wizard']['issue_type'] = issue_type_name
-            await self._show_issue_priority_selection(update, context)
-            return ConversationState.ISSUE_SELECT_PRIORITY.value
-
-        return ConversationHandler.END
-
-    async def _show_issue_priority_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    @wizard_try("Priority Selection")
+    async def _show_issue_priority_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Show issue priority selection."""
-        message = f"""
-{EMOJI.get('CREATE', '📝')} **Quick Issue Creation**
+        wizard_data = get_issue_ctx(context)
+        require(wizard_data, 'project_key', 'issue_type')
 
-**Step 3:** Choose priority:
-        """
+        # Get display info
+        try:
+            project = await self.db.get_project_by_key(wizard_data.project_key)
+            project_name = project.name if project else wizard_data.project_key
+        except Exception:
+            project_name = wizard_data.project_key
 
-        keyboard_buttons = []
-        for priority in IssuePriority:
-            emoji = priority.get_emoji()
-            keyboard_buttons.append([
-                InlineKeyboardButton(
-                    f"{emoji} {priority.value}",
-                    callback_data=f"issue_priority_{priority.name}"
-                )
-            ])
+        issue_type_display = IssueType[wizard_data.issue_type].value
 
-        keyboard_buttons.append([
-            InlineKeyboardButton("🔙 Back", callback_data="back_to_type"),
-            InlineKeyboardButton("❌ Cancel", callback_data="issue_cancel")
-        ])
+        message = (f"⚡ <b>Priority</b>\n\n"
+                  f"Project: <b>{project_name}</b>\n"
+                  f"Type: <b>{issue_type_display}</b>\n\n"
+                  f"Select the priority level:")
 
-        keyboard = InlineKeyboardMarkup(keyboard_buttons)
-        await update.callback_query.edit_message_text(message, reply_markup=keyboard)
+        # Available priorities
+        priorities = [IssuePriority.HIGHEST, IssuePriority.HIGH, IssuePriority.MEDIUM, 
+                     IssuePriority.LOW, IssuePriority.LOWEST]
+        keyboard = build_issue_priority_keyboard(
+            priorities,
+            cb("issue", "back_to_type"),
+            cb("issue", "cancel")
+        )
 
-    async def handle_issue_priority_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Handle issue priority selection callback."""
-        query = update.callback_query
-        await query.answer()
+        await reply_or_edit(update, message, reply_markup=keyboard)
+        return ConversationState.ISSUE_SELECT_PRIORITY.value
 
-        if query.data == "issue_cancel":
-            return await self.cancel_wizard(update, context)
-        elif query.data == "back_to_type":
-            await self._show_issue_type_selection(update, context)
-            return ConversationState.ISSUE_SELECT_TYPE.value
-        elif query.data.startswith("issue_priority_"):
-            priority_name = query.data.replace("issue_priority_", "")
-            context.user_data['issue_wizard']['priority'] = priority_name
-            await self._show_issue_summary_input(update, context)
-            return ConversationState.ISSUE_ENTER_SUMMARY.value
+    @wizard_try("Summary Request")
+    async def _request_summary(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Request issue summary."""
+        wizard_data = get_issue_ctx(context)
+        require(wizard_data, 'project_key', 'issue_type', 'priority')
 
-        return ConversationHandler.END
+        # Get display info
+        try:
+            project = await self.db.get_project_by_key(wizard_data.project_key)
+            project_name = project.name if project else wizard_data.project_key
+        except Exception:
+            project_name = wizard_data.project_key
 
-    async def _show_issue_summary_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Show issue summary input prompt."""
-        message = f"""
-{EMOJI.get('CREATE', '📝')} **Quick Issue Creation**
+        issue_type_display = IssueType[wizard_data.issue_type].value
+        priority_display = IssuePriority[wizard_data.priority].value
 
-**Step 4:** Enter a brief summary of your issue:
+        message = (f"📝 <b>Issue Summary</b>\n\n"
+                  f"Project: <b>{project_name}</b>\n"
+                  f"Type: <b>{issue_type_display}</b>\n"
+                  f"Priority: <b>{priority_display}</b>\n\n"
+                  f"Please enter a brief summary for your issue:\n\n"
+                  f"<i>Example: \"Login button not working on mobile\"</i>")
 
-**Examples:**
-• "Login button not working on mobile"
-• "Add user profile settings page"
-• "Fix database connection timeout"
+        keyboard = build_back_cancel_keyboard(
+            cb("issue", "back_to_priority"),
+            cb("issue", "cancel")
+        )
 
-Type your issue summary below:
-        """
+        await reply_or_edit(update, message, reply_markup=keyboard)
+        return ConversationState.ISSUE_ENTER_SUMMARY.value
 
-        # Remove inline keyboard and show instruction
-        await update.callback_query.edit_message_text(message)
+    @wizard_try("Description Request")
+    async def _request_description(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Request issue description."""
+        wizard_data = get_issue_ctx(context)
+        require(wizard_data, 'project_key', 'issue_type', 'priority', 'summary')
 
-    async def handle_issue_summary_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Handle issue summary input."""
-        if not update.message or not update.message.text:
-            await self.send_message(update, "❌ Please enter a valid summary.")
-            return ConversationState.ISSUE_ENTER_SUMMARY.value
+        message = (f"📄 <b>Issue Description</b>\n\n"
+                  f"Summary: <i>{truncate_text(wizard_data.summary, 50)}</i>\n\n"
+                  f"Please provide a detailed description for your issue.\n\n"
+                  f"You can also send <b>/skip</b> to create the issue without a description.")
 
-        summary = update.message.text.strip()
-        
-        if len(summary) < 10:
-            await self.send_message(update, "❌ Summary must be at least 10 characters long.")
-            return ConversationState.ISSUE_ENTER_SUMMARY.value
+        keyboard = build_back_cancel_keyboard(
+            cb("issue", "back_to_summary"),
+            cb("issue", "cancel")
+        )
 
-        context.user_data['issue_wizard']['summary'] = summary
-        await self._show_issue_description_input(update, context)
+        await reply_or_edit(update, message, reply_markup=keyboard)
         return ConversationState.ISSUE_ENTER_DESCRIPTION.value
 
-    async def _show_issue_description_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Show issue description input prompt."""
-        message = f"""
-{EMOJI.get('CREATE', '📝')} **Quick Issue Creation**
+    @wizard_try("Issue Confirmation")
+    async def _show_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Show issue creation confirmation."""
+        wizard_data = get_issue_ctx(context)
+        require(wizard_data, 'project_key', 'issue_type', 'priority', 'summary')
 
-**Step 5:** Add a detailed description (optional):
+        # Get project details
+        try:
+            project = await self.db.get_project_by_key(wizard_data.project_key)
+            project_name = project.name if project else wizard_data.project_key
+        except Exception:
+            project_name = wizard_data.project_key
 
-Provide more context about the issue, steps to reproduce, expected behavior, etc.
+        issue_type_display = IssueType[wizard_data.issue_type].value
+        priority_display = IssuePriority[wizard_data.priority].value
 
-**Type your description below, or send "skip" to continue without a description:**
-        """
+        message = quick_issue_summary_message(
+            project_name, issue_type_display, priority_display, 
+            wizard_data.summary, wizard_data.description
+        )
 
-        await self.send_message(update, message)
+        keyboard = build_confirm_keyboard(
+            cb("issue", "confirm_create"),
+            cb("issue", "back_to_description"),
+            cb("issue", "cancel")
+        )
 
-    async def handle_issue_description_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Handle issue description input."""
-        if not update.message or not update.message.text:
-            await self.send_message(update, "❌ Please enter a description or 'skip'.")
-            return ConversationState.ISSUE_ENTER_DESCRIPTION.value
-
-        description = update.message.text.strip()
-        
-        if description.lower() == 'skip':
-            context.user_data['issue_wizard']['description'] = ""
-        else:
-            context.user_data['issue_wizard']['description'] = description
-
-        await self._show_issue_confirmation(update, context)
+        await reply_or_edit(update, message, reply_markup=keyboard)
         return ConversationState.ISSUE_CONFIRM_CREATE.value
 
-    async def _show_issue_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Show issue creation confirmation."""
-        wizard_data = context.user_data.get('issue_wizard', {})
-        
-        project_key = wizard_data.get('project_key')
-        issue_type = IssueType[wizard_data.get('issue_type')]
-        priority = IssuePriority[wizard_data.get('priority')]
-        summary = wizard_data.get('summary')
-        description = wizard_data.get('description', '')
+    @wizard_try("Issue Creation")
+    async def _create_issue(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Create the issue in Jira."""
+        wizard_data = get_issue_ctx(context)
+        require(wizard_data, 'project_key', 'issue_type', 'priority', 'summary')
 
-        project = await self.db.get_project_by_key(project_key)
+        user = await self.enforce_user_access(update)
+        if not user:
+            return ConversationHandler.END
 
-        message = f"""
-{EMOJI.get('CONFIRM', '✅')} **Confirm Issue Creation**
-
-**Project:** {project.key}: {project.name}
-**Type:** {issue_type.get_emoji()} {issue_type.value}
-**Priority:** {priority.get_emoji()} {priority.value}
-**Summary:** {summary}
-**Description:** {description[:100] + '...' if len(description) > 100 else description or 'None'}
-
-**Create this issue?**
-        """
-
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Create Issue", callback_data="confirm_create_issue")],
-            [InlineKeyboardButton("✏️ Edit Details", callback_data="edit_issue_details")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="issue_cancel")]
-        ])
-
-        await self.send_message(update, message, reply_markup=keyboard)
-
-    async def handle_issue_confirmation_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Handle issue confirmation callback."""
-        query = update.callback_query
-        await query.answer()
-
-        if query.data == "confirm_create_issue":
-            return await self._create_issue_from_wizard(update, context)
-        elif query.data == "edit_issue_details":
-            await self._show_issue_type_selection(update, context)
-            return ConversationState.ISSUE_SELECT_TYPE.value
-        elif query.data == "issue_cancel":
-            return await self.cancel_wizard(update, context)
-
-        return ConversationHandler.END
-
-    async def _create_issue_from_wizard(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Create issue from wizard data."""
-        wizard_data = context.user_data.get('issue_wizard', {})
-        
         try:
-            # Create issue in Jira
+            # FIXED: Pass enum instances, not strings
+            issue_type = IssueType[wizard_data.issue_type]
+            priority = IssuePriority[wizard_data.priority]
+
+            # Create the issue
             created_issue = await self.jira.create_issue(
-                project_key=wizard_data['project_key'],
-                summary=wizard_data['summary'],
-                description=wizard_data.get('description', 'Created via Telegram bot'),
-                issue_type=IssueType[wizard_data['issue_type']].value,
-                priority=IssuePriority[wizard_data['priority']].value
+                project_key=wizard_data.project_key,
+                summary=wizard_data.summary,
+                description=wizard_data.description or 'Created via Telegram bot',
+                issue_type=issue_type,
+                priority=priority,
             )
 
-            success_message = self.formatter.format_success_message(
-                "Issue created successfully!",
-                f"**{created_issue.key}**: {created_issue.summary}\n"
-                f"🔗 View in Jira: {created_issue.url}\n\n"
-                f"You can now:\n"
-                f"• View with `/view {created_issue.key}`\n"
-                f"• Add comments with `/comment {created_issue.key} <text>`\n"
-                f"• Create another issue with `/quick`"
-            )
+            # Log the action
+            await self.db.log_user_action(user.user_id, "wizard.issue.created", {
+                "issue_key": created_issue.key,
+                "project_key": wizard_data.project_key,
+                "issue_type": wizard_data.issue_type,
+                "priority": wizard_data.priority,
+            })
 
-            await update.callback_query.edit_message_text(success_message)
-            
-            # Clean up wizard data
+            success_message = issue_created_success_message(created_issue)
+            await reply_or_edit(update, success_message)
+
             await self.cleanup_wizard_data(context)
-            
             return ConversationHandler.END
 
         except JiraAPIError as e:
-            await update.callback_query.edit_message_text(f"❌ Failed to create issue: {str(e)}")
-            return ConversationHandler.END
+            error_message = f"❌ <b>Failed to create issue</b>\n\n{str(e)}"
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Try Again", callback_data=cb("issue", "confirm_create"))],
+                [InlineKeyboardButton("❌ Cancel", callback_data=cb("issue", "cancel"))]
+            ])
+            await reply_or_edit(update, error_message, reply_markup=keyboard)
+            return ConversationState.ISSUE_CONFIRM_CREATE.value
 
     # =============================================================================
-    # ADDITIONAL SETUP FUNCTIONS
+    # UTILITY METHODS
     # =============================================================================
 
-    async def _show_preferences_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Show preferences setup."""
-        message = f"""
-{EMOJI.get('SETTINGS', '⚙️')} **Configure Preferences**
-
-**Current Settings:**
-• Compact Mode: {'✅ Enabled' if self.config.compact_mode else '❌ Disabled'}
-• Notifications: ✅ Enabled
-• Quick Create: {'✅ Enabled' if self.config.enable_quick_create else '❌ Disabled'}
-
-**Note:** Some settings are managed by your administrator.
-
-**What would you like to do?**
-        """
-
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📚 View All Settings", callback_data="view_settings")],
-            [InlineKeyboardButton("🔙 Back to Setup", callback_data="back_to_setup")],
-            [InlineKeyboardButton("✅ Finish Setup", callback_data="setup_complete")]
-        ])
-
-        await update.callback_query.edit_message_text(message, reply_markup=keyboard)
-        return ConversationState.SETUP_WELCOME.value
-
-    async def _show_tutorial(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Show tutorial for quick commands."""
-        message = f"""
-{EMOJI.get('TUTORIAL', '📖')} **Quick Commands Tutorial**
-
-**🚀 Quick Issue Creation:**
-Just type: `[PRIORITY] [TYPE] Description`
-
-**Examples:**
-• `HIGH BUG Login button broken`
-• `MEDIUM TASK Update user documentation`
-• `LOW IMPROVEMENT Add dark mode theme`
-
-**📋 Essential Commands:**
-• `/projects` - View available projects
-• `/myissues` - Your recent issues
-• `/create` - Full issue creation wizard
-• `/help` - Complete command list
-
-**⚡ Shortcuts:**
-• `/c` = `/create`
-• `/mi` = `/myissues`
-• `/p` = `/projects`
-
-**Ready to start?**
-        """
-
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📝 Try Quick Create", callback_data="try_quick_create")],
-            [InlineKeyboardButton("🔙 Back to Setup", callback_data="back_to_setup")],
-            [InlineKeyboardButton("✅ Finish Setup", callback_data="setup_complete")]
-        ])
-
-        await update.callback_query.edit_message_text(message, reply_markup=keyboard)
-        return ConversationState.SETUP_WELCOME.value
-
-    async def _show_admin_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Show admin setup options."""
-        message = f"""
-{EMOJI.get('ADMIN', '⚙️')} **Admin Setup**
-
-**Quick Admin Tasks:**
-• Add projects from Jira
-• Configure user permissions
-• Review system status
-
-**What would you like to do?**
-        """
-
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add Projects", callback_data="admin_add_projects")],
-            [InlineKeyboardButton("👥 Manage Users", callback_data="admin_manage_users")],
-            [InlineKeyboardButton("📊 View Statistics", callback_data="admin_view_stats")],
-            [InlineKeyboardButton("🔙 Back to Setup", callback_data="back_to_setup")],
-            [InlineKeyboardButton("✅ Finish Setup", callback_data="setup_complete")]
-        ])
-
-        await update.callback_query.edit_message_text(message, reply_markup=keyboard)
-        return ConversationState.SETUP_WELCOME.value
-
-    async def _complete_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Complete setup wizard."""
-        user = await self.get_or_create_user(update)
-        default_project = await self.db.get_user_default_project(user.user_id)
+    @wizard_try("Skip Handler")
+    async def handle_skip(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Handle /skip command in description state."""
+        wizard_data = get_issue_ctx(context)
+        wizard_data.description = ""
+        set_issue_ctx(context, wizard_data)
         
-        message = f"""
-{EMOJI.get('SUCCESS', '🎉')} **Setup Complete!**
+        return await self._show_confirmation(update, context)
 
-Welcome to the Telegram-Jira Bot, **{user.username}**!
-
-**Your Configuration:**
-• Default Project: {default_project.key if default_project else 'Not set'}
-• Role: {user.role.value.replace('_', ' ').title()}
-
-**🚀 Ready to go! Try these:**
-• Type: `HIGH BUG Something is broken`
-• Use `/help` to see all commands
-• Use `/projects` to manage projects
-
-**Need help?** Use `/help` anytime!
-        """
-
-        if update.callback_query:
-            await update.callback_query.edit_message_text(message)
-        else:
-            await self.send_message(update, message)
-
-        # Clean up wizard data
+    @wizard_try("Cancel Wizard")
+    async def _cancel_wizard(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Cancel the wizard and clean up."""
+        await reply_or_edit(update, "❌ <b>Wizard Cancelled</b>\n\nYou can start again anytime with <code>/wizard</code>.")
         await self.cleanup_wizard_data(context)
-        
         return ConversationHandler.END
+
+    async def cleanup_wizard_data(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Clean up wizard data from context."""
+        if context.user_data:
+            context.user_data.pop('issue_wizard', None)
+            context.user_data.pop('setup_wizard', None)
 
     # =============================================================================
     # CONVERSATION HANDLER SETUP
@@ -819,62 +743,47 @@ Welcome to the Telegram-Jira Bot, **{user.username}**!
 
     def get_conversation_handler(self) -> ConversationHandler:
         """Get the configured ConversationHandler for wizard flows."""
-        entry_points = [
-            CommandHandler("wizard", self.wizard_command),
-            CommandHandler("quick", self.quick_command),
-        ]
-        
-        # Add shortcuts if enabled
-        if self.config.enable_shortcuts:
-            entry_points.extend([
-                CommandHandler("w", self.wizard_command),  # Shortcut for wizard
-                CommandHandler("q", self.quick_command),   # Shortcut for quick
-            ])
-        
         return ConversationHandler(
-            entry_points=entry_points,
+            entry_points=[
+                CommandHandler(['wizard', 'w'], self.wizard_command),
+                CommandHandler(['quick', 'q'], self.quick_issue_command),
+            ],
             states={
                 ConversationState.SETUP_WELCOME.value: [
-                    CallbackQueryHandler(self.handle_setup_welcome_callback)
+                    CallbackQueryHandler(self.handle_callback),
                 ],
                 ConversationState.SETUP_SELECT_PROJECT.value: [
-                    CallbackQueryHandler(self.handle_project_selection_callback)
+                    CallbackQueryHandler(self.handle_callback),
                 ],
                 ConversationState.SETUP_CONFIRM_PROJECT.value: [
-                    CallbackQueryHandler(self.handle_project_confirmation_callback)
+                    CallbackQueryHandler(self.handle_callback),
                 ],
                 ConversationState.ISSUE_SELECT_PROJECT.value: [
-                    CallbackQueryHandler(self.handle_issue_project_callback)
+                    CallbackQueryHandler(self.handle_callback),
                 ],
                 ConversationState.ISSUE_SELECT_TYPE.value: [
-                    CallbackQueryHandler(self.handle_issue_type_callback)
+                    CallbackQueryHandler(self.handle_callback),
                 ],
                 ConversationState.ISSUE_SELECT_PRIORITY.value: [
-                    CallbackQueryHandler(self.handle_issue_priority_callback)
+                    CallbackQueryHandler(self.handle_callback),
                 ],
                 ConversationState.ISSUE_ENTER_SUMMARY.value: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_issue_summary_input)
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_summary_input),
+                    CallbackQueryHandler(self.handle_callback),
                 ],
                 ConversationState.ISSUE_ENTER_DESCRIPTION.value: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_issue_description_input)
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_description_input),
+                    CommandHandler('skip', self.handle_skip),
+                    CallbackQueryHandler(self.handle_callback),
                 ],
                 ConversationState.ISSUE_CONFIRM_CREATE.value: [
-                    CallbackQueryHandler(self.handle_issue_confirmation_callback)
+                    CallbackQueryHandler(self.handle_callback),
                 ],
             },
             fallbacks=[
-                CommandHandler("cancel", self.cancel_wizard),
-                CallbackQueryHandler(self.cancel_wizard, pattern="^(setup_cancel|issue_cancel)$")
+                CommandHandler('cancel', self._cancel_wizard),
+                CallbackQueryHandler(self.handle_callback, pattern=r'^(wizard|setup|issue|nav):.*'),
             ],
-            per_user=True,
-            per_chat=True,
-            per_message=False  # Set to False to avoid deprecation warnings
+            name="wizard_conversation",
+            persistent=True,
         )
-
-    async def cleanup_wizard_data(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Clean up wizard data from context."""
-        keys_to_remove = ['wizard_data', 'issue_wizard', 'project_wizard', 'selected_project']
-        
-        for key in keys_to_remove:
-            if key in context.user_data:
-                del context.user_data[key]
