@@ -784,6 +784,5 @@ class WizardHandlers(BaseHandler):
                 CommandHandler('cancel', self._cancel_wizard),
                 CallbackQueryHandler(self.handle_callback, pattern=r'^(wizard|setup|issue|nav):.*'),
             ],
-            name="wizard_conversation",
-            persistent=True,
+            name="wizard_conversation"
         )

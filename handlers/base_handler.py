@@ -13,6 +13,7 @@ from typing import Optional
 from telegram import InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
+from config.settings import BotConfig
 from services.database import DatabaseError, DatabaseService
 from services.jira_service import JiraAPIError, JiraService
 from models import ErrorType, SentMessages, User, UserRole
@@ -31,6 +32,7 @@ class BaseHandler:
 
     def __init__(
         self,
+        config: BotConfig,
         database_service: DatabaseService,
         jira_service: JiraService,
         telegram_service: TelegramService,
@@ -53,6 +55,7 @@ class BaseHandler:
         if not isinstance(telegram_service, TelegramService):
             raise TypeError(f"telegram_service must be TelegramService, got {type(telegram_service)}")
 
+        self.config = config 
         self.db = database_service
         self.jira = jira_service
         self.telegram = telegram_service

@@ -241,34 +241,39 @@ class TelegramJiraBot:
 
             self.logger.info("Initializing handlers...")
 
-            # Initialize base handler - FIXED PARAMETERS
+            # Initialize base handler - ADD CONFIG PARAMETER
             self.base_handler = BaseHandler(
-                database_service=self.database,  # Changed from 'db' to 'database_service'
+                config=self.config,  # ADD THIS LINE
+                database_service=self.database,
                 jira_service=self.jira_service,
                 telegram_service=self.telegram_service,
             )
 
-            # Initialize specialized handlers - FIXED PARAMETERS
+            # Initialize specialized handlers - ADD CONFIG PARAMETER
             self.admin_handlers = AdminHandlers(
-                database_service=self.database,  # Changed from 'db' to 'database_service'
+                config=self.config,  # ADD THIS LINE
+                database_service=self.database,
                 jira_service=self.jira_service,
                 telegram_service=self.telegram_service,
             )
 
             self.project_handlers = ProjectHandlers(
-                database_service=self.database,  # Changed from 'db' to 'database_service'
+                config=self.config,  # ADD THIS LINE
+                database_service=self.database,
                 jira_service=self.jira_service,
                 telegram_service=self.telegram_service,
             )
 
             self.issue_handlers = IssueHandlers(
-                database_service=self.database,  # Changed from 'db' to 'database_service'
+                config=self.config,  # ADD THIS LINE
+                database_service=self.database,
                 jira_service=self.jira_service,
                 telegram_service=self.telegram_service,
             )
 
             self.wizard_handlers = WizardHandlers(
-                database_service=self.database,  # Changed from 'db' to 'database_service'
+                config=self.config,  # ADD THIS LINE
+                database_service=self.database,
                 jira_service=self.jira_service,
                 telegram_service=self.telegram_service,
             )

@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
+from config.settings import BotConfig
 from .base_handler import BaseHandler
 from services.database import DatabaseService
 from services.jira_service import JiraService
@@ -32,12 +33,13 @@ class AdminHandlers(BaseHandler):
 
     def __init__(
         self,
+        config: BotConfig,
         database_service: DatabaseService,
         jira_service: JiraService,
         telegram_service: TelegramService,
     ) -> None:
         """Initialize admin handlers with required services."""
-        super().__init__(database_service, jira_service, telegram_service)
+        super().__init__(config,database_service, jira_service, telegram_service)
 
     # ---- Public Commands ----
 
