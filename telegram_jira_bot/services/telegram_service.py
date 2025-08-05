@@ -899,3 +899,33 @@ class TelegramService:
             reply_markup=reply_markup,
             parse_mode=ParseMode.MARKDOWN_V2
         )
+        
+    async def send_error_message(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        error_message: str,
+        show_help: bool = False
+    ) -> Optional[int]:
+        """Send an error message to the user.
+        
+        Args:
+            update: Telegram update
+            context: Bot context
+            error_message: Error message to display
+            show_help: Whether to show help information
+            
+        Returns:
+            Message ID of sent message
+        """
+        message = f"❌ **Error**\n\n{error_message}"
+        
+        if show_help:
+            message += "\n\nUse /help for available commands."
+        
+        return await self.send_message(
+            update=update,
+            context=context,
+            text=message,
+            parse_mode=ParseMode.MARKDOWN_V2
+        )

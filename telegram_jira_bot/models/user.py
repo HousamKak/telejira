@@ -110,10 +110,14 @@ class User:
             User instance
         """
         return cls(
-            user_id=telegram_user.id,
+            user_id=str(telegram_user.id),  # Convert to string
             username=telegram_user.username,
             first_name=telegram_user.first_name,
-            last_name=telegram_user.last_name
+            last_name=telegram_user.last_name,
+            role=UserRole.USER,
+            is_active=True,
+            created_at=datetime.now(timezone.utc),
+            last_activity=datetime.now(timezone.utc)
         )
 
     def get_display_name(self) -> str:
