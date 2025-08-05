@@ -47,7 +47,10 @@ class BaseHandler(ABC):
         self.telegram = telegram_service
         self.logger = logging.getLogger(self.__class__.__name__)
 
-    # User management methods
+    # =============================================================================
+    # USER MANAGEMENT METHODS - FIXED
+    # =============================================================================
+
     async def get_or_create_user(self, update: Update) -> Optional[User]:
         """Get or create user from update.
         
@@ -62,24 +65,42 @@ class BaseHandler(ABC):
 
         try:
             telegram_user_id = str(update.effective_user.id)  # Convert to string
-            user = await self.db.get_user(telegram_user_id)
+            
+            # FIX: Use correct method name
+            user = await self.db.get_user_by_telegram_id(telegram_user_id)
             if user:
-                # Update activity
-                await self.db.update_user_activity(telegram_user_id)
+                # Activity is automatically updated in get_user_by_telegram_id()
                 return user
             else:
-                # Create new user
-                new_user = User.from_telegram_user(update.effective_user)
+                # Create new user with individual parameters
+                user_data = {
+                    'user_id': telegram_user_id,
+                    'username': update.effective_user.username or '',
+                    'first_name': update.effective_user.first_name or '',
+                    'last_name': update.effective_user.last_name or '',
+                    'is_active': True,
+                    'preferred_language': 'en',
+                    'timezone': 'UTC'
+                }
                 
                 # Set role based on config
                 if self.config.is_user_super_admin(update.effective_user.id):
-                    new_user.role = UserRole.SUPER_ADMIN
+                    role = UserRole.SUPER_ADMIN
                 elif self.config.is_user_admin(update.effective_user.id):
-                    new_user.role = UserRole.ADMIN
+                    role = UserRole.ADMIN
+                else:
+                    role = UserRole.USER
                 
-                await self.db.save_user(new_user)
+                user_data['role'] = role
+                
+                # FIX: Use correct method signature with individual parameters
+                user_db_id = await self.db.create_user(**user_data)
+                
+                # Get the created user
+                created_user = await self.db.get_user_by_id(user_db_id)
+                
                 self.logger.info(f"Created new user: {telegram_user_id}")
-                return new_user
+                return created_user
 
         except DatabaseError as e:
             self.logger.error(f"Failed to get/create user: {e}")
@@ -123,22 +144,25 @@ class BaseHandler(ABC):
             return None
 
     async def save_user_session(self, session: UserSession) -> bool:
-            """Save user session.
+        """Save user session.
+        
+        Args:
+            session: User session to save
             
-            Args:
-                session: User session to save
-                
-            Returns:
-                True if saved successfully
-            """
-            try:
-                await self.db.save_user_session(session)
-                return True
-            except DatabaseError as e:
-                self.logger.error(f"Failed to save user session: {e}")
-                return False
+        Returns:
+            True if saved successfully
+        """
+        try:
+            await self.db.save_user_session(session)
+            return True
+        except DatabaseError as e:
+            self.logger.error(f"Failed to save user session: {e}")
+            return False
 
-    # Permission checking methods
+    # =============================================================================
+    # PERMISSION CHECKING METHODS
+    # =============================================================================
+
     def check_user_access(self, user_id: int) -> bool:
         """Check if user has access to the bot.
         
@@ -184,7 +208,79 @@ class BaseHandler(ABC):
         """
         return user.is_super_admin()
 
-    # Message sending utilities
+    async def enforce_user_access(self, update: Update) -> Optional[User]:
+        """Enforce user access requirement.
+        
+        Args:
+            update: Telegram update
+            
+        Returns:
+            User object if authorized, None otherwise
+        """
+        if not update.effective_user:
+            return None
+
+        if not self.check_user_access(update.effective_user.id):
+            await self.send_error_message(
+                update,
+                "Access denied. Contact an administrator.",
+                ErrorType.PERMISSION_ERROR
+            )
+            return None
+
+        return await self.get_or_create_user(update)
+
+    async def enforce_role(self, update: Update, required_role: UserRole) -> Optional[User]:
+        """Enforce role requirement and return user if authorized.
+        
+        Args:
+            update: Telegram update
+            required_role: Required user role
+            
+        Returns:
+            User object if authorized, None otherwise
+        """
+        user = await self.enforce_user_access(update)
+        if not user:
+            return None
+
+        if not self.check_user_role(user, required_role):
+            role_name = required_role.value.replace('_', ' ').title()
+            await self.send_error_message(
+                update,
+                f"You need {role_name} permissions to use this command.",
+                ErrorType.PERMISSION_ERROR
+            )
+            return None
+
+        return user
+
+    async def enforce_admin(self, update: Update) -> Optional[User]:
+        """Enforce admin requirement.
+        
+        Args:
+            update: Telegram update
+            
+        Returns:
+            User object if admin, None otherwise
+        """
+        return await self.enforce_role(update, UserRole.ADMIN)
+
+    async def enforce_super_admin(self, update: Update) -> Optional[User]:
+        """Enforce super admin requirement.
+        
+        Args:
+            update: Telegram update
+            
+        Returns:
+            User object if super admin, None otherwise
+        """
+        return await self.enforce_role(update, UserRole.SUPER_ADMIN)
+
+    # =============================================================================
+    # MESSAGE SENDING UTILITIES
+    # =============================================================================
+
     async def send_message(
         self,
         update: Update,
@@ -267,66 +363,54 @@ class BaseHandler(ABC):
         Returns:
             Message ID if sent successfully
         """
-        return await self.telegram.send_success_message(update, success_text, reply_markup)
+        message = f"{EMOJI['SUCCESS']} **Success**\n\n{success_text}"
+        return await self.send_message(update, message, reply_markup)
 
-    async def send_info_message(
-        self,
-        update: Update,
-        info_text: str,
-        reply_markup: Optional[InlineKeyboardMarkup] = None
-    ) -> Optional[int]:
-        """Send an info message.
+    async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle callback queries with user verification.
         
         Args:
             update: Telegram update
-            info_text: Info message text
-            reply_markup: Optional keyboard markup
-            
-        Returns:
-            Message ID if sent successfully
+            context: Telegram context
         """
-        return await self.telegram.send_info_message(update, info_text, reply_markup)
+        query = update.callback_query
+        if not query:
+            return
 
-    async def send_warning_message(
-        self,
-        update: Update,
-        warning_text: str,
-        reply_markup: Optional[InlineKeyboardMarkup] = None
-    ) -> Optional[int]:
-        """Send a warning message.
-        
-        Args:
-            update: Telegram update
-            warning_text: Warning message text
-            reply_markup: Optional keyboard markup
+        try:
+            # Always answer callback queries to remove loading state
+            await query.answer()
             
-        Returns:
-            Message ID if sent successfully
-        """
-        return await self.telegram.send_warning_message(update, warning_text, reply_markup)
+            # Verify user access
+            user = await self.get_or_create_user(update)
+            if not user:
+                await self.edit_message(update, "Access denied.")
+                return
 
-    # Validation utilities
-    def validate_project_key(self, key: str) -> ValidationResult:
+            # Log callback query
+            self.log_user_action(user, f"callback_query: {query.data}")
+
+        except Exception as e:
+            self.logger.error(f"Error handling callback query: {e}")
+            try:
+                await query.answer("An error occurred.")
+            except:
+                pass
+
+    # =============================================================================
+    # VALIDATION METHODS
+    # =============================================================================
+
+    def validate_project_key(self, project_key: str) -> ValidationResult:
         """Validate project key.
         
         Args:
-            key: Project key to validate
+            project_key: Project key to validate
             
         Returns:
             ValidationResult
         """
-        return InputValidator.validate_project_key(key)
-
-    def validate_project_name(self, name: str) -> ValidationResult:
-        """Validate project name.
-        
-        Args:
-            name: Project name to validate
-            
-        Returns:
-            ValidationResult
-        """
-        return InputValidator.validate_project_name(name)
+        return InputValidator.validate_project_key(project_key)
 
     def validate_issue_summary(self, summary: str) -> ValidationResult:
         """Validate issue summary.
@@ -350,7 +434,10 @@ class BaseHandler(ABC):
         """
         return InputValidator.validate_issue_description(description, self.config.max_description_length)
 
-    # Command argument parsing
+    # =============================================================================
+    # COMMAND ARGUMENT PARSING
+    # =============================================================================
+
     def parse_command_args(self, update: Update, expected_args: int) -> Optional[List[str]]:
         """Parse command arguments from message.
         
@@ -400,7 +487,10 @@ class BaseHandler(ABC):
         """
         return callback_data.split('_') if callback_data else []
 
-    # Error handling utilities
+    # =============================================================================
+    # ERROR HANDLING UTILITIES
+    # =============================================================================
+
     async def handle_database_error(self, update: Update, error: DatabaseError, context: str = "") -> None:
         """Handle database errors consistently.
         
@@ -427,101 +517,34 @@ class BaseHandler(ABC):
         self.logger.error(f"Jira API error{' in ' + context if context else ''}: {error}")
         
         if error.status_code == 401:
-            error_message = "Jira authentication failed. Please check bot configuration."
+            await self.send_error_message(
+                update,
+                "Jira authentication failed. Please check the bot configuration.",
+                ErrorType.JIRA_AUTH_ERROR
+            )
         elif error.status_code == 403:
-            error_message = "Permission denied. Check your Jira permissions."
+            await self.send_error_message(
+                update,
+                "Jira access denied. Check your permissions.",
+                ErrorType.PERMISSION_ERROR
+            )
         elif error.status_code == 404:
-            error_message = "Resource not found in Jira."
+            await self.send_error_message(
+                update,
+                "Jira resource not found.",
+                ErrorType.NOT_FOUND_ERROR
+            )
         else:
-            error_message = f"Jira API error: {str(error)}"
-        
-        await self.send_error_message(update, error_message, ErrorType.JIRA_API_ERROR)
-
-    async def handle_validation_error(self, update: Update, validation_result: ValidationResult, context: str = "") -> None:
-        """Handle validation errors consistently.
-        
-        Args:
-            update: Telegram update
-            validation_result: Validation result with errors
-            context: Additional context
-        """
-        if validation_result.has_errors():
-            error_message = "\n".join([f"• {error}" for error in validation_result.errors])
-            self.logger.warning(f"Validation error{' in ' + context if context else ''}: {error_message}")
-            await self.send_error_message(update, error_message, ErrorType.VALIDATION_ERROR)
-
-    # Permission enforcement
-    async def enforce_user_access(self, update: Update) -> Optional[User]:
-        """Enforce user access and return user if allowed.
-        
-        Args:
-            update: Telegram update
-            
-        Returns:
-            User object if access is allowed, None otherwise
-        """
-        if not update.effective_user:
-            await self.send_error_message(update, "Unable to identify user")
-            return None
-
-        if not self.check_user_access(update.effective_user.id):
             await self.send_error_message(
                 update,
-                "You don't have access to this bot. Contact an administrator.",
-                ErrorType.PERMISSION_ERROR
+                f"Jira API error: {str(error)}",
+                ErrorType.JIRA_API_ERROR
             )
-            return None
 
-        return await self.get_or_create_user(update)
+    # =============================================================================
+    # UTILITY METHODS
+    # =============================================================================
 
-    async def enforce_role(self, update: Update, required_role: UserRole) -> Optional[User]:
-        """Enforce role requirement and return user if authorized.
-        
-        Args:
-            update: Telegram update
-            required_role: Required user role
-            
-        Returns:
-            User object if authorized, None otherwise
-        """
-        user = await self.enforce_user_access(update)
-        if not user:
-            return None
-
-        if not self.check_user_role(user, required_role):
-            role_name = required_role.value.replace('_', ' ').title()
-            await self.send_error_message(
-                update,
-                f"You need {role_name} permissions to use this command.",
-                ErrorType.PERMISSION_ERROR
-            )
-            return None
-
-        return user
-
-    async def enforce_admin(self, update: Update) -> Optional[User]:
-        """Enforce admin requirement.
-        
-        Args:
-            update: Telegram update
-            
-        Returns:
-            User object if admin, None otherwise
-        """
-        return await self.enforce_role(update, UserRole.ADMIN)
-
-    async def enforce_super_admin(self, update: Update) -> Optional[User]:
-        """Enforce super admin requirement.
-        
-        Args:
-            update: Telegram update
-            
-        Returns:
-            User object if super admin, None otherwise
-        """
-        return await self.enforce_role(update, UserRole.SUPER_ADMIN)
-
-    # Utility methods
     def get_user_display_name(self, user: User) -> str:
         """Get display name for user.
         
@@ -561,28 +584,10 @@ class BaseHandler(ABC):
             return text
         return text[:max_length - 3] + "..."
 
-    # Abstract methods that must be implemented by subclasses
-    @abstractmethod
-    async def handle_error(self, update: Update, error: Exception, context: str = "") -> None:
-        """Handle errors specific to this handler.
-        
-        Args:
-            update: Telegram update
-            error: Exception that occurred
-            context: Additional context
-        """
-        pass
+    # =============================================================================
+    # LOGGING UTILITIES
+    # =============================================================================
 
-    @abstractmethod
-    def get_handler_name(self) -> str:
-        """Get the name of this handler for logging purposes.
-        
-        Returns:
-            Handler name
-        """
-        pass
-
-    # Logging utilities
     def log_user_action(self, user: User, action: str, details: Optional[Dict[str, Any]] = None) -> None:
         """Log user action for audit purposes.
         
@@ -630,3 +635,27 @@ class BaseHandler(ABC):
             f"Handler {self.get_handler_name()}.{handler_method} {status}",
             extra={'user_id': user_id, 'method': handler_method, 'success': success}
         )
+
+    # =============================================================================
+    # ABSTRACT METHODS - MUST BE IMPLEMENTED BY SUBCLASSES
+    # =============================================================================
+
+    @abstractmethod
+    async def handle_error(self, update: Update, error: Exception, context: str = "") -> None:
+        """Handle errors specific to this handler.
+        
+        Args:
+            update: Telegram update
+            error: Exception that occurred
+            context: Additional context
+        """
+        pass
+
+    @abstractmethod
+    def get_handler_name(self) -> str:
+        """Get the name of this handler for logging purposes.
+        
+        Returns:
+            Handler name
+        """
+        pass

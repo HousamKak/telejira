@@ -46,32 +46,34 @@ class TestBaseHandler:
         )
     
     @pytest.mark.asyncio
-    async def test_start_command(
-        self, 
-        base_handler: BaseHandler,
-        telegram_update: Update,
-        mock_context: ContextTypes.DEFAULT_TYPE,
-        sample_user: BotUser
-    ) -> None:
-        """Test /start command handling."""
-        # Mock database methods
-        base_handler.database.get_user_by_telegram_id = AsyncMock(return_value=None)
-        base_handler.database.create_user = AsyncMock(return_value=1)
-        base_handler.database.get_user_by_id = AsyncMock(return_value=sample_user)
-        
-        await base_handler.start_command(telegram_update, mock_context)
-        
-        # Verify user creation was attempted for new users
-        base_handler.database.get_user_by_telegram_id.assert_called_once()
-        base_handler.database.create_user.assert_called_once()
-        
-        # Verify welcome message was sent
-        mock_context.bot.send_message.assert_called_once()
-        
-        # Check message content
-        call_args = mock_context.bot.send_message.call_args
-        assert call_args[1]['chat_id'] == telegram_update.effective_chat.id
-        assert "welcome" in call_args[1]['text'].lower()
+async def test_start_command(
+    self, 
+    base_handler: BaseHandler,
+    telegram_update: Update,
+    mock_context: ContextTypes.DEFAULT_TYPE,
+    sample_user: BotUser
+) -> None:
+    """Test /start command handling."""
+    # FIX: Use correct database method names
+    base_handler.db.get_user_by_telegram_id = AsyncMock(return_value=None)
+    base_handler.db.create_user = AsyncMock(return_value=1)
+    base_handler.db.get_user_by_id = AsyncMock(return_value=sample_user)
+    
+    # This would call a start_command method if it exists on BaseHandler
+    # Note: start_command may need to be implemented in BaseHandler or tested via subclass
+    await base_handler.start_command(telegram_update, mock_context)
+    
+    # Verify user creation was attempted for new users
+    base_handler.db.get_user_by_telegram_id.assert_called_once()
+    base_handler.db.create_user.assert_called_once()
+    
+    # Verify welcome message was sent
+    mock_context.bot.send_message.assert_called_once()
+    
+    # Check message content
+    call_args = mock_context.bot.send_message.call_args
+    assert call_args[1]['chat_id'] == telegram_update.effective_chat.id
+    assert "welcome" in call_args[1]['text'].lower()
     
     @pytest.mark.asyncio
     async def test_start_command_existing_user(
