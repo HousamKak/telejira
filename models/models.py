@@ -35,7 +35,7 @@ class UserRole(Enum):
 
 class IssueType(Enum):
     """Jira issue type enumeration."""
-    
+
     TASK = "Task"
     BUG = "Bug"
     STORY = "Story"
@@ -45,10 +45,21 @@ class IssueType(Enum):
     def __str__(self) -> str:
         return self.value
 
+    def get_emoji(self) -> str:
+        """Get emoji representation for the issue type."""
+        emoji_map = {
+            IssueType.TASK: "📋",
+            IssueType.BUG: "🐛",
+            IssueType.STORY: "📖",
+            IssueType.EPIC: "🎯",
+            IssueType.SUBTASK: "📌",
+        }
+        return emoji_map.get(self, "📄")
+
 
 class IssuePriority(Enum):
     """Jira issue priority enumeration."""
-    
+
     HIGHEST = "Highest"
     HIGH = "High"
     MEDIUM = "Medium"
@@ -58,10 +69,21 @@ class IssuePriority(Enum):
     def __str__(self) -> str:
         return self.value
 
+    def get_emoji(self) -> str:
+        """Get emoji representation for the priority."""
+        emoji_map = {
+            IssuePriority.HIGHEST: "🔴",
+            IssuePriority.HIGH: "🟠",
+            IssuePriority.MEDIUM: "🟡",
+            IssuePriority.LOW: "🟢",
+            IssuePriority.LOWEST: "⚪",
+        }
+        return emoji_map.get(self, "⚫")
+
 
 class IssueStatus(Enum):
     """Jira issue status enumeration."""
-    
+
     TO_DO = "To Do"
     IN_PROGRESS = "In Progress"
     DONE = "Done"
@@ -70,6 +92,17 @@ class IssueStatus(Enum):
 
     def __str__(self) -> str:
         return self.value
+
+    def get_emoji(self) -> str:
+        """Get emoji representation for the status."""
+        emoji_map = {
+            IssueStatus.TO_DO: "📝",
+            IssueStatus.IN_PROGRESS: "⚙️",
+            IssueStatus.DONE: "✅",
+            IssueStatus.BLOCKED: "🚫",
+            IssueStatus.REVIEW: "👀",
+        }
+        return emoji_map.get(self, "❓")
 
 
 class ErrorType(Enum):
@@ -274,6 +307,8 @@ class JiraIssue:
     components: List[str] = None
     created: Optional[datetime] = None
     updated: Optional[datetime] = None
+    story_points: Optional[float] = None
+    due_date: Optional[datetime] = None
     url: str = ""
 
     def __post_init__(self) -> None:
@@ -330,10 +365,38 @@ class JiraIssue:
             except ValueError:
                 priority = IssuePriority.MEDIUM
 
+            # Extract description from ADF format or plain text
+            description_data = fields.get('description', '')
+            if isinstance(description_data, dict):
+                # ADF format - extract text from content
+                description = IssueComment._extract_text_from_adf(description_data)
+            else:
+                # Plain text (fallback for older API versions)
+                description = description_data or ''
+
+            # Parse story points (custom field, may vary)
+            story_points = None
+            # Story points can be in customfield_10016 or other custom fields
+            for key in fields:
+                if 'story' in key.lower() or 'point' in key.lower():
+                    try:
+                        story_points = float(fields[key]) if fields[key] else None
+                        break
+                    except (TypeError, ValueError):
+                        pass
+
+            # Parse due date
+            due_date = None
+            if fields.get('duedate'):
+                try:
+                    due_date = datetime.fromisoformat(fields['duedate'].replace('Z', '+00:00'))
+                except ValueError:
+                    logger.warning(f"Could not parse due date: {fields['duedate']}")
+
             return cls(
                 key=data['key'],
                 summary=fields.get('summary', ''),
-                description=fields.get('description', ''),
+                description=description,
                 issue_type=issue_type,
                 status=fields.get('status', {}).get('name', 'Unknown'),
                 priority=priority,
@@ -347,6 +410,8 @@ class JiraIssue:
                 components=[c.get('name', '') for c in fields.get('components', [])],
                 created=created,
                 updated=updated,
+                story_points=story_points,
+                due_date=due_date,
                 url=data.get('self', ''),
             )
         except KeyError as e:
@@ -479,9 +544,18 @@ class IssueComment:
                 except ValueError:
                     logger.warning(f"Could not parse updated date: {data['updated']}")
 
+            # Extract body text from ADF format or plain text
+            body_data = data.get('body', '')
+            if isinstance(body_data, dict):
+                # ADF format - extract text from content
+                body = cls._extract_text_from_adf(body_data)
+            else:
+                # Plain text (fallback for older API versions)
+                body = body_data
+
             return cls(
                 id=data['id'],
-                body=data['body'],
+                body=body,
                 author_account_id=data['author']['accountId'],
                 author_display_name=data['author']['displayName'],
                 created=created,
@@ -489,6 +563,26 @@ class IssueComment:
             )
         except KeyError as e:
             raise ValueError(f"Missing required field in Jira comment response: {e}")
+
+    @staticmethod
+    def _extract_text_from_adf(adf: Dict[str, Any]) -> str:
+        """Extract plain text from Atlassian Document Format (ADF)."""
+        if not isinstance(adf, dict):
+            return str(adf)
+
+        text_parts = []
+
+        def extract_text(node: Dict[str, Any]) -> None:
+            """Recursively extract text from ADF nodes."""
+            if isinstance(node, dict):
+                if node.get('type') == 'text':
+                    text_parts.append(node.get('text', ''))
+                if 'content' in node and isinstance(node['content'], list):
+                    for child in node['content']:
+                        extract_text(child)
+
+        extract_text(adf)
+        return ' '.join(text_parts).strip() or '[No text content]'
 
     def get_formatted_comment(self) -> str:
         """Get formatted comment for display."""

@@ -99,7 +99,17 @@ class TelegramJiraBot:
             # Clear existing handlers
             root_logger.handlers.clear()
 
-            # Console handler
+            # Console handler with UTF-8 encoding for Windows
+            # Reconfigure stdout to handle UTF-8 on Windows
+            if sys.platform == 'win32':
+                import io
+                sys.stdout = io.TextIOWrapper(
+                    sys.stdout.buffer,
+                    encoding='utf-8',
+                    errors='replace',  # Replace characters that can't be encoded
+                    line_buffering=True
+                )
+
             console_handler = logging.StreamHandler(sys.stdout)
             console_handler.setFormatter(console_formatter)
             console_handler.setLevel(logging.INFO)
@@ -353,7 +363,9 @@ class TelegramJiraBot:
                 
                 # Issue commands
                 CommandHandler("create", self.issue_handlers.create_issue),
-                CommandHandler("myissues", self.issue_handlers.list_my_issues),
+                CommandHandler("idea", self.issue_handlers.create_idea),
+                CommandHandler("allissues", self.issue_handlers.list_my_issues),
+                CommandHandler("myissues", self.issue_handlers.list_my_issues),  # Alias for backwards compatibility
                 CommandHandler("listissues", self.issue_handlers.list_issues),
                 CommandHandler("searchissues", self.issue_handlers.search_issues),
                 CommandHandler("view", self.issue_handlers.view_issue),
@@ -361,6 +373,7 @@ class TelegramJiraBot:
                 CommandHandler("assign", self.issue_handlers.assign_issue),
                 CommandHandler("comment", self.issue_handlers.comment_issue),
                 CommandHandler("transition", self.issue_handlers.transition_issue),
+                CommandHandler("delete", self.issue_handlers.delete_issue),
             ]
 
             # Add admin commands if enabled
@@ -372,6 +385,7 @@ class TelegramJiraBot:
                 CommandHandler("setrole", self.admin_handlers.set_user_role),
                 CommandHandler("addproject", self.admin_handlers.add_project),
                 CommandHandler("refresh", self.admin_handlers.refresh_projects),
+                CommandHandler("sync", self.admin_handlers.refresh_projects),  # Alias for refresh
                 CommandHandler("stats", self.admin_handlers.show_stats),
             ]
             command_handlers.extend(admin_commands)
@@ -379,10 +393,13 @@ class TelegramJiraBot:
             # Add shortcut handlers if enabled
             if self.config.enable_shortcuts:
                 shortcut_handlers = [
+                    CommandHandler("s", self.base_handler.start_command),
+                    CommandHandler("h", self.base_handler.help_command),
                     CommandHandler("c", self.issue_handlers.create_issue),
                     CommandHandler("l", self.issue_handlers.list_issues),
                     CommandHandler("m", self.issue_handlers.list_my_issues),
                     CommandHandler("p", self.project_handlers.list_projects),
+                    CommandHandler("r", self.admin_handlers.refresh_projects),
                 ]
                 command_handlers.extend(shortcut_handlers)
 
@@ -392,24 +409,31 @@ class TelegramJiraBot:
 
             # Register callback query handlers (for inline keyboards)
             self.application.add_handler(
-                CallbackQueryHandler(self.project_handlers.handle_callback, pattern=r'^project_.*')
+                CallbackQueryHandler(self.project_handlers.handle_project_callback, pattern=r'^project_.*')
             )
             self.application.add_handler(
-                CallbackQueryHandler(self.issue_handlers.handle_callback, pattern=r'^issue_.*')
+                CallbackQueryHandler(self.issue_handlers.handle_issue_callback, pattern=r'^(view_issue_|view_comments_|refresh_issue_|edit_summary_|edit_description_|edit_priority_|edit_assignee_|set_priority_|edit_issue_|transition_issue_|do_transition_|confirm_create_|confirm_delete_|cancel_delete|create_new_issue|refresh_my_issues|cancel_create|create_issue_project_|search_more_)')
             )
             self.application.add_handler(
-                CallbackQueryHandler(self.admin_handlers.handle_callback, pattern=r'^admin_.*')
+                CallbackQueryHandler(self.admin_handlers.handle_admin_callback, pattern=r'^admin_.*')
             )
 
             # Register message handlers for shortcuts and natural language
             if self.config.enable_shortcuts:
                 # Natural language issue creation (e.g., "HIGH BUG Login broken")
-                self.application.add_handler(
-                    MessageHandler(
-                        filters.TEXT & ~filters.COMMAND & filters.Regex(r'^(LOW|MEDIUM|HIGH|CRITICAL|HIGHEST)\s+(BUG|TASK|STORY|EPIC)\s+.+'),
-                        self.issue_handlers.create_issue_from_text
-                    )
-                )
+                # TODO: Implement create_issue_from_text method in IssueHandlers
+                # self.application.add_handler(
+                #     MessageHandler(
+                #         filters.TEXT & ~filters.COMMAND & filters.Regex(r'^(LOW|MEDIUM|HIGH|CRITICAL|HIGHEST)\s+(BUG|TASK|STORY|EPIC)\s+.+'),
+                #         self.issue_handlers.create_issue_from_text
+                #     )
+                # )
+                pass
+
+            # Handler for editing issue fields (must come before general handler)
+            self.application.add_handler(
+                MessageHandler(filters.TEXT & ~filters.COMMAND, self.issue_handlers.handle_edit_field_message)
+            )
 
             # General message handler (for fallback)
             self.application.add_handler(

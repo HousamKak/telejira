@@ -15,36 +15,56 @@ from models import Project,IssuePriority, IssueType, IssueStatus, UserRole,JiraI
 
 from .constants import EMOJI, MAX_MESSAGE_LENGTH, MAX_SUMMARY_LENGTH
 
-def truncate_text(self, text: str, max_length: int) -> str:
-        """Truncate text to specified length.
-        
-        Args:
-            text: Text to truncate
-            max_length: Maximum length
-            
-        Returns:
-            Truncated text
-        """
-        if not isinstance(text, str):
-            return str(text)
-        
-        if len(text) <= max_length:
-            return text
-        
-        return text[:max_length - 3] + "..."
+
+def truncate_text(text: str, max_length: int) -> str:
+    """Truncate text to specified length (standalone function).
+
+    Args:
+        text: Text to truncate
+        max_length: Maximum length
+
+    Returns:
+        Truncated text
+    """
+    if not isinstance(text, str):
+        return str(text)
+
+    if len(text) <= max_length:
+        return text
+
+    return text[:max_length - 3] + "..."
+
 
 class MessageFormatter:
     """Utility class for formatting Telegram messages."""
 
     def __init__(self, compact_mode: bool = False, use_emoji: bool = True):
         """Initialize message formatter.
-        
+
         Args:
             compact_mode: Whether to use compact formatting
             use_emoji: Whether to include emojis in messages
         """
         self.compact_mode = compact_mode
         self.use_emoji = use_emoji
+
+    def truncate_text(self, text: str, max_length: int) -> str:
+        """Truncate text to specified length.
+
+        Args:
+            text: Text to truncate
+            max_length: Maximum length
+
+        Returns:
+            Truncated text
+        """
+        if not isinstance(text, str):
+            return str(text)
+
+        if len(text) <= max_length:
+            return text
+
+        return text[:max_length - 3] + "..."
 
     def format_issue(self, issue: JiraIssue, include_description: bool = True) -> str:
         """Format a Jira issue for display.
@@ -62,7 +82,18 @@ class MessageFormatter:
         # Build header with emojis
         priority_emoji = issue.priority.get_emoji() if self.use_emoji else ""
         type_emoji = issue.issue_type.get_emoji() if self.use_emoji else ""
-        status_emoji = issue.status.get_emoji() if self.use_emoji and issue.status else ""
+
+        # Status emoji mapping (status is a string, not an enum)
+        status_emoji_map = {
+            'To Do': '📋',
+            'In Progress': '🔄',
+            'Done': '✅',
+            'Closed': '✅',
+            'Blocked': '🚫',
+            'In Review': '👀',
+            'Open': '📂',
+        }
+        status_emoji = status_emoji_map.get(issue.status, '📌') if self.use_emoji and issue.status else ""
 
         header_parts = []
         if priority_emoji:
@@ -70,7 +101,7 @@ class MessageFormatter:
         if type_emoji:
             header_parts.append(f"{type_emoji} {issue.issue_type.value}")
         if status_emoji and issue.status:
-            header_parts.append(f"{status_emoji} {issue.status.value}")
+            header_parts.append(f"{status_emoji} {issue.status}")
 
         header = " • ".join(header_parts) if header_parts else ""
 
@@ -78,7 +109,7 @@ class MessageFormatter:
         lines = []
         
         # Title line
-        title_line = f"**{issue.key}: {self.truncate_text(issue.summary, MAX_SUMMARY_LENGTH)}**"
+        title_line = f"{issue.key}: {self.truncate_text(issue.summary, MAX_SUMMARY_LENGTH)}"
         lines.append(title_line)
         
         # Header line with priority, type, status
@@ -121,13 +152,13 @@ class MessageFormatter:
                 if len(issue.components) > 3:
                     components_str += f" (+{len(issue.components) - 3} more)"
                 details.append(f"🧩 Components: {components_str}")
-            
-            # Story points
-            if issue.story_points:
+
+            # Story points (if available)
+            if hasattr(issue, 'story_points') and issue.story_points:
                 details.append(f"📊 Story Points: {issue.story_points}")
-            
-            # Due date
-            if issue.due_date:
+
+            # Due date (if available)
+            if hasattr(issue, 'due_date') and issue.due_date:
                 due_str = self._format_datetime(issue.due_date)
                 is_overdue = issue.due_date < datetime.now(timezone.utc)
                 due_emoji = EMOJI.get('OVERDUE', '🚨') if is_overdue else EMOJI.get('DEADLINE', '📅')
@@ -137,11 +168,11 @@ class MessageFormatter:
                 lines.append(" • ".join(details))
 
         # Timestamps
-        created_str = self._format_datetime(issue.created_at)
+        created_str = self._format_datetime(issue.created)
         time_line = f"⏰ Created: {created_str}"
-        
-        if issue.updated_at and issue.updated_at != issue.created_at:
-            updated_str = self._format_datetime(issue.updated_at)
+
+        if issue.updated and issue.updated != issue.created:
+            updated_str = self._format_datetime(issue.updated)
             time_line += f" • Updated: {updated_str}"
         
         lines.append(time_line)
@@ -166,9 +197,9 @@ class MessageFormatter:
             raise TypeError("issues must be a list")
         
         if not issues:
-            return f"📋 **{title}**\n\nNo issues found."
+            return f"📋 {title}\n\nNo issues found."
 
-        lines = [f"📋 **{title}** ({len(issues)} total)"]
+        lines = [f"📋 {title} ({len(issues)} total)"]
         lines.append("")
 
         for i, issue in enumerate(issues[:20], 1):  # Limit to 20 issues
@@ -176,7 +207,7 @@ class MessageFormatter:
             type_emoji = issue.issue_type.get_emoji() if self.use_emoji else ""
             
             # Create compact issue line
-            issue_line = f"{i}. {priority_emoji}{type_emoji} **{issue.key}**: {self.truncate_text(issue.summary, 60)}"
+            issue_line = f"{i}. {priority_emoji}{type_emoji} {issue.key}: {self.truncate_text(issue.summary, 60)}"
             
             if issue.assignee and not self.compact_mode:
                 issue_line += f" (👤 {issue.assignee})"
@@ -205,7 +236,7 @@ class MessageFormatter:
         
         # Title with status
         status_emoji = "✅" if project.is_active else "❌"
-        title = f"{status_emoji} **{project.key}: {project.name}**"
+        title = f"{status_emoji} {project.key}: {project.name}"
         lines.append(title)
 
         # Description
@@ -265,7 +296,7 @@ class MessageFormatter:
         display_name = self._get_user_display_name(user)
         role_emoji = self._get_role_emoji(user.role)
         
-        header = f"{role_emoji} **{display_name}**"
+        header = f"{role_emoji} {display_name}"
         if user.role != UserRole.USER:
             header += f" ({user.role.value.replace('_', ' ').title()})"
         
@@ -325,11 +356,11 @@ class MessageFormatter:
         """
         error_emoji = EMOJI.get('ERROR', '❌') if self.use_emoji else ""
         
-        lines = [f"{error_emoji} **Error**: {message}"]
+        lines = [f"{error_emoji} Error: {message}"]
         
         if suggestion:
             lines.append("")
-            lines.append(f"💡 **Suggestion**: {suggestion}")
+            lines.append(f"💡 Suggestion: {suggestion}")
         
         return "\n".join(lines)
 
@@ -345,7 +376,7 @@ class MessageFormatter:
         """
         success_emoji = EMOJI.get('SUCCESS', '✅') if self.use_emoji else ""
         
-        lines = [f"{success_emoji} **Success**: {message}"]
+        lines = [f"{success_emoji} Success: {message}"]
         
         if details:
             lines.append("")
@@ -365,7 +396,7 @@ class MessageFormatter:
         """
         warning_emoji = EMOJI.get('WARNING', '⚠️') if self.use_emoji else ""
         
-        lines = [f"{warning_emoji} **Warning**: {message}"]
+        lines = [f"{warning_emoji} Warning: {message}"]
         
         if details:
             lines.append("")
@@ -385,7 +416,7 @@ class MessageFormatter:
         """
         help_emoji = EMOJI.get('HELP', '❓') if self.use_emoji else ""
         
-        lines = [f"{help_emoji} **{title}**"]
+        lines = [f"{help_emoji} {title}"]
         lines.append("")
         
         for command, description in commands.items():
@@ -405,13 +436,13 @@ class MessageFormatter:
         """
         stats_emoji = EMOJI.get('STATS', '📊') if self.use_emoji else ""
         
-        lines = [f"{stats_emoji} **{title}**"]
+        lines = [f"{stats_emoji} {title}"]
         lines.append("")
         
         for key, value in stats.items():
             # Format the key nicely
             formatted_key = key.replace('_', ' ').title()
-            lines.append(f"• **{formatted_key}**: {value}")
+            lines.append(f"• {formatted_key}: {value}")
         
         return "\n".join(lines)
 
@@ -425,7 +456,7 @@ class MessageFormatter:
         Returns:
             Formatted options message
         """
-        lines = [f"**{title}**"]
+        lines = [f"{title}"]
         lines.append("")
         lines.append("Please select an option:")
         

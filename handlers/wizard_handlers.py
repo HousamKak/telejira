@@ -29,7 +29,7 @@ from services.database import DatabaseError
 from services.jira_service import JiraAPIError
 from utils.constants import EMOJI, SUCCESS_MESSAGES, ERROR_MESSAGES, INFO_MESSAGES
 from utils.validators import InputValidator, ValidationResult
-from utils.formatters import MessageFormatter
+from utils.formatters import MessageFormatter, truncate_text
 from utils.keyboards import (
     cb, parse_cb, build_project_list_keyboard, build_issue_type_keyboard,
     build_issue_priority_keyboard, build_confirm_keyboard, build_back_cancel_keyboard
@@ -93,9 +93,9 @@ class IssueWizardData:
 def wizard_try(context_label: str):
     """Decorator for wizard error handling."""
     def decorator(func):
-        async def wrapper(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        async def wrapper(self, update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
             try:
-                return await func(self, update, context)
+                return await func(self, update, context, *args, **kwargs)
             except DatabaseError as e:
                 await self.handle_error(update, e, f"{context_label} - Database error")
                 return ConversationHandler.END
@@ -209,11 +209,10 @@ class WizardHandlers(BaseHandler):
 
         # Get user's default project
         default_project = None
-        if user.default_project_key:
-            try:
-                default_project = await self.db.get_project_by_key(user.default_project_key)
-            except Exception:
-                pass  # Default project might not exist anymore
+        try:
+            default_project = await self.db.get_user_default_project(user.user_id)
+        except Exception:
+            pass  # Default project might not exist
 
         # Show wizard welcome
         welcome_text = setup_welcome_message(user, default_project)
@@ -241,15 +240,14 @@ class WizardHandlers(BaseHandler):
         set_issue_ctx(context, wizard_data)
 
         # If user has a default project, use it
-        if user.default_project_key:
-            try:
-                default_project = await self.db.get_project_by_key(user.default_project_key)
-                if default_project:
-                    wizard_data.project_key = default_project.key
-                    set_issue_ctx(context, wizard_data)
-                    return await self._show_issue_type_selection(update, context)
-            except Exception:
-                pass  # Fall through to project selection
+        try:
+            default_project = await self.db.get_user_default_project(user.user_id)
+            if default_project:
+                wizard_data.project_key = default_project.key
+                set_issue_ctx(context, wizard_data)
+                return await self._show_issue_type_selection(update, context)
+        except Exception:
+            pass  # Fall through to project selection
 
         return await self._show_project_selection(update, context, "issue")
 
@@ -315,12 +313,12 @@ class WizardHandlers(BaseHandler):
             wizard_data.project_key = payload
             set_issue_ctx(context, wizard_data)
             return await self._show_issue_type_selection(update, context)
-        elif action == "set_type":
-            wizard_data.issue_type = payload
+        elif action == "select_type":
+            wizard_data.issue_type = payload.upper()
             set_issue_ctx(context, wizard_data)
             return await self._show_issue_priority_selection(update, context)
-        elif action == "set_priority":
-            wizard_data.priority = payload
+        elif action == "select_priority":
+            wizard_data.priority = payload.upper()
             set_issue_ctx(context, wizard_data)
             return await self._request_summary(update, context)
         elif action == "confirm_create":
@@ -426,8 +424,8 @@ class WizardHandlers(BaseHandler):
         if not user:
             return ConversationHandler.END
 
-        # Get user's accessible projects - FIXED: Use correct method name
-        projects = await self.db.list_user_projects(user.user_id)
+        # Get all available projects
+        projects = await self.db.list_projects()
 
         if not projects:
             # FIXED: Proper no projects handling
@@ -441,11 +439,21 @@ class WizardHandlers(BaseHandler):
 
         # Show project list
         message = f"📁 <b>Select Project</b>\n\nChoose a project for your {wizard_type}:"
-        
+
+        # Build keyboard with project buttons
+        action_prefix = "setup:select_project" if wizard_type == "setup" else "issue:select_project"
+        keyboard_buttons = []
+
+        for project in projects:
+            button_text = f"{project.name} ({project.key})"
+            callback_data = f"{action_prefix}:{project.key}"
+            keyboard_buttons.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
+
+        # Add cancel button
         cancel_cb = "wizard:cancel" if wizard_type == "setup" else "issue:cancel"
-        back_to = "setup" if wizard_type == "setup" else "wizard"
-        
-        keyboard = build_project_list_keyboard(projects, back_to, cancel_cb)
+        keyboard_buttons.append([InlineKeyboardButton("❌ Cancel", callback_data=cancel_cb)])
+
+        keyboard = InlineKeyboardMarkup(keyboard_buttons)
         
         await reply_or_edit(update, message, reply_markup=keyboard)
         
@@ -545,8 +553,7 @@ class WizardHandlers(BaseHandler):
         issue_types = [IssueType.TASK, IssueType.BUG, IssueType.STORY, IssueType.EPIC]
         keyboard = build_issue_type_keyboard(
             issue_types,
-            cb("issue", "back_to_project"),
-            cb("issue", "cancel")
+            "issue:select_type"
         )
 
         await reply_or_edit(update, message, reply_markup=keyboard)
@@ -573,12 +580,11 @@ class WizardHandlers(BaseHandler):
                   f"Select the priority level:")
 
         # Available priorities
-        priorities = [IssuePriority.HIGHEST, IssuePriority.HIGH, IssuePriority.MEDIUM, 
+        priorities = [IssuePriority.HIGHEST, IssuePriority.HIGH, IssuePriority.MEDIUM,
                      IssuePriority.LOW, IssuePriority.LOWEST]
         keyboard = build_issue_priority_keyboard(
             priorities,
-            cb("issue", "back_to_type"),
-            cb("issue", "cancel")
+            "issue:select_priority"
         )
 
         await reply_or_edit(update, message, reply_markup=keyboard)
@@ -655,11 +661,13 @@ class WizardHandlers(BaseHandler):
             wizard_data.summary, wizard_data.description
         )
 
-        keyboard = build_confirm_keyboard(
-            cb("issue", "confirm_create"),
-            cb("issue", "back_to_description"),
-            cb("issue", "cancel")
-        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Create Issue", callback_data=cb("issue", "confirm_create"))],
+            [
+                InlineKeyboardButton("🔙 Back", callback_data=cb("issue", "back_to_description")),
+                InlineKeyboardButton("❌ Cancel", callback_data=cb("issue", "cancel"))
+            ]
+        ])
 
         await reply_or_edit(update, message, reply_markup=keyboard)
         return ConversationState.ISSUE_CONFIRM_CREATE.value
@@ -675,9 +683,12 @@ class WizardHandlers(BaseHandler):
             return ConversationHandler.END
 
         try:
-            # FIXED: Pass enum instances, not strings
-            issue_type = IssueType[wizard_data.issue_type]
-            priority = IssuePriority[wizard_data.priority]
+            # Convert string enum names to enum instances
+            issue_type = IssueType[wizard_data.issue_type.upper()]
+            priority = IssuePriority[wizard_data.priority.upper()]
+
+            # Log what we're about to create for debugging
+            self.logger.info(f"Creating issue: project={wizard_data.project_key}, type={issue_type}, priority={priority}, summary={wizard_data.summary}")
 
             # Create the issue
             created_issue = await self.jira.create_issue(
@@ -687,6 +698,25 @@ class WizardHandlers(BaseHandler):
                 issue_type=issue_type,
                 priority=priority,
             )
+
+            # Try to transition to "Backlog" status automatically
+            try:
+                transitions = await self.jira.list_transitions(created_issue.key)
+
+                # Find "Backlog" transition
+                backlog_transition = None
+                for transition in transitions:
+                    if 'backlog' in transition['name'].lower():
+                        backlog_transition = transition
+                        break
+
+                if backlog_transition:
+                    await self.jira.transition_issue(created_issue.key, backlog_transition['id'])
+                    self.logger.info(f"Issue {created_issue.key} transitioned to Backlog")
+
+            except Exception as e:
+                self.logger.warning(f"Could not transition to Backlog status: {e}")
+                # Continue anyway - not a critical error
 
             # Log the action
             await self.db.log_user_action(user.user_id, "wizard.issue.created", {
@@ -703,7 +733,8 @@ class WizardHandlers(BaseHandler):
             return ConversationHandler.END
 
         except JiraAPIError as e:
-            error_message = f"❌ <b>Failed to create issue</b>\n\n{str(e)}"
+            self.logger.error(f"Failed to create issue: {e}")
+            error_message = f"❌ <b>Failed to create issue</b>\n\n{str(e)}\n\nPlease check the logs for more details."
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 Try Again", callback_data=cb("issue", "confirm_create"))],
                 [InlineKeyboardButton("❌ Cancel", callback_data=cb("issue", "cancel"))]

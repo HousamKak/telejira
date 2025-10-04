@@ -217,6 +217,11 @@ class InputValidator:
         return result
 
     @staticmethod
+    def validate_summary(summary: str, max_length: int = 200) -> ValidationResult:
+        """Alias for validate_issue_summary for convenience."""
+        return InputValidator.validate_issue_summary(summary, max_length)
+
+    @staticmethod
     def validate_issue_description(description: str, max_length: int = 5000) -> ValidationResult:
         """Validate issue description.
         
@@ -248,6 +253,11 @@ class InputValidator:
             result.add_warning("Consider providing a more detailed description")
         
         return result
+
+    @staticmethod
+    def validate_description(description: str, max_length: int = 5000) -> ValidationResult:
+        """Alias for validate_issue_description for convenience."""
+        return InputValidator.validate_issue_description(description, max_length)
 
     @staticmethod
     def validate_priority(priority: Union[str, IssuePriority], allow_empty: bool = False) -> ValidationResult:

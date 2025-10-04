@@ -72,7 +72,7 @@ class TelegramService:
         chat_id: Union[int, str],
         text: str,
         *,
-        parse_mode: Optional[str] = "Markdown",
+        parse_mode: Optional[str] = None,
         reply_markup: Optional[InlineKeyboardMarkup] = None,
         reply_to_message_id: Optional[int] = None,
         disable_notification: bool = False,
@@ -272,7 +272,7 @@ class TelegramService:
         message_id: int,
         text: str,
         *,
-        parse_mode: Optional[str] = "Markdown",
+        parse_mode: Optional[str] = None,
         reply_markup: Optional[InlineKeyboardMarkup] = None,
     ) -> None:
         """

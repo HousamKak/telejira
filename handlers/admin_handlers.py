@@ -39,7 +39,7 @@ class AdminHandlers(BaseHandler):
         telegram_service: TelegramService,
     ) -> None:
         """Initialize admin handlers with required services."""
-        super().__init__(config,database_service, jira_service, telegram_service)
+        super().__init__(config, database_service, jira_service, telegram_service)
 
     # ---- Public Commands ----
 
@@ -86,7 +86,7 @@ class AdminHandlers(BaseHandler):
             reply_markup = InlineKeyboardMarkup(keyboard)
             
             menu_text = (
-                f"🔧 **Admin Panel**\n\n"
+                f"🔧 Admin Panel\n\n"
                 f"Welcome, {user.display_name}!\n"
                 f"Role: {user.role.display_name}\n\n"
                 f"Choose an administrative action:"
@@ -121,13 +121,13 @@ class AdminHandlers(BaseHandler):
             
             if len(args) != 2:
                 help_text = (
-                    "**Usage:** `/adduser <username> <role>`\n\n"
-                    "**Available roles:**\n"
+                    "Usage: `/adduser <username> <role>`\n\n"
+                    "Available roles:\n"
                     "• `guest` - Limited access\n"
                     "• `user` - Standard user access\n"
                     "• `admin` - Administrative access\n"
                     "• `super_admin` - Full system access (super admin only)\n\n"
-                    "**Example:** `/adduser johndoe user`"
+                    "Example: `/adduser johndoe user`"
                 )
                 await self.send_message(update, help_text)
                 return
@@ -172,7 +172,7 @@ class AdminHandlers(BaseHandler):
             })
             
             success_text = (
-                f"✅ **User Added Successfully**\n\n"
+                f"✅ User Added Successfully\n\n"
                 f"Username: @{username}\n"
                 f"Role: {role.display_name}\n\n"
                 f"The user can now start the bot and will be automatically registered with the specified role."
@@ -207,8 +207,8 @@ class AdminHandlers(BaseHandler):
             
             if len(args) != 1:
                 help_text = (
-                    "**Usage:** `/removeuser <username>`\n\n"
-                    "**Example:** `/removeuser johndoe`\n\n"
+                    "Usage: `/removeuser <username>`\n\n"
+                    "Example: `/removeuser johndoe`\n\n"
                     "This will deactivate the user's account."
                 )
                 await self.send_message(update, help_text)
@@ -280,7 +280,7 @@ class AdminHandlers(BaseHandler):
                 users_by_role[role_name].append(u)
             
             # Build user list text
-            text_parts = [f"👥 **System Users ({len(users)} total)**\n"]
+            text_parts = [f"👥 System Users ({len(users)} total)\n"]
             
             # Define role order for display
             role_order = [UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.USER, UserRole.GUEST]
@@ -289,7 +289,7 @@ class AdminHandlers(BaseHandler):
                 role_name = role.display_name
                 if role_name in users_by_role:
                     role_users = users_by_role[role_name]
-                    text_parts.append(f"\n**{role_name} ({len(role_users)}):**")
+                    text_parts.append(f"\n{role_name} ({len(role_users)}):")
                     
                     for u in sorted(role_users, key=lambda x: x.username or x.display_name):
                         status_emoji = "✅" if u.is_active else "❌"
@@ -332,13 +332,13 @@ class AdminHandlers(BaseHandler):
             
             if len(args) != 2:
                 help_text = (
-                    "**Usage:** `/setrole <username> <new_role>`\n\n"
-                    "**Available roles:**\n"
+                    "Usage: `/setrole <username> <new_role>`\n\n"
+                    "Available roles:\n"
                     "• `guest` - Limited access\n"
                     "• `user` - Standard user access\n"
                     "• `admin` - Administrative access\n"
                     "• `super_admin` - Full system access (super admin only)\n\n"
-                    "**Example:** `/setrole johndoe admin`"
+                    "Example: `/setrole johndoe admin`"
                 )
                 await self.send_message(update, help_text)
                 return
@@ -409,7 +409,7 @@ class AdminHandlers(BaseHandler):
             })
             
             success_text = (
-                f"✅ **Role Updated Successfully**\n\n"
+                f"✅ Role Updated Successfully\n\n"
                 f"User: @{username}\n"
                 f"Previous role: {old_role.display_name}\n"
                 f"New role: {new_role.display_name}"
@@ -497,8 +497,8 @@ class AdminHandlers(BaseHandler):
             
             # Send summary
             summary_text = (
-                f"✅ **Project Refresh Complete**\n\n"
-                f"📊 **Summary:**\n"
+                f"✅ Project Refresh Complete\n\n"
+                f"📊 Summary:\n"
                 f"• Total Jira projects: {len(jira_projects)}\n"
                 f"• New projects created: {created_count}\n"
                 f"• Existing projects updated: {updated_count}"
@@ -535,20 +535,20 @@ class AdminHandlers(BaseHandler):
             
             # Format statistics message
             stats_text = (
-                f"📊 **System Statistics**\n\n"
-                f"👥 **Users:**\n"
+                f"📊 System Statistics\n\n"
+                f"👥 Users:\n"
                 f"• Total users: {stats['users']['total']}\n"
                 f"• Active today: {stats['users']['active_today']}\n"
                 f"• New this week: {stats['users']['new_this_week']}\n\n"
-                f"🏗 **Projects:**\n"
+                f"🏗 Projects:\n"
                 f"• Total projects: {stats['projects']['total']}\n"
                 f"• Active projects: {stats['projects']['active']}\n\n"
-                f"📈 **Activity:**\n"
+                f"📈 Activity:\n"
                 f"• Actions today: {stats['activity']['actions_today']}\n"
                 f"• Total actions (7 days): {stats['activity']['actions_week']}\n\n"
-                f"🎯 **Issues:**\n"
+                f"🎯 Issues:\n"
                 f"• Total tracked: {stats['issues']['total']}\n\n"
-                f"🔧 **System Health:**\n"
+                f"🔧 System Health:\n"
                 f"• Database: {stats['health']['database']}\n"
                 f"• Jira API: {stats['health']['jira']}\n"
                 f"• Telegram API: {stats['health']['telegram']}"
@@ -556,7 +556,7 @@ class AdminHandlers(BaseHandler):
             
             # Add role distribution for super admins
             if self.is_super_admin(user) and stats['users']['role_distribution']:
-                stats_text += "\n\n👤 **Role Distribution:**\n"
+                stats_text += "\n\n👤 Role Distribution:\n"
                 for role, count in stats['users']['role_distribution'].items():
                     stats_text += f"• {role.title()}: {count}\n"
             
@@ -709,11 +709,11 @@ class AdminHandlers(BaseHandler):
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         confirmation_text = (
-            f"⚠️ **Confirm User Removal**\n\n"
+            f"⚠️ Confirm User Removal\n\n"
             f"Are you sure you want to deactivate this user?\n\n"
-            f"**User:** @{target_user.username or 'No username'}\n"
-            f"**Name:** {target_user.display_name}\n"
-            f"**Role:** {target_user.role.display_name}\n\n"
+            f"User: @{target_user.username or 'No username'}\n"
+            f"Name: {target_user.display_name}\n"
+            f"Role: {target_user.role.display_name}\n\n"
             f"This action will deactivate the user's account. They will no longer be able to use the bot."
         )
         
@@ -749,7 +749,7 @@ class AdminHandlers(BaseHandler):
             })
             
             success_text = (
-                f"✅ **User Deactivated**\n\n"
+                f"✅ User Deactivated\n\n"
                 f"User @{target_user.username or 'No username'} has been deactivated successfully."
             )
             
@@ -768,9 +768,9 @@ class AdminHandlers(BaseHandler):
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         text = (
-            "👥 **User Management**\n\n"
+            "👥 User Management\n\n"
             "Choose an action or use commands:\n\n"
-            "**Commands:**\n"
+            "Commands:\n"
             "• `/adduser <username> <role>` - Add preauthorized user\n"
             "• `/removeuser <username>` - Deactivate user\n"
             "• `/setrole <username> <role>` - Change user role\n"
@@ -788,9 +788,9 @@ class AdminHandlers(BaseHandler):
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         text = (
-            "🏗 **Project Management**\n\n"
+            "🏗 Project Management\n\n"
             "Manage projects synchronized from Jira:\n\n"
-            "**Available Actions:**\n"
+            "Available Actions:\n"
             "• Refresh projects from Jira API\n"
             "• View project statistics\n\n"
             "Projects are automatically synchronized from your Jira instance. "
@@ -827,10 +827,10 @@ class AdminHandlers(BaseHandler):
                 health_data['telegram'] = f"Unhealthy - {str(e)[:50]}..."
             
             text = (
-                f"🔧 **System Health Status**\n\n"
-                f"🗄 **Database:** {health_data['database']}\n"
-                f"🔧 **Jira API:** {health_data['jira']}\n"
-                f"🤖 **Telegram API:** {health_data['telegram']}\n\n"
+                f"🔧 System Health Status\n\n"
+                f"🗄 Database: {health_data['database']}\n"
+                f"🔧 Jira API: {health_data['jira']}\n"
+                f"🤖 Telegram API: {health_data['telegram']}\n\n"
                 f"_Last checked: Now_"
             )
             
@@ -849,22 +849,22 @@ class AdminHandlers(BaseHandler):
             stats = await self._get_comprehensive_statistics()
             
             text_parts = [
-                "📊 **Comprehensive System Statistics**\n",
-                f"👥 **Users:** {stats['users']['total']} total, {stats['users']['active_today']} active today",
-                f"🏗 **Projects:** {stats['projects']['total']} total, {stats['projects']['active']} active",
-                f"🎯 **Issues:** {stats['issues']['total']} tracked locally",
-                f"📈 **Activity:** {stats['activity']['actions_today']} today, {stats['activity']['actions_week']} this week",
+                "📊 Comprehensive System Statistics\n",
+                f"👥 Users: {stats['users']['total']} total, {stats['users']['active_today']} active today",
+                f"🏗 Projects: {stats['projects']['total']} total, {stats['projects']['active']} active",
+                f"🎯 Issues: {stats['issues']['total']} tracked locally",
+                f"📈 Activity: {stats['activity']['actions_today']} today, {stats['activity']['actions_week']} this week",
             ]
             
             # Add role distribution
             if stats['users']['role_distribution']:
-                text_parts.append("\n👤 **Role Distribution:**")
+                text_parts.append("\n👤 Role Distribution:")
                 for role, count in stats['users']['role_distribution'].items():
                     text_parts.append(f"• {role.title()}: {count}")
             
             # Add popular projects if available
             if stats.get('projects_detailed', {}).get('popular_projects'):
-                text_parts.append("\n🏆 **Popular Projects:**")
+                text_parts.append("\n🏆 Popular Projects:")
                 for proj in stats['projects_detailed']['popular_projects'][:5]:
                     text_parts.append(f"• {proj['name']} ({proj['user_count']} users)")
             
@@ -878,3 +878,72 @@ class AdminHandlers(BaseHandler):
         except Exception as e:
             logger.error(f"Error showing comprehensive stats: {e}")
             await self.edit_message(update, "❌ Failed to retrieve comprehensive statistics.")
+            
+    async def add_project(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        Add/sync a single Jira project into the local database.
+
+        Usage: /addproject <PROJECT_KEY>
+        """
+        self.log_handler_start(update, "add_project")
+
+        # Admins only
+        user = await self.enforce_role(update, UserRole.ADMIN)
+        if not user:
+            return
+
+        try:
+            args = self._extract_command_args(update)
+            if len(args) != 1:
+                await self.send_message(
+                    update,
+                    "Usage: /addproject <PROJECT_KEY>\nExample: /addproject ABC"
+                )
+                return
+
+            project_key = args[0].strip().upper()
+
+            # Fetch project from Jira
+            jira_project = await self.jira.get_project(project_key)
+
+            # See if it already exists locally
+            existing = await self.db.get_project_by_key(project_key)
+            if existing:
+                await self.db.update_project(
+                    project_key=project_key,
+                    name=jira_project.name,
+                    description=jira_project.description or "",
+                    url=jira_project.url or "",
+                    project_type=jira_project.project_type or "software",
+                    lead=jira_project.lead,
+                    avatar_url=jira_project.avatar_url,
+                )
+                action = "updated"
+            else:
+                await self.db.create_project(
+                    key=jira_project.key,
+                    name=jira_project.name,
+                    description=jira_project.description or "",
+                    url=jira_project.url or "",
+                    project_type=jira_project.project_type or "software",
+                    lead=jira_project.lead,
+                    avatar_url=jira_project.avatar_url,
+                )
+                action = "created"
+
+            # Log admin action
+            await self.db.log_user_action(user.user_id, "admin.add_project", {
+                "project_key": project_key,
+                "action": action,
+            })
+
+            await self.send_message(
+                update,
+                f"✅ Project <b>{jira_project.key}</b> – <b>{jira_project.name}</b> {action}."
+            )
+            self.log_handler_end(update, "add_project", success=True)
+
+        except Exception as e:
+            logger.error(f"Error in add_project: {e}")
+            await self.handle_jira_error(update, e, "adding project")
+            self.log_handler_end(update, "add_project", success=False)

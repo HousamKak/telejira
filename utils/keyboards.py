@@ -12,34 +12,50 @@ from models import IssuePriority, IssueType,Project
 from .constants import EMOJI
 
 
-def cb(action: str, data: str = "") -> str:
+def cb(scope: str, action: str = "", payload: str = "") -> str:
     """Create callback data string.
-    
+
     Args:
-        action: Action identifier
-        data: Additional data (optional)
-        
+        scope: Scope/prefix identifier (or full action for backwards compatibility)
+        action: Action identifier (optional)
+        payload: Additional data (optional)
+
     Returns:
-        Formatted callback data string
+        Formatted callback data string in format "scope:action:payload" or "scope_action"
     """
-    if data:
-        return f"{action}_{data}"
-    return action
+    # New format: scope:action:payload
+    if action:
+        if payload:
+            return f"{scope}:{action}:{payload}"
+        return f"{scope}:{action}"
+
+    # Legacy format: just scope (backwards compatibility)
+    return scope
 
 
-def parse_cb(callback_data: str) -> Tuple[str, str]:
+def parse_cb(callback_data: str) -> Tuple[str, str, str]:
     """Parse callback data string.
-    
+
     Args:
-        callback_data: Callback data to parse
-        
+        callback_data: Callback data to parse in format "scope:action:payload" or "scope_action"
+
     Returns:
-        Tuple of (action, data)
+        Tuple of (scope, action, payload)
     """
+    # Handle colon-separated format (new wizard format)
+    if ':' in callback_data:
+        parts = callback_data.split(":", 2)
+        scope = parts[0] if len(parts) > 0 else ""
+        action = parts[1] if len(parts) > 1 else ""
+        payload = parts[2] if len(parts) > 2 else ""
+        return scope, action, payload
+
+    # Handle underscore-separated format (legacy format)
     parts = callback_data.split("_", 1)
-    action = parts[0]
-    data = parts[1] if len(parts) > 1 else ""
-    return action, data
+    scope = parts[0]
+    action = parts[1] if len(parts) > 1 else ""
+    payload = ""
+    return scope, action, payload
 
 
 def build_project_list_keyboard(
@@ -78,22 +94,27 @@ def build_project_list_keyboard(
 
 
 def build_issue_type_keyboard(
+    issue_types: List[IssueType] = None,
     action_prefix: str = "select_type",
     max_per_row: int = 2
 ) -> InlineKeyboardMarkup:
     """Build keyboard for issue type selection.
-    
+
     Args:
+        issue_types: List of issue types to include (default: all)
         action_prefix: Prefix for callback actions
         max_per_row: Maximum buttons per row
-        
+
     Returns:
         InlineKeyboardMarkup for issue type selection
     """
+    if issue_types is None:
+        issue_types = list(IssueType)
+
     keyboard = []
     row = []
-    
-    for issue_type in IssueType:
+
+    for issue_type in issue_types:
         emoji = issue_type.get_emoji() if hasattr(issue_type, 'get_emoji') else ""
         button_text = f"{emoji} {issue_type.value}".strip()
         callback_data = cb(action_prefix, issue_type.name.lower())
@@ -112,22 +133,27 @@ def build_issue_type_keyboard(
 
 
 def build_issue_priority_keyboard(
+    priorities: List[IssuePriority] = None,
     action_prefix: str = "select_priority",
     max_per_row: int = 2
 ) -> InlineKeyboardMarkup:
     """Build keyboard for issue priority selection.
-    
+
     Args:
-        action_prefix: Prefix for callback actions  
+        priorities: List of priorities to include (default: all)
+        action_prefix: Prefix for callback actions
         max_per_row: Maximum buttons per row
-        
+
     Returns:
         InlineKeyboardMarkup for priority selection
     """
+    if priorities is None:
+        priorities = list(IssuePriority)
+
     keyboard = []
     row = []
-    
-    for priority in IssuePriority:
+
+    for priority in priorities:
         emoji = priority.get_emoji() if hasattr(priority, 'get_emoji') else ""
         button_text = f"{emoji} {priority.value}".strip()
         callback_data = cb(action_prefix, priority.name.lower())

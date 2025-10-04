@@ -108,6 +108,35 @@ class JiraService:
         self._session: Optional[ClientSession] = None
         self._closed = False
 
+    @staticmethod
+    def _text_to_adf(text: str) -> Dict[str, Any]:
+        """
+        Convert plain text to Atlassian Document Format (ADF).
+
+        Jira Cloud API v3 requires text content in ADF format for descriptions and comments.
+
+        Args:
+            text: Plain text to convert
+
+        Returns:
+            ADF document structure
+        """
+        return {
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "paragraph",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": text
+                        }
+                    ]
+                }
+            ]
+        }
+
     async def _get_session(self) -> ClientSession:
         """Get or create HTTP session with proper configuration."""
         if self._session is None or self._session.closed:
@@ -376,24 +405,26 @@ class JiraService:
         if fields is not None and not isinstance(fields, list):
             raise TypeError("fields must be list or None")
 
-        json_data = {
-            'jql': jql,
-            'maxResults': min(max_results, 100),  # Jira API limit
-            'startAt': start_at,
-            'expand': ['names', 'schema', 'operations'],
-        }
-        
+        # Prepare fields parameter
         if fields:
-            json_data['fields'] = fields
+            fields_list = fields
         else:
             # Default fields for comprehensive issue data
-            json_data['fields'] = [
+            fields_list = [
                 'summary', 'description', 'issuetype', 'status', 'priority',
                 'assignee', 'reporter', 'project', 'labels', 'components',
                 'created', 'updated'
             ]
 
-        response = await self._make_request('POST', 'search', json_data=json_data)
+        params = {
+            'jql': jql,
+            'maxResults': min(max_results, 100),  # Jira API limit
+            'startAt': start_at,
+            'fields': ','.join(fields_list),
+            'expand': 'names,schema,operations',
+        }
+
+        response = await self._make_request('GET', 'search/jql', params=params)
         
         issues = []
         for issue_data in response.get('issues', []):
@@ -464,10 +495,15 @@ class JiraService:
         fields = {
             'project': {'key': project_key},
             'summary': summary,
-            'description': description,
             'issuetype': {'name': issue_type.value},
             'priority': {'name': priority.value},
         }
+
+        # Add description in ADF format (required by Jira Cloud API v3)
+        if description:
+            fields['description'] = self._text_to_adf(description)
+        else:
+            fields['description'] = self._text_to_adf("Created via Telegram bot")
         
         if assignee_account_id:
             fields['assignee'] = {'accountId': assignee_account_id}
@@ -485,6 +521,100 @@ class JiraService:
         # Fetch the created issue with full details
         issue_key = response['key']
         return await self.get_issue(issue_key)
+
+    async def update_issue(
+        self,
+        issue_key: str,
+        *,
+        summary: Optional[str] = None,
+        description: Optional[str] = None,
+        priority: Optional[IssuePriority] = None,
+        issue_type: Optional[IssueType] = None,
+        labels: Optional[List[str]] = None,
+        components: Optional[List[str]] = None,
+    ) -> JiraIssue:
+        """
+        Update an existing Jira issue.
+
+        Args:
+            issue_key: Jira issue key to update
+            summary: New issue summary (optional)
+            description: New description (optional)
+            priority: New priority level (optional)
+            issue_type: New issue type (optional)
+            labels: New labels list (optional)
+            components: New components list (optional)
+
+        Returns:
+            Updated JiraIssue instance
+
+        Raises:
+            TypeError: If parameters have incorrect types
+            JiraNotFoundError: If issue doesn't exist
+            JiraAPIError: If update fails
+        """
+        if not isinstance(issue_key, str) or not issue_key:
+            raise TypeError("issue_key must be non-empty string")
+        if summary is not None and not isinstance(summary, str):
+            raise TypeError("summary must be string or None")
+        if description is not None and not isinstance(description, str):
+            raise TypeError("description must be string or None")
+        if priority is not None and not isinstance(priority, IssuePriority):
+            raise TypeError("priority must be IssuePriority or None")
+        if issue_type is not None and not isinstance(issue_type, IssueType):
+            raise TypeError("issue_type must be IssueType or None")
+        if labels is not None and not isinstance(labels, list):
+            raise TypeError("labels must be list or None")
+        if components is not None and not isinstance(components, list):
+            raise TypeError("components must be list or None")
+
+        fields = {}
+
+        if summary is not None:
+            fields['summary'] = summary
+
+        if description is not None:
+            fields['description'] = self._text_to_adf(description)
+
+        if priority is not None:
+            fields['priority'] = {'name': priority.value}
+
+        if issue_type is not None:
+            fields['issuetype'] = {'name': issue_type.value}
+
+        if labels is not None:
+            fields['labels'] = labels
+
+        if components is not None:
+            fields['components'] = [{'name': comp} for comp in components]
+
+        if not fields:
+            # No fields to update, just return the current issue
+            return await self.get_issue(issue_key)
+
+        json_data = {'fields': fields}
+
+        await self._make_request('PUT', f'issue/{issue_key}', json_data=json_data)
+
+        # Fetch the updated issue with full details
+        return await self.get_issue(issue_key)
+
+    async def delete_issue(self, issue_key: str) -> None:
+        """
+        Delete a Jira issue.
+
+        Args:
+            issue_key: Jira issue key to delete
+
+        Raises:
+            TypeError: If issue_key is not a string
+            JiraNotFoundError: If issue doesn't exist
+            JiraAPIError: If deletion fails
+        """
+        if not isinstance(issue_key, str) or not issue_key:
+            raise TypeError("issue_key must be non-empty string")
+
+        await self._make_request('DELETE', f'issue/{issue_key}')
 
     async def assign_issue(self, issue_key: str, assignee_account_id: str) -> None:
         """
@@ -533,10 +663,11 @@ class JiraService:
         if not isinstance(body, str) or not body:
             raise TypeError("body must be non-empty string")
 
+        # Convert comment body to ADF format (required by Jira Cloud API v3)
         json_data = {
-            'body': body
+            'body': self._text_to_adf(body)
         }
-        
+
         response = await self._make_request('POST', f'issue/{issue_key}/comment', json_data=json_data)
         return IssueComment.from_jira_response(response)
 

@@ -89,15 +89,15 @@ class IssueHandlers(BaseHandler):
 
         try:
             # Get user's projects
-            projects = await self.db.get_user_projects(user.user_id)
+            projects = await self.db.list_user_projects(user.user_id)
             
             if not projects:
                 message = f"""
-{EMOJI.get('ERROR', '❌')} **No Projects Available**
+{EMOJI.get('ERROR', '❌')} No Projects Available
 
 You don't have access to any projects yet.
 
-**Next Steps:**
+Next Steps:
 • Contact your admin to add projects
 • Or use `/help` for more information
                 """
@@ -106,9 +106,9 @@ You don't have access to any projects yet.
 
             # Show project selection
             message = f"""
-{EMOJI.get('CREATE', '📝')} **Create New Issue**
+{EMOJI.get('CREATE', '📝')} Create New Issue
 
-**Step 1:** Choose a project
+Step 1: Choose a project
 
 Available projects:
             """
@@ -135,6 +135,93 @@ Available projects:
         except Exception as e:
             await self.handle_error(update, e, "create_issue_wizard")
             self.log_handler_end(update, "create_issue_wizard", success=False)
+
+    async def create_idea(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /idea command - create an issue and set status to Idea."""
+        self.log_handler_start(update, "create_idea")
+
+        user = await self.enforce_user_access(update)
+        if not user:
+            return
+
+        try:
+            # Check if summary is provided
+            if not context.args:
+                await self.send_message(
+                    update,
+                    "Usage: /idea <summary>\n\nExample: /idea New feature for user dashboard\n\nThis will create an issue with 'Idea' status."
+                )
+                return
+
+            # Get summary from arguments
+            summary = ' '.join(context.args)
+
+            # Get user's default project
+            project = await self.db.get_user_default_project(user.user_id)
+            if not project:
+                await self.send_message(
+                    update,
+                    f"{EMOJI.get('ERROR', '❌')} No default project set.\n\nUse /setdefault <project_key> to set one."
+                )
+                return
+
+            # Create the issue with Task type and Medium priority
+            created_issue = await self.jira.create_issue(
+                project_key=project.key,
+                summary=summary,
+                description="Created as an idea via Telegram bot",
+                issue_type=IssueType.TASK,
+                priority=IssuePriority.MEDIUM,
+            )
+
+            # Try to transition to "Idea" status
+            try:
+                transitions = await self.jira.list_transitions(created_issue.key)
+
+                # Find "Idea" transition
+                idea_transition = None
+                for transition in transitions:
+                    if 'idea' in transition['name'].lower():
+                        idea_transition = transition
+                        break
+
+                if idea_transition:
+                    await self.jira.transition_issue(created_issue.key, idea_transition['id'])
+                    status_msg = "Status: Idea"
+                else:
+                    status_msg = f"Status: {created_issue.status} (Idea status not available in workflow)"
+
+            except Exception as e:
+                self.logger.warning(f"Could not transition to Idea status: {e}")
+                status_msg = f"Status: {created_issue.status}"
+
+            # Show success message
+            message = f"""
+{EMOJI.get('SUCCESS', '✅')} Idea Created
+
+{created_issue.key}: {created_issue.summary}
+Project: {project.key}
+{status_msg}
+
+Use /view {created_issue.key} to see details.
+            """
+
+            await self.send_message(update, message)
+
+            # Log the action
+            await self.db.log_user_action(user.user_id, "idea.created", {
+                "issue_key": created_issue.key,
+                "project_key": project.key,
+            })
+
+            self.log_handler_end(update, "create_idea")
+
+        except JiraAPIError as e:
+            await self.send_error_message(update, f"Failed to create idea: {str(e)}")
+            self.log_handler_end(update, "create_idea", success=False)
+        except Exception as e:
+            await self.handle_error(update, e, "create_idea")
+            self.log_handler_end(update, "create_idea", success=False)
 
     async def handle_message_issue_creation(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle issue creation from plain text messages."""
@@ -185,39 +272,82 @@ Available projects:
         await self.list_user_issues(update, context)
 
     async def list_user_issues(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /myissues command - list user's recent issues."""
+        """Handle /allissues command - list issues from all projects, categorized by project."""
         self.log_handler_start(update, "list_user_issues")
-        
+
         user = await self.enforce_user_access(update)
         if not user:
             return
 
         try:
-            # Get user's issues from database
-            user_issues = await self.db.get_user_issues(user.user_id, limit=20)
-            
-            if not user_issues:
+            # Get all projects
+            projects = await self.db.list_projects()
+
+            if not projects:
                 message = f"""
-{EMOJI.get('ISSUES', '📋')} **Your Issues**
+{EMOJI.get('ERROR', '❌')} No Projects Found
 
-You haven't created any issues yet.
-
-**Get Started:**
-• Use `/create` to start the issue creation wizard
-• Or just type: `HIGH BUG Login button broken`
-• Use `/projects` to see available projects
+No projects are available. Use /refresh to sync from Jira.
                 """
                 await self.send_message(update, message)
                 return
 
-            # Format issues list
-            message = self.formatter.format_issue_list(user_issues, "Your Recent Issues")
-            
+            # Build JQL query for all projects
+            # Jira requires at least one filter, so we filter by project keys
+            project_keys = [p.key for p in projects]
+            if len(project_keys) == 1:
+                jql_query = f"project = {project_keys[0]} ORDER BY updated DESC"
+            else:
+                # Use IN clause for multiple projects
+                projects_filter = ", ".join(project_keys)
+                jql_query = f"project IN ({projects_filter}) ORDER BY updated DESC"
+
+            search_result = await self.jira.search_issues(jql_query, max_results=50)
+            all_issues = search_result.issues
+
+            if not all_issues:
+                message = f"""
+{EMOJI.get('ISSUES', '📋')} All Issues
+
+No issues found across all projects.
+
+Get Started:
+• Use /create to start the issue creation wizard
+                """
+                await self.send_message(update, message)
+                return
+
+            # Group issues by project
+            from collections import defaultdict
+            issues_by_project = defaultdict(list)
+            for issue in all_issues:
+                issues_by_project[issue.project_key].append(issue)
+
+            # Build message with issues categorized by project
+            message_lines = [f"{EMOJI.get('ISSUES', '📋')} All Issues ({len(all_issues)} total)", ""]
+
+            for project_key in sorted(issues_by_project.keys()):
+                project_issues = issues_by_project[project_key]
+                project_name = project_issues[0].project_name if project_issues else project_key
+
+                message_lines.append(f"\n{project_name} ({project_key}) - {len(project_issues)} issues")
+
+                # Show up to 5 issues per project
+                for i, issue in enumerate(project_issues[:5], 1):
+                    priority_emoji = issue.priority.get_emoji() if hasattr(issue.priority, 'get_emoji') else ""
+                    type_emoji = issue.issue_type.get_emoji() if hasattr(issue.issue_type, 'get_emoji') else ""
+                    message_lines.append(f"{i}. {priority_emoji}{type_emoji} {issue.key}: {issue.summary[:50]}")
+
+                if len(project_issues) > 5:
+                    message_lines.append(f"   ... and {len(project_issues) - 5} more")
+
+            message = "\n".join(message_lines)
+
             # Add action buttons
             keyboard_buttons = []
-            
+
             # Quick action buttons for first few issues
-            for issue in user_issues[:3]:
+            for issue in all_issues[:3]:
                 keyboard_buttons.append([
                     InlineKeyboardButton(
                         f"View {issue.key}",
@@ -272,24 +402,33 @@ You haven't created any issues yet.
             if 'status' in filters:
                 jql_parts.append(f"status = {filters['status']}")
 
-            # Default query if no filters
+            # Default query if no filters - restrict to user's default project or recent issues
             if not jql_parts:
-                jql_parts.append("ORDER BY updated DESC")
-            else:
-                jql_parts.append("ORDER BY updated DESC")
+                # Get user's default project
+                default_project = await self.db.get_user_default_project(user.user_id)
+                if default_project:
+                    jql_parts.append(f"project = {default_project.key}")
+                else:
+                    # If no default project, limit to issues updated in last 30 days
+                    jql_parts.append("updated >= -30d")
 
+            # Add ORDER BY clause
+            jql_parts.append("ORDER BY updated DESC")
+
+            # Build final query
             jql_query = " AND ".join(jql_parts[:-1]) + " " + jql_parts[-1] if len(jql_parts) > 1 else jql_parts[0]
 
             # Search issues
-            issues = await self.jira.search_issues(jql_query, max_results=20)
+            search_result = await self.jira.search_issues(jql_query, max_results=20)
+            issues = search_result.issues
 
             if not issues:
                 message = f"""
-{EMOJI.get('SEARCH', '🔍')} **No Issues Found**
+{EMOJI.get('SEARCH', '🔍')} No Issues Found
 
 No issues match your criteria.
 
-**Try:**
+Try:
 • Different filter criteria
 • `/myissues` for your issues
 • `/projects` to see available projects
@@ -336,25 +475,26 @@ No issues match your criteria.
             if not context.args:
                 await self.send_message(
                     update,
-                    "**Usage:** `/search <query>`\n\nSearch issues by summary, description, or key."
+                    "Usage: `/search <query>`\n\nSearch issues by summary, description, or key."
                 )
                 return
 
             query = ' '.join(context.args)
-            
-            # Build search JQL
-            jql_query = f'text ~ "{query}" ORDER BY updated DESC'
-            
+
+            # Build search JQL with date restriction to avoid unbounded queries
+            jql_query = f'text ~ "{query}" AND updated >= -90d ORDER BY updated DESC'
+
             # Search issues
-            issues = await self.jira.search_issues(jql_query, max_results=20)
+            search_result = await self.jira.search_issues(jql_query, max_results=20)
+            issues = search_result.issues
 
             if not issues:
                 message = f"""
-{EMOJI.get('SEARCH', '🔍')} **No Results Found**
+{EMOJI.get('SEARCH', '🔍')} No Results Found
 
-No issues found matching: **{query}**
+No issues found matching: {query}
 
-**Tips:**
+Tips:
 • Try different keywords
 • Check spelling
 • Use simpler terms
@@ -407,7 +547,7 @@ No issues found matching: **{query}**
             if not context.args:
                 await self.send_message(
                     update,
-                    "**Usage:** `/view <ISSUE_KEY>`\n\nExample: `/view WEBAPP-123`"
+                    "Usage: `/view <ISSUE_KEY>`\n\nExample: `/view WEBAPP-123`"
                 )
                 return
 
@@ -420,7 +560,7 @@ No issues found matching: **{query}**
 
             # Get issue from Jira
             try:
-                issue = await self.jira.get_issue_by_key(issue_key)
+                issue = await self.jira.get_issue(issue_key)
             except JiraAPIError as e:
                 if "404" in str(e) or "not found" in str(e).lower():
                     await self.send_error_message(update, f"Issue '{issue_key}' not found.")
@@ -432,7 +572,7 @@ No issues found matching: **{query}**
                 return
 
             # Format issue details
-            message = self.formatter.format_issue_details(issue)
+            message = self.formatter.format_issue(issue, include_description=True)
 
             # Add action buttons
             keyboard_buttons = [
@@ -467,7 +607,7 @@ No issues found matching: **{query}**
             if not context.args:
                 await self.send_message(
                     update,
-                    "**Usage:** `/edit <ISSUE_KEY>`\n\nExample: `/edit WEBAPP-123`"
+                    "Usage: `/edit <ISSUE_KEY>`\n\nExample: `/edit WEBAPP-123`"
                 )
                 return
 
@@ -480,7 +620,7 @@ No issues found matching: **{query}**
 
             # Check if issue exists
             try:
-                issue = await self.jira.get_issue_by_key(issue_key)
+                issue = await self.jira.get_issue(issue_key)
                 if not issue:
                     await self.send_error_message(update, f"Issue '{issue_key}' not found.")
                     return
@@ -510,7 +650,7 @@ No issues found matching: **{query}**
             if not context.args or len(context.args) < 2:
                 await self.send_message(
                     update,
-                    "**Usage:** `/assign <ISSUE_KEY> <USERNAME>`\n\nExample: `/assign WEBAPP-123 john.doe`"
+                    "Usage: `/assign <ISSUE_KEY> <USERNAME>`\n\nExample: `/assign WEBAPP-123 john.doe`"
                 )
                 return
 
@@ -528,7 +668,7 @@ No issues found matching: **{query}**
                 
                 success_message = self.formatter.format_success_message(
                     f"Issue {issue_key} assigned",
-                    f"Issue has been assigned to **@{assignee}**"
+                    f"Issue has been assigned to @{assignee}"
                 )
                 
                 await self.send_message(update, success_message)
@@ -563,7 +703,7 @@ No issues found matching: **{query}**
             if not context.args or len(context.args) < 2:
                 await self.send_message(
                     update,
-                    "**Usage:** `/comment <ISSUE_KEY> <comment text>`\n\nExample: `/comment WEBAPP-123 This issue is resolved`"
+                    "Usage: `/comment <ISSUE_KEY> <comment text>`\n\nExample: `/comment WEBAPP-123 This issue is resolved`"
                 )
                 return
 
@@ -585,7 +725,7 @@ No issues found matching: **{query}**
                 comment_id = comment.get("id") if isinstance(comment, dict) else getattr(comment, "id", None)
                 
                 details = (
-                    f"Your comment has been posted successfully.\n\n💬 **Comment:** "
+                    f"Your comment has been posted successfully.\n\n💬 Comment: "
                     f"{comment_text[:100]}{'...' if len(comment_text) > 100 else ''}"
                 )
                 if comment_id:
@@ -622,7 +762,7 @@ No issues found matching: **{query}**
             if not context.args:
                 await self.send_message(
                     update,
-                    "**Usage:** `/transition <ISSUE_KEY> [status]`\n\nExample: `/transition WEBAPP-123 Done`"
+                    "Usage: `/transition <ISSUE_KEY> [status]`\n\nExample: `/transition WEBAPP-123 Done`"
                 )
                 return
 
@@ -647,6 +787,66 @@ No issues found matching: **{query}**
             await self.handle_error(update, e, "transition_issue")
             self.log_handler_end(update, "transition_issue", success=False)
 
+    async def delete_issue(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /delete command - delete an issue with confirmation."""
+        self.log_handler_start(update, "delete_issue")
+
+        user = await self.enforce_user_access(update)
+        if not user:
+            return
+
+        try:
+            if not context.args:
+                await self.send_message(
+                    update,
+                    "Usage: `/delete <ISSUE_KEY>`\n\nExample: `/delete MBA-123`\n\n⚠️ This will permanently delete the issue!"
+                )
+                return
+
+            issue_key = context.args[0].upper()
+
+            # Validate issue key format
+            if not self._validate_issue_key(issue_key):
+                await self.send_error_message(update, "Invalid issue key format.")
+                return
+
+            # Check if issue exists
+            try:
+                issue = await self.jira.get_issue(issue_key)
+                if not issue:
+                    await self.send_error_message(update, f"Issue '{issue_key}' not found.")
+                    return
+            except JiraAPIError as e:
+                if "404" in str(e):
+                    await self.send_error_message(update, f"Issue '{issue_key}' not found.")
+                    return
+                raise
+
+            # Show confirmation dialog
+            message = f"""
+⚠️ Delete Issue Confirmation
+
+Are you sure you want to delete this issue?
+
+{issue_key}: {issue.summary}
+Type: {issue.issue_type.value}
+Status: {issue.status}
+
+This action cannot be undone!**
+            """
+
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑️ Yes, Delete", callback_data=f"confirm_delete_{issue_key}")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_delete")]
+            ])
+
+            await self.send_message(update, message, reply_markup=keyboard)
+            self.log_handler_end(update, "delete_issue")
+
+        except Exception as e:
+            await self.handle_error(update, e, "delete_issue")
+            self.log_handler_end(update, "delete_issue", success=False)
+
     # =============================================================================
     # CALLBACK QUERY HANDLERS
     # =============================================================================
@@ -662,12 +862,26 @@ No issues found matching: **{query}**
             await self._handle_view_comments_callback(update, context)
         elif query.data.startswith("refresh_issue_"):
             await self._handle_refresh_issue_callback(update, context)
+        elif query.data.startswith("edit_summary_"):
+            await self._handle_edit_summary_callback(update, context)
+        elif query.data.startswith("edit_description_"):
+            await self._handle_edit_description_callback(update, context)
+        elif query.data.startswith("edit_priority_"):
+            await self._handle_edit_priority_callback(update, context)
+        elif query.data.startswith("edit_assignee_"):
+            await self._handle_edit_assignee_callback(update, context)
+        elif query.data.startswith("set_priority_"):
+            await self._handle_set_priority_callback(update, context)
         elif query.data.startswith("edit_issue_"):
             await self._handle_edit_issue_callback(update, context)
         elif query.data.startswith("transition_issue_"):
             await self._handle_transition_issue_callback(update, context)
         elif query.data.startswith("confirm_create_"):
             await self._handle_confirm_create_callback(update, context)
+        elif query.data.startswith("confirm_delete_"):
+            await self._handle_confirm_delete_callback(update, context)
+        elif query.data == "cancel_delete":
+            await self._handle_cancel_delete_callback(update, context)
         elif query.data == "create_new_issue":
             await self._handle_create_new_issue_callback(update, context)
         elif query.data == "refresh_my_issues":
@@ -753,12 +967,12 @@ No issues found matching: **{query}**
         type_emoji = parsed_issue['issue_type'].get_emoji()
         
         message = f"""
-{EMOJI.get('CONFIRM', '✅')} **Confirm Issue Creation**
+{EMOJI.get('CONFIRM', '✅')} Confirm Issue Creation
 
-**Project:** {project.key}: {project.name}
-**Type:** {type_emoji} {parsed_issue['issue_type'].value}
-**Priority:** {priority_emoji} {parsed_issue['priority'].value}
-**Summary:** {parsed_issue['summary']}
+Project: {project.key}: {project.name}
+Type: {type_emoji} {parsed_issue['issue_type'].value}
+Priority: {priority_emoji} {parsed_issue['priority'].value}
+Summary: {parsed_issue['summary']}
 
 Create this issue?
         """
@@ -781,7 +995,7 @@ Create this issue?
     async def _show_edit_issue_menu(self, update: Update, issue_key: str) -> None:
         """Show edit issue menu."""
         message = f"""
-✏️ **Edit Issue: {issue_key}**
+✏️ Edit Issue: {issue_key}
 
 What would you like to edit?
         """
@@ -799,14 +1013,14 @@ What would you like to edit?
     async def _show_available_transitions(self, update: Update, issue_key: str) -> None:
         """Show available transitions for an issue."""
         try:
-            transitions = await self.jira.get_available_transitions(issue_key)
+            transitions = await self.jira.list_transitions(issue_key)
             
             if not transitions:
                 await self.send_message(update, f"No transitions available for {issue_key}.")
                 return
 
             message = f"""
-🔄 **Available Transitions for {issue_key}**
+🔄 Available Transitions for {issue_key}
 
 Choose a new status:
             """
@@ -834,7 +1048,7 @@ Choose a new status:
         """Perform transition to target status."""
         try:
             # Get available transitions
-            transitions = await self.jira.get_available_transitions(issue_key)
+            transitions = await self.jira.list_transitions(issue_key)
             
             # Find matching transition
             matching_transition = None
@@ -856,7 +1070,7 @@ Choose a new status:
             
             success_message = self.formatter.format_success_message(
                 f"Issue {issue_key} transitioned",
-                f"Status changed to **{matching_transition['name']}**"
+                f"Status changed to {matching_transition['name']}"
             )
             
             await self.send_message(update, success_message)
@@ -878,7 +1092,7 @@ Choose a new status:
         issue_key = query.data.replace("view_comments_", "")
         
         try:
-            comments = await self.jira.get_issue_comments(issue_key)
+            comments = await self.jira.list_comments(issue_key)
             
             if not comments:
                 await self.edit_message(update, f"No comments found for {issue_key}.")
@@ -886,15 +1100,15 @@ Choose a new status:
 
             # Format comments
             message_lines = [
-                f"💬 **Comments for {issue_key}** ({len(comments)} total)",
+                f"💬 Comments for {issue_key} ({len(comments)} total)",
                 ""
             ]
 
             for i, comment in enumerate(comments[-10:], 1):  # Show last 10 comments
-                comment_preview = self.formatter._truncate_text(comment.body, 100)
+                comment_preview = self.formatter.truncate_text(comment.body, 100)
                 age = comment.get_age_string()
                 
-                comment_line = f"{i}. **{comment.author}** ({age})\n   {comment_preview}"
+                comment_line = f"{i}. {comment.author_display_name} ({age})\n   {comment_preview}"
                 message_lines.append(comment_line)
 
             message = "\n\n".join(message_lines)
@@ -950,7 +1164,7 @@ Choose a new status:
 
             success_message = self.formatter.format_success_message(
                 "Issue created successfully!",
-                f"**{created_issue.key}**: {created_issue.summary}\n"
+                f"{created_issue.key}: {created_issue.summary}\n"
                 f"🔗 View in Jira: {created_issue.url}"
             )
 
@@ -969,3 +1183,193 @@ Choose a new status:
     async def _handle_refresh_my_issues_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle refresh my issues callback."""
         await self.list_user_issues(update, context)
+
+    async def _handle_edit_summary_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle edit summary callback."""
+        query = update.callback_query
+        issue_key = query.data.replace("edit_summary_", "")
+
+        message = f"📝 Edit Summary for {issue_key}\n\nPlease send the new summary text:"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"view_issue_{issue_key}")]
+        ])
+
+        # Store the issue key and field being edited
+        context.user_data['editing_issue'] = {
+            'issue_key': issue_key,
+            'field': 'summary'
+        }
+
+        await query.edit_message_text(message, reply_markup=keyboard, parse_mode="Markdown")
+
+    async def _handle_edit_description_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle edit description callback."""
+        query = update.callback_query
+        issue_key = query.data.replace("edit_description_", "")
+
+        message = f"📄 Edit Description for {issue_key}\n\nPlease send the new description text:"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"view_issue_{issue_key}")]
+        ])
+
+        # Store the issue key and field being edited
+        context.user_data['editing_issue'] = {
+            'issue_key': issue_key,
+            'field': 'description'
+        }
+
+        await query.edit_message_text(message, reply_markup=keyboard, parse_mode="Markdown")
+
+    async def _handle_edit_priority_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle edit priority callback."""
+        query = update.callback_query
+        issue_key = query.data.replace("edit_priority_", "")
+
+        message = f"🎯 Edit Priority for {issue_key}\n\nSelect new priority:"
+
+        # Create priority selection keyboard
+        priorities = [IssuePriority.HIGHEST, IssuePriority.HIGH, IssuePriority.MEDIUM,
+                     IssuePriority.LOW, IssuePriority.LOWEST]
+        keyboard_buttons = []
+
+        for priority in priorities:
+            emoji = priority.get_emoji()
+            keyboard_buttons.append([
+                InlineKeyboardButton(
+                    f"{emoji} {priority.value}",
+                    callback_data=f"set_priority_{issue_key}_{priority.name}"
+                )
+            ])
+
+        keyboard_buttons.append([
+            InlineKeyboardButton("❌ Cancel", callback_data=f"view_issue_{issue_key}")
+        ])
+
+        keyboard = InlineKeyboardMarkup(keyboard_buttons)
+        await query.edit_message_text(message, reply_markup=keyboard, parse_mode="Markdown")
+
+    async def _handle_edit_assignee_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle edit assignee callback."""
+        query = update.callback_query
+        issue_key = query.data.replace("edit_assignee_", "")
+
+        message = f"👤 Edit Assignee for {issue_key}\n\nPlease send the assignee's account ID or username:"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"view_issue_{issue_key}")]
+        ])
+
+        # Store the issue key and field being edited
+        context.user_data['editing_issue'] = {
+            'issue_key': issue_key,
+            'field': 'assignee'
+        }
+
+        await query.edit_message_text(message, reply_markup=keyboard, parse_mode="Markdown")
+
+    async def _handle_set_priority_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle set priority callback."""
+        query = update.callback_query
+        # Parse: set_priority_MBA-7_HIGH
+        parts = query.data.replace("set_priority_", "").rsplit("_", 1)
+        issue_key = parts[0]
+        priority_name = parts[1]
+
+        try:
+            priority = IssuePriority[priority_name]
+
+            # Update the issue
+            updated_issue = await self.jira.update_issue(issue_key, priority=priority)
+
+            # Show success message
+            emoji = priority.get_emoji()
+            message = f"✅ Priority Updated\n\n{issue_key} priority set to {emoji} {priority.value}"
+
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back to Issue", callback_data=f"view_issue_{issue_key}")]
+            ])
+
+            await query.edit_message_text(message, reply_markup=keyboard, parse_mode="Markdown")
+
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ Failed to update priority: {str(e)}\n\nTry again with /edit {issue_key}",
+                parse_mode="Markdown"
+            )
+
+    async def handle_edit_field_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle message input for editing issue fields."""
+        # Check if user is editing an issue
+        if not context.user_data or 'editing_issue' not in context.user_data:
+            return
+
+        editing_data = context.user_data['editing_issue']
+        issue_key = editing_data['issue_key']
+        field = editing_data['field']
+        new_value = update.message.text.strip()
+
+        try:
+            if field == 'summary':
+                updated_issue = await self.jira.update_issue(issue_key, summary=new_value)
+                field_display = "Summary"
+            elif field == 'description':
+                updated_issue = await self.jira.update_issue(issue_key, description=new_value)
+                field_display = "Description"
+            elif field == 'assignee':
+                await self.jira.assign_issue(issue_key, new_value)
+                field_display = "Assignee"
+            else:
+                await update.message.reply_text("❌ Invalid field")
+                return
+
+            # Clear editing state
+            context.user_data.pop('editing_issue', None)
+
+            # Show success message
+            message = f"✅ {field_display} Updated\n\n{issue_key} {field} has been updated successfully."
+
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back to Issue", callback_data=f"view_issue_{issue_key}")]
+            ])
+
+            await update.message.reply_text(message, reply_markup=keyboard, parse_mode="Markdown")
+
+        except JiraAPIError as e:
+            await update.message.reply_text(
+                f"❌ Failed to update {field}: {str(e)}\n\nTry again with /edit {issue_key}",
+                parse_mode="Markdown"
+            )
+            context.user_data.pop('editing_issue', None)
+
+    async def _handle_confirm_delete_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle confirm delete callback."""
+        query = update.callback_query
+        issue_key = query.data.replace("confirm_delete_", "")
+
+        try:
+            # Delete the issue
+            await self.jira.delete_issue(issue_key)
+
+            # Show success message
+            message = f"✅ Issue Deleted\n\n{issue_key} has been permanently deleted from Jira."
+
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋 My Issues", callback_data="refresh_my_issues")]
+            ])
+
+            await query.edit_message_text(message, reply_markup=keyboard, parse_mode="Markdown")
+
+            # Log the action
+            user = await self.get_or_create_user(update)
+            if user:
+                await self.db.log_user_action(user.user_id, "issue.deleted", {
+                    "issue_key": issue_key
+                })
+
+        except JiraAPIError as e:
+            error_msg = f"❌ Failed to delete issue: {str(e)}"
+            await query.edit_message_text(error_msg, parse_mode="Markdown")
+
+    async def _handle_cancel_delete_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle cancel delete callback."""
+        query = update.callback_query
+        await query.edit_message_text("❌ Delete cancelled.", parse_mode="Markdown")

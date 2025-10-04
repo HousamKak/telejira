@@ -55,10 +55,11 @@ class BaseHandler:
         if not isinstance(telegram_service, TelegramService):
             raise TypeError(f"telegram_service must be TelegramService, got {type(telegram_service)}")
 
-        self.config = config 
+        self.config = config
         self.db = database_service
         self.jira = jira_service
         self.telegram = telegram_service
+        self.logger = logging.getLogger(self.__class__.__name__)
 
     def get_handler_name(self) -> str:
         """
@@ -113,6 +114,7 @@ class BaseHandler:
             sent_messages = await self.telegram.send_message(
                 chat_id=chat_id,
                 text=text,
+                parse_mode="HTML",
                 reply_markup=reply_markup,
                 reply_to_message_id=reply_to_message_id,
             )
@@ -160,6 +162,7 @@ class BaseHandler:
                 chat_id=chat_id,
                 message_id=message_id,
                 text=text,
+                parse_mode="HTML",
                 reply_markup=reply_markup,
             )
             
@@ -259,7 +262,7 @@ class BaseHandler:
                 # Send welcome message
                 welcome_text = (
                     f"🎉 Welcome to the Jira Bot, {new_user.display_name}!\n\n"
-                    f"Your account has been created with role: **{preauth_role.display_name}**\n\n"
+                    f"Your account has been created with role: {preauth_role.display_name}\n\n"
                     "Use /help to see available commands or /setup to configure your preferences."
                 )
                 await self.send_message(update, welcome_text)
@@ -472,7 +475,7 @@ class BaseHandler:
         }
         
         emoji = error_emojis.get(error_type, "❌")
-        formatted_text = f"{emoji} **Error:** {text}"
+        formatted_text = f"{emoji} Error: {text}"
         
         await self.send_message(update, formatted_text)
 
@@ -569,3 +572,85 @@ class BaseHandler:
                 await update.callback_query.answer(text=text)
             except Exception as e:
                 logger.warning(f"Failed to answer callback query: {e}")
+                
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /start."""
+        user = await self.get_or_create_user(update)
+        if not user:
+            return
+        text = (
+            "👋 Hey! I’m your Jira bot.\n\n"
+            "• Use /wizard (or /w) for a guided setup or quick issue creation\n"
+            "• Use /help to see all commands\n"
+            "• Try /status for a quick health check"
+        )
+        await self.send_message(update, text)
+
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /help."""
+        lines = [
+            "🆘 <b>Help - Available Commands</b>",
+            "",
+            "📌 <b>Basics</b>",
+            "  /start - Welcome message & tips",
+            "  /help - Show this help menu",
+            "  /status - Check bot/Jira/DB status",
+            "",
+            "🪄 <b>Wizard (Recommended)</b>",
+            "  /wizard or /w - Open interactive wizard",
+            "  /quick or /q - Quick issue creation",
+            "",
+            "📁 <b>Projects</b>",
+            "  /projects - List all projects",
+            "  /allissues - View all issues (grouped by project)",
+            "  /setdefault - Set your default project",
+            "  /refresh - Sync projects from Jira (admin)",
+            "",
+            "🎫 <b>Issues</b>",
+            "  /create - Create new issue (goes to Backlog)",
+            "  /idea [summary] - Quick create idea",
+            "  /listissues - List project issues",
+            "  /searchissues - Search for issues",
+            "  /view - View issue details",
+            "  /edit - Edit an issue",
+            "  /assign - Assign issue to user",
+            "  /comment - Add comment to issue",
+            "  /transition - Change issue status",
+            "  /delete - Delete an issue (permanent!)",
+        ]
+        await self.send_message(update, "\n".join(lines))
+
+    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /status."""
+        # Light touch DB check
+        try:
+            users = await self.db.get_user_count()
+            db_ok = True
+        except Exception as e:
+            users = "?"
+            db_ok = False
+            logger.warning(f"/status DB check failed: {e}")
+
+        # Light touch Jira check
+        jira_ok = True
+        try:
+            health = await self.jira.health_check()
+            jira_ok = (health.get("status") == "healthy")
+        except Exception as e:
+            jira_ok = False
+            logger.warning(f"/status Jira check failed: {e}")
+
+        text = (
+            "📊 <b>Status</b>\n"
+            f"• Jira: {'✅' if jira_ok else '❌'}\n"
+            f"• Database: {'✅' if db_ok else '❌'} (users: {users})\n"
+            f"• Config: {self.config.jira_domain}\n"
+        )
+        await self.send_message(update, text)
+
+    async def handle_unknown(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Fallback for non-command text."""
+        await self.send_message(
+            update,
+            "🤔 I didn’t understand that.\nTry /help or /wizard to get started."
+        )

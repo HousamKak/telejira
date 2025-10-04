@@ -40,7 +40,7 @@ class ProjectHandlers(BaseHandler):
         telegram_service: TelegramService,
     ) -> None:
         """Initialize project handlers with required services."""
-        super().__init__(config,database_service, jira_service, telegram_service)
+        super().__init__(config, database_service, jira_service, telegram_service)
 
     # ---- Public Commands ----
 
@@ -59,46 +59,38 @@ class ProjectHandlers(BaseHandler):
             return
 
         try:
-            # Get user's projects
-            user_projects = await self.db.list_user_projects(user.user_id)
-            
-            if not user_projects:
-                # If user has no projects, show all available projects
-                all_projects = await self.db.list_projects()
-                
-                if not all_projects:
-                    await self.send_message(
-                        update,
-                        "📭 No projects found. Contact an administrator to refresh projects from Jira."
-                    )
-                    return
-                
-                # Show selection menu for first-time setup
-                await self._show_project_selection_menu(update, user)
+            # Get all available projects
+            all_projects = await self.db.list_projects()
+
+            if not all_projects:
+                await self.send_message(
+                    update,
+                    "📭 No projects found. Contact an administrator to refresh projects from Jira."
+                )
                 return
-            
+
             # Get default project
             default_project = await self.db.get_user_default_project(user.user_id)
-            
+
             # Build project list
-            text_parts = [f"🏗 **Your Projects ({len(user_projects)})**\n"]
-            
-            for project in user_projects:
+            text_parts = [f"🏗 <b>Available Projects ({len(all_projects)})</b>\n"]
+
+            for project in all_projects:
                 # Add default indicator
                 default_indicator = " ⭐" if default_project and project.key == default_project.key else ""
-                
+
                 # Format project info
-                project_line = f"**{project.name}** (`{project.key}`){default_indicator}"
+                project_line = f"<b>{project.name}</b> (<code>{project.key}</code>){default_indicator}"
                 if project.description:
                     desc = project.description[:80] + "..." if len(project.description) > 80 else project.description
-                    project_line += f"\n_{desc}_"
-                
+                    project_line += f"\n<i>{desc}</i>"
+
                 text_parts.append(project_line)
-            
+
             if default_project:
-                text_parts.append(f"\n⭐ Default project: **{default_project.name}**")
+                text_parts.append(f"\n⭐ Default project: <b>{default_project.name}</b>")
             else:
-                text_parts.append("\n💡 Use `/setdefault` to set your default project")
+                text_parts.append("\n💡 Use <code>/setdefault</code> to set your default project")
             
             # Add action buttons
             keyboard = [
@@ -139,8 +131,8 @@ class ProjectHandlers(BaseHandler):
             
             if len(args) != 1:
                 help_text = (
-                    "**Usage:** `/project <project_key>`\n\n"
-                    "**Example:** `/project DEMO`\n\n"
+                    "Usage: `/project <project_key>`\n\n"
+                    "Example: `/project DEMO`\n\n"
                     "Get detailed information about a specific project."
                 )
                 await self.send_message(update, help_text)
@@ -172,7 +164,7 @@ class ProjectHandlers(BaseHandler):
             
             # Add statistics
             if project_stats:
-                details_text += f"\n\n📊 **Statistics:**"
+                details_text += f"\n\n📊 Statistics:"
                 if project_stats.get('user_count', 0) > 0:
                     details_text += f"\n👥 Users: {project_stats['user_count']}"
                 if project_stats.get('issue_count', 0) > 0:
@@ -225,44 +217,44 @@ class ProjectHandlers(BaseHandler):
             
             if len(args) != 1:
                 help_text = (
-                    "**Usage:** `/setdefault <project_key>`\n\n"
-                    "**Example:** `/setdefault DEMO`\n\n"
-                    "Or use `/setdefault` without arguments to choose from a menu."
+                    "<b>Usage:</b> <code>/setdefault &lt;project_key&gt;</code>\n\n"
+                    "<b>Example:</b> <code>/setdefault DEMO</code>\n\n"
+                    "Or use <code>/setdefault</code> without arguments to choose from a menu."
                 )
                 await self.send_message(update, help_text)
                 return
 
             project_key = args[0].upper()
-            
+
             if not self._validate_project_key(project_key):
                 await self.send_error_message(
                     update,
                     "Invalid project key format. Project keys should be 2-10 uppercase letters."
                 )
                 return
-            
+
             # Verify project exists
             project = await self.db.get_project_by_key(project_key)
             if not project:
                 await self.send_error_message(
                     update,
-                    f"Project '{project_key}' not found. Use `/projects` to see available projects."
+                    f"Project '{project_key}' not found. Use <code>/projects</code> to see available projects."
                 )
                 return
-            
+
             # Set as default
             await self.db.set_user_default_project(user.user_id, project_key)
-            
+
             # Log the action
             await self.db.log_user_action(user.user_id, "set_default_project", {
                 "project_key": project_key,
                 "project_name": project.name,
             })
-            
+
             success_text = (
-                f"✅ **Default Project Set**\n\n"
+                f"✅ <b>Default Project Set</b>\n\n"
                 f"Your default project is now:\n"
-                f"**{project.name}** (`{project.key}`)\n\n"
+                f"<b>{project.name}</b> (<code>{project.key}</code>)\n\n"
                 f"This project will be pre-selected when creating new issues."
             )
             
@@ -293,20 +285,20 @@ class ProjectHandlers(BaseHandler):
             
             if not default_project:
                 text = (
-                    "🤷 **No Default Project Set**\n\n"
+                    "🤷 <b>No Default Project Set</b>\n\n"
                     "You haven't set a default project yet.\n\n"
-                    "Use `/setdefault <project_key>` to set one, or use `/projects` to see available projects."
+                    "Use <code>/setdefault &lt;project_key&gt;</code> to set one, or use <code>/projects</code> to see available projects."
                 )
-                
+
                 keyboard = [
                     [InlineKeyboardButton("🏗 Choose Project", callback_data="project_change_default")]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
-                
+
                 await self.send_message(update, text, reply_markup=reply_markup)
             else:
                 text = (
-                    f"⭐ **Your Default Project**\n\n"
+                    f"⭐ <b>Your Default Project</b>\n\n"
                     f"{default_project.get_formatted_summary()}\n\n"
                     f"This project is pre-selected when creating new issues."
                 )
@@ -349,10 +341,10 @@ class ProjectHandlers(BaseHandler):
             
             if len(args) == 0:
                 help_text = (
-                    "**Usage:** `/searchprojects <search_term>`\n\n"
-                    "**Examples:**\n"
-                    "• `/searchprojects demo` - Search for projects containing 'demo'\n"
-                    "• `/searchprojects web` - Search for projects containing 'web'\n\n"
+                    "<b>Usage:</b> <code>/searchprojects &lt;search_term&gt;</code>\n\n"
+                    "<b>Examples:</b>\n"
+                    "• <code>/searchprojects demo</code> - Search for projects containing 'demo'\n"
+                    "• <code>/searchprojects web</code> - Search for projects containing 'web'\n\n"
                     "Search is case-insensitive and matches project names and keys."
                 )
                 await self.send_message(update, help_text)
@@ -387,10 +379,10 @@ class ProjectHandlers(BaseHandler):
                 return
             
             # Build results text
-            text_parts = [f"🔍 **Search Results for '{search_term}'** ({len(matching_projects)} found)\n"]
+            text_parts = [f"🔍 Search Results for '{search_term}' ({len(matching_projects)} found)\n"]
             
             for project in matching_projects[:10]:  # Limit to 10 results
-                project_summary = f"**{project.name}** (`{project.key}`)"
+                project_summary = f"{project.name} (`{project.key}`)"
                 if project.description:
                     desc = project.description[:100] + "..." if len(project.description) > 100 else project.description
                     project_summary += f"\n_{desc}_"
@@ -433,7 +425,7 @@ class ProjectHandlers(BaseHandler):
             if callback_data == "project_search":
                 await self.edit_message(
                     update,
-                    "🔍 Use the command `/searchprojects <search_term>` to search for projects."
+                    "🔍 Use the command <code>/searchprojects &lt;search_term&gt;</code> to search for projects."
                 )
             elif callback_data == "project_change_default":
                 await self._handle_change_default_callback(update, context)
@@ -483,7 +475,7 @@ class ProjectHandlers(BaseHandler):
             reply_markup = InlineKeyboardMarkup(keyboard)
             
             text = (
-                f"🏗 **Choose Your Default Project**\n\n"
+                f"🏗 <b>Choose Your Default Project</b>\n\n"
                 f"Select a project to set as your default.\n"
                 f"This project will be pre-selected when creating new issues.\n\n"
                 f"Showing {min(len(projects), 10)} of {len(projects)} projects:"
@@ -552,8 +544,8 @@ class ProjectHandlers(BaseHandler):
             })
             
             success_text = (
-                f"✅ **Default Project Set**\n\n"
-                f"**{project.name}** (`{project.key}`) is now your default project.\n\n"
+                f"✅ <b>Default Project Set</b>\n\n"
+                f"<b>{project.name}</b> (<code>{project.key}</code>) is now your default project.\n\n"
                 f"This project will be pre-selected when creating new issues."
             )
             
@@ -577,7 +569,7 @@ class ProjectHandlers(BaseHandler):
         
         await self.edit_message(
             update,
-            f"🎯 Use `/create` to create an issue in project **{project_key}**, "
+            f"🎯 Use `/create` to create an issue in project {project_key}, "
             f"or `/quick` for the issue creation wizard."
         )
 
@@ -624,7 +616,7 @@ class ProjectHandlers(BaseHandler):
             updated_text = jira_project.get_formatted_summary()
             
             if project_stats:
-                updated_text += f"\n\n📊 **Statistics:**"
+                updated_text += f"\n\n📊 Statistics:"
                 if project_stats.get('user_count', 0) > 0:
                     updated_text += f"\n👥 Users: {project_stats['user_count']}"
                 if project_stats.get('issue_count', 0) > 0:
